@@ -2,15 +2,45 @@ import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from sparse_model import convert_sparse_weights_to_dense, convert_dense_weights_to_sparse
+from sparse_model import (
+    convert_sparse_weights_to_dense,
+    convert_dense_weights_to_sparse,
+)
 
 
-def train_one_model(model, train_loader, valid_loader, device, epochs=10000, 
-                    patience=10, min_delta=1e-4, criterion=torch.nn.L1Loss(),
-                    lr=3e-4, optimizer=None):
+def train_one_model(
+    model,
+    train_loader,
+    valid_loader,
+    device,
+    epochs=10000,
+    patience=10,
+    min_delta=1e-4,
+    criterion=torch.nn.L1Loss(),
+    lr=3e-4,
+    optimizer=None,
+):
+    """
+    Trains a given model for a specified number of epochs with early stopping.
+
+        Args:
+            model: The PyTorch model to train.
+            train_loader: DataLoader for the training dataset.
+            valid_loader: DataLoader for the validation dataset.
+            device:  The device (e.g., 'cpu', 'cuda') on which to perform training.
+            epochs: The maximum number of epochs to train for.
+            patience: Number of epochs with no improvement before early stopping.
+            min_delta: Minimum change in validation loss to qualify as an improvement.
+            criterion: Loss function used for training.
+            lr: Learning rate for the optimizer.
+            optimizer: Optional optimizer instance; if None, Adam is used.
+
+        Returns:
+            float: The best validation loss achieved during training.
+    """
     if not optimizer:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    best_loss = float('inf')
+    best_loss = float("inf")
     epochs_no_improve = 0
     val_losses = []
 
@@ -47,7 +77,12 @@ def train_one_model(model, train_loader, valid_loader, device, epochs=10000,
 
     plt.figure(figsize=(10, 5))
     plt.plot(val_losses, label="Validation Loss")
-    plt.axhline(y=sum(val_losses) / len(val_losses), color='r', linestyle='--', label="Average Loss")
+    plt.axhline(
+        y=sum(val_losses) / len(val_losses),
+        color="r",
+        linestyle="--",
+        label="Average Loss",
+    )
     plt.xlabel("Epochs")
     plt.ylabel("Loss")
     plt.title("Validation Loss per Epoch")
@@ -58,6 +93,18 @@ def train_one_model(model, train_loader, valid_loader, device, epochs=10000,
 
 
 def valid_model(model, valid_loader, criterion, device):
+    """
+    Calculates the mean squared error (MSE) loss on a validation dataset.
+
+        Args:
+            model: The model to validate.
+            valid_loader: DataLoader for the validation dataset.
+            criterion: Loss function used for evaluation.
+            device: Device (e.g., 'cpu', 'cuda') where tensors are located.
+
+        Returns:
+            float: The average MSE loss over the validation dataset.
+    """
     model.eval()
     mse = 0
     with torch.no_grad():

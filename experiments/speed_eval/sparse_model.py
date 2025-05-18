@@ -3,7 +3,20 @@ from torch import nn
 
 
 class MyModel(nn.Module):
+    """
+    A simple neural network model with customizable layer sizes and activation."""
+
     def __init__(self, all_sizes, activation=nn.ReLU):
+        """
+        Initializes the MyModel with specified layer sizes and activation function.
+
+            Args:
+                all_sizes: A tuple containing the input size, hidden layer sizes, and output size.
+                activation: The activation function to use for hidden layers. Defaults to nn.ReLU.
+
+            Returns:
+                None
+        """
         super(MyModel, self).__init__()
         input_size, *hidden_sizes, output_size = all_sizes
         layers = []
@@ -17,11 +30,34 @@ class MyModel(nn.Module):
         self.layers = all_sizes
 
     def forward(self, x):
+        """
+        Passes input through the model.
+
+          Args:
+            x: The input tensor.
+
+          Returns:
+            The output of the model after processing the input.
+        """
         return self.model(x)
 
 
 class SparseLinear(nn.Module):
+    """
+    A sparse linear layer that performs a matrix multiplication with sparsity."""
+
     def __init__(self, in_features, out_features, bias=True):
+        """
+        Initializes a sparse linear layer.
+
+            Args:
+                in_features: The number of expected features in the input.
+                out_features: The number of output features.
+                bias: A boolean indicating whether to include a bias term. Defaults to True.
+
+            Returns:
+                None
+        """
         super(SparseLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -29,9 +65,18 @@ class SparseLinear(nn.Module):
         if bias:
             self.bias = nn.Parameter(torch.randn(out_features))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
     def forward(self, input):
+        """
+        Performs a sparse matrix multiplication followed by optional bias addition.
+
+            Args:
+                input: The input tensor to be multiplied with the weight matrix.
+
+            Returns:
+                The output tensor after performing the sparse matrix multiplication and adding the bias (if present).
+        """
         output = torch.sparse.mm(self.weight, input.t()).t()
         if self.bias is not None:
             output += self.bias
@@ -39,31 +84,85 @@ class SparseLinear(nn.Module):
 
 
 def convert_sparse_weights_to_dense(model):
+    """
+    Converts sparse weights in a model to dense weights.
+
+        Iterates through the modules of the given model and converts any
+        SparseLinear layers' weights from a sparse format to a dense format,
+        replacing the original sparse weight tensor with its dense equivalent.
+
+        Args:
+            model: The PyTorch model whose weights are to be converted.
+
+        Returns:
+            None: This method modifies the model in-place and does not return a value.
+    """
     for module in model.modules():
         if isinstance(module, SparseLinear):
-            module.weight = nn.Parameter(module.weight.to_dense()) 
+            module.weight = nn.Parameter(module.weight.to_dense())
 
 
 def convert_dense_weights_to_sparse(model):
+    """
+    Converts dense weights in SparseLinear modules to sparse format.
+
+        Iterates through the model's modules and converts the weight of any
+        SparseLinear module from a dense tensor to a sparse tensor. This is done
+        in-place, modifying the model directly.
+
+        Args:
+            model: The PyTorch model containing potentially dense weights in
+                   SparseLinear layers.
+
+        Returns:
+            None: The function modifies the input model in place and does not return a value.
+    """
     for module in model.modules():
         if isinstance(module, SparseLinear):
-            module.weight = nn.Parameter(module.weight.to_sparse()) 
+            module.weight = nn.Parameter(module.weight.to_sparse())
 
 
 def convert_layer(layer):
+    """
+    Converts a PyTorch layer to a sparse equivalent if applicable.
+
+        Currently, only nn.Linear layers are converted to SparseLinear layers.
+        Other layer types are returned unchanged.
+
+        Args:
+            layer: The PyTorch layer to convert.
+
+        Returns:
+            The potentially converted layer (SparseLinear or the original layer).
+    """
     if isinstance(layer, nn.Linear):
         print(layer.bias)
         print(layer.bias is not None)
-        sparse_layer = SparseLinear(layer.in_features, layer.out_features, bias=layer.bias is not None)
+        sparse_layer = SparseLinear(
+            layer.in_features, layer.out_features, bias=layer.bias is not None
+        )
         sparse_layer.weight = nn.Parameter(layer.weight.to_sparse())
         if layer.bias is not None:
             sparse_layer.bias = nn.Parameter(layer.bias)
         return sparse_layer
     else:
         return layer
-        
+
 
 def convert_to_sparse(model):
+    """
+    Recursively converts dense layers to sparse layers within a model.
+
+        This function iterates through the model's children, and if it encounters an
+        nn.Sequential module, it recursively processes each layer within that sequence.
+        Otherwise, it directly applies the conversion to the module itself.
+
+        Args:
+            model: The PyTorch model to convert.
+
+        Returns:
+            The modified model with sparse layers.
+    """
     for name, module in model.named_children():
         if isinstance(module, nn.Sequential):
             for idx, layer in enumerate(module):
@@ -91,7 +190,19 @@ class SparseLinear(nn.Module):
                 torch.Tensor: Output tensor after applying the sparse linear transformation.
     """
 
-    def __init__(self, weight: torch.sparse.FloatTensor, bias: torch.sparse.FloatTensor):
+    def __init__(
+        self, weight: torch.sparse.FloatTensor, bias: torch.sparse.FloatTensor
+    ):
+        """
+        Initializes the SparseLinear layer.
+
+          Args:
+            weight: The sparse weight tensor.
+            bias: The sparse bias tensor.
+
+          Returns:
+            None
+        """
         super(SparseLinear, self).__init__()
 
         # sparse weight
@@ -106,18 +217,41 @@ class SparseLinear(nn.Module):
         self.bias_size = list(bias.coalesce().size())
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """
+        Performs a sparse matrix multiplication with learned weights and bias.
+
+          Args:
+            input: The input tensor to be multiplied by the sparse weight matrix.
+
+          Returns:
+            torch.Tensor: The output tensor after performing the sparse matrix
+              multiplication and adding the bias.
+        """
         # create real sparse weight and bias
         # weight in separated form needed for optimizer
-        sparse_weight = torch.sparse.FloatTensor(self.weight_indices, self.weight_values, self.weight_size)
-        sparse_bias = torch.sparse.FloatTensor(self.bias_indices, self.bias_values, self.bias_size).to_dense()
+        sparse_weight = torch.sparse.FloatTensor(
+            self.weight_indices, self.weight_values, self.weight_size
+        )
+        sparse_bias = torch.sparse.FloatTensor(
+            self.bias_indices, self.bias_values, self.bias_size
+        ).to_dense()
 
         output = torch.sparse.mm(sparse_weight, input.t()).t()
         output += sparse_bias.unsqueeze(0)
 
         return output
-    
+
 
 def dense_to_sparse(dense_tensor: torch.Tensor) -> torch.sparse.FloatTensor:
+    """
+    Converts a dense tensor to a sparse tensor.
+
+        Args:
+            dense_tensor: The dense tensor to convert.
+
+        Returns:
+            A sparse tensor representation of the input dense tensor.
+    """
     indices = dense_tensor.nonzero(as_tuple=True)
     values = dense_tensor[indices]
     indices = torch.stack(indices)
@@ -141,7 +275,7 @@ def convert_dense_to_sparse_network(model: nn.Module) -> nn.Module:
     """
     if isinstance(model, MyModel):
         new_model = model.__class__(model.layers)
-    else: 
+    else:
         new_model = model.__class__()
 
     for name, module in model.named_children():
@@ -172,7 +306,19 @@ class SparseRecursiveLinear(nn.Module):
         forward(input):
             Forward pass through all previous layers and the MAIN layer.
     """
+
     def __init__(self, sparse_linear, previous, is_last=False):
+        """
+        Initializes a SparseRecursiveLinear module.
+
+            Args:
+                sparse_linear: The linear layer to use for the current level.
+                previous: The previous SparseRecursiveLinear module in the recursion.
+                is_last: A boolean indicating if this is the last layer in the recursion.
+
+            Returns:
+                None
+        """
         super(SparseRecursiveLinear, self).__init__()
         self.sparse_linear = sparse_linear
         self.previous = previous
@@ -184,36 +330,89 @@ class SparseRecursiveLinear(nn.Module):
 
         self.child_counter = 0
 
-
     def replace(self, child, parent):
-        # mask of edge to remove in MAIN weight
-        matches = (self.sparse_linear.weight_indices[0] == child) &\
-                  (self.sparse_linear.weight_indices[1] == parent)
-        index_to_remove = matches.nonzero(as_tuple=True)[0] # index of edge to remove in MAIN weight
+        """
+        Replaces a connection in the sparse linear layer with a new one.
 
-        self.sparse_linear.weight_indices = self.sparse_linear.weight_indices[:, torch.logical_not(matches)] # remove edge from MAIN weight by masking
+            This method removes an existing edge between 'child' and 'parent' nodes
+            in the main weight matrix and adds a new edge from 'child' to a newly
+            created node (indexed by max_parent). It also updates the embedding weights
+            to reflect this change.
+
+            Args:
+                child: The child node index.
+                parent: The parent node index.
+
+            Returns:
+                None
+        """
+        # mask of edge to remove in MAIN weight
+        matches = (self.sparse_linear.weight_indices[0] == child) & (
+            self.sparse_linear.weight_indices[1] == parent
+        )
+        index_to_remove = matches.nonzero(as_tuple=True)[
+            0
+        ]  # index of edge to remove in MAIN weight
+
+        self.sparse_linear.weight_indices = self.sparse_linear.weight_indices[
+            :, torch.logical_not(matches)
+        ]  # remove edge from MAIN weight by masking
 
         # concated input from embed weight will pass through last vertices in MAIN layer
-        max_parent = self.sparse_linear.weight_indices[1].max() + 1 # increase number of nodes in "input" of MAIN layer
-        self.sparse_linear.weight_indices = torch.cat([self.sparse_linear.weight_indices, torch.tensor([[child, max_parent]]).t()], dim=1) # add new edge to MAIN weight
+        max_parent = (
+            self.sparse_linear.weight_indices[1].max() + 1
+        )  # increase number of nodes in "input" of MAIN layer
+        self.sparse_linear.weight_indices = torch.cat(
+            [
+                self.sparse_linear.weight_indices,
+                torch.tensor([[child, max_parent]]).t(),
+            ],
+            dim=1,
+        )  # add new edge to MAIN weight
 
-        value_to_remove = self.sparse_linear.weight_values[index_to_remove] # get value of deleted edge from MAIN weight
-        self.sparse_linear.weight_values.data = self.sparse_linear.weight_values[self.sparse_linear.weight_values != value_to_remove] # remove value of deleted edge from MAIN value list
+        value_to_remove = self.sparse_linear.weight_values[
+            index_to_remove
+        ]  # get value of deleted edge from MAIN weight
+        self.sparse_linear.weight_values.data = self.sparse_linear.weight_values[
+            self.sparse_linear.weight_values != value_to_remove
+        ]  # remove value of deleted edge from MAIN value list
         # todo smart weight generation
-        self.sparse_linear.weight_values.data = torch.cat([self.sparse_linear.weight_values.data, torch.rand(1)]) # add new random weight to end of MAIN value list
+        self.sparse_linear.weight_values.data = torch.cat(
+            [self.sparse_linear.weight_values.data, torch.rand(1)]
+        )  # add new random weight to end of MAIN value list
 
-        self.sparse_linear.weight_size[1] += 1 # increase number of nodes in "input" of MAIN layer
+        self.sparse_linear.weight_size[
+            1
+        ] += 1  # increase number of nodes in "input" of MAIN layer
 
         # add new edge to embed weight
         # where self.child_counter is number of nodes in embed weight
         # and parent is number of input node
-        self.embed_weight_indeces = torch.cat([self.embed_weight_indeces, torch.tensor([[self.child_counter, parent]]).t()], dim=1)
+        self.embed_weight_indeces = torch.cat(
+            [
+                self.embed_weight_indeces,
+                torch.tensor([[self.child_counter, parent]]).t(),
+            ],
+            dim=1,
+        )
         # todo smart weight generation
-        self.embed_weight_values.data = torch.cat([self.embed_weight_values, torch.rand(1)]) # add new random weight to end of embed value list
+        self.embed_weight_values.data = torch.cat(
+            [self.embed_weight_values, torch.rand(1)]
+        )  # add new random weight to end of embed value list
         self.embed_weight_size[0] += 1
         self.child_counter += 1
 
     def forward(self, input):
+        """
+        Passes the input through the embedding and main layers.
+
+            Args:
+                input: The input tensor to be processed.
+
+            Returns:
+                torch.Tensor: The output tensor after passing through the embedding
+                              and potentially a linear layer if this is the last recursive layer.
+        """
         # if previous layer exists pass input through prevuios layer
         if self.previous is not None:
             input = self.previous.forward(input)
@@ -223,7 +422,7 @@ class SparseRecursiveLinear(nn.Module):
         sparse_embed_weight = torch.sparse.FloatTensor(
             self.embed_weight_indeces,
             self.embed_weight_values,
-            list(self.embed_weight_size)
+            list(self.embed_weight_size),
         )
         # pass thourgh self weight
         output = torch.sparse.mm(sparse_embed_weight, input.t()).t()
