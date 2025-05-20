@@ -11,9 +11,7 @@ class SparseModule(ABC, nn.Module):
             "weight_indices", torch.empty(2, 0, dtype=torch.int, device=device)
         )
         self.weight_values = nn.Parameter(torch.empty(0, device=device))
-        self.register_buffer(
-            "weight_size", torch.tensor(weight_size, dtype=torch.long)
-        )
+        self.register_buffer("weight_size", torch.tensor(weight_size, dtype=torch.long))
         self.device = device
 
         self.activation = nn.ReLU()
@@ -23,7 +21,11 @@ class SparseModule(ABC, nn.Module):
             [[child, parent]], dtype=torch.int, device=self.device
         ).t()
         self.weight_indices = torch.cat([self.weight_indices, new_edge], dim=1)
-        new_weight = torch.tensor(original_weight, device=self.device).unsqueeze(0)
+        new_weight = (
+            torch.tensor(original_weight, device=self.device).unsqueeze(0)
+            if not isinstance(original_weight, torch.Tensor)
+            else original_weight.to(self.device)
+        )
         self.weight_values.data = torch.cat([self.weight_values.data, new_weight])
 
     def create_sparse_tensor(self):
@@ -39,7 +41,7 @@ class SparseModule(ABC, nn.Module):
         pass
 
     def epsilon(self):
-        return torch.rand(1).item() * 1e-8
+        return torch.rand(1) * 1e-8
 
     def replace_many(self, children, parents):
         for c, p in zip(children, parents):
