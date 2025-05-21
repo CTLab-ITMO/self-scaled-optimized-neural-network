@@ -3,10 +3,10 @@ requires = ['setuptools >= 61.0.0', 'wheel']
 build-backend = 'setuptools.build_meta'
 
 [project]
-name = 'senmodel'
+name = 'ssonn'
 version = '1.0.0'
 authors = []
-description = 'self-expanding-nets'
+description = 'Self-Scaled Optimized Neural Network'
 readme = 'README.md'
 requires-python = '>= 3.9'
 dependencies = [

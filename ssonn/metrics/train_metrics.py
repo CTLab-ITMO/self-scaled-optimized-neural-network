@@ -1,4 +1,4 @@
-from senmodel.model.utils import *
+from ssonn.model.utils import *
 
 def get_params_amount(model):
     amount = 0

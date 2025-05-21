@@ -1,11 +1,11 @@
 import time
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, mean_squared_error
-from senmodel.metrics.nonlinearity_metrics import AbsGradientEdgeMetric
-from senmodel.model.utils import *
+from ssonn.metrics.nonlinearity_metrics import AbsGradientEdgeMetric
+from ssonn.model.utils import *
 import torch.optim as optim
-from senmodel.metrics.train_metrics import *
-from senmodel.metrics.edge_finder import *
+from ssonn.metrics.train_metrics import *
+from ssonn.metrics.edge_finder import *
 import wandb
 
 
