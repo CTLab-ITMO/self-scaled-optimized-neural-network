@@ -128,13 +128,18 @@ def train_sparse_recursive(model, train_loader, val_loader, test_loader, criteri
     
     model = model.to(device)
     
-    ef = EdgeFinder(hyperparams['metric'], val_loader, device=device, aggregation_mode=hyperparams['aggregation_mode'], max_to_replace=hyperparams['max_to_replace'])
-    # efg = EdgeFinder(AbsGradientEdgeMetric, val_loader, device=device, aggregation_mode='mean')
+    ef = EdgeFinder(
+        hyperparams['edge_importance_metric'],
+        val_loader,
+        device=device,
+        aggregation_mode=hyperparams['edge_score_aggregation'],
+        max_to_replace=hyperparams['max_new_edges_per_expansion']
+    )
 
     non_zero_masks = {}
-
     replace_epoch = [0]
     val_losses = []
+    
     for epoch in range(hyperparams['num_epochs']):
         train_loss, train_time = train_one_epoch(model, optimizer, criterion, train_loader, device)
         val_loss, val_accuracy = eval_one_epoch(model, criterion, test_loader, hyperparams['task_type'], device)
@@ -144,45 +149,65 @@ def train_sparse_recursive(model, train_loader, val_loader, test_loader, criteri
         print(f"Epoch {epoch + 1}/{hyperparams['num_epochs']}, Train Loss: {train_loss:.4f}, "
               f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
         
-        # todo check, maybe need min(max(min_delt, wind_size), del_after) or something like that 
-        if epoch - replace_epoch[-1] > max(hyperparams['delete_after'], hyperparams['min_delta_epoch_replace'], hyperparams['window_size']):
-            recent_changes = [abs(val_losses[i] - val_losses[i - 1]) for i in range(-hyperparams['window_size'], 0)]
-            avg_change = sum(recent_changes) / hyperparams['window_size']
-            if avg_change < hyperparams['threshold']:
+        if epoch - replace_epoch[-1] > max(
+            hyperparams['prune_after_epochs'],
+            hyperparams['min_epochs_between_expansions'],
+            hyperparams['plateau_window_size']
+        ):
+            recent_changes = [
+                abs(val_losses[i] - val_losses[i - 1])
+                for i in range(-hyperparams['plateau_window_size'], 0)
+            ]
+            avg_change = sum(recent_changes) / hyperparams['plateau_window_size']
+            if avg_change < hyperparams['plateau_threshold']:
                 len_choose = 0
-                for layer_name in hyperparams['choose_thresholds'].keys():
+                for layer_name in hyperparams['expansion_thresholds'].keys():
                     layer = model.__getattr__(layer_name)
-                    len_choose += edge_replacement_func_new_layer(model, layer, optimizer, hyperparams['choose_thresholds'][layer_name], ef, hyperparams['fully_connected'])
+                    len_choose += edge_replacement_func_new_layer(
+                        model, layer, optimizer,
+                        hyperparams['expansion_thresholds'][layer_name],
+                        ef,
+                        hyperparams['start_fully_connected']
+                    )
                     non_zero_masks[layer_name] = layer.get_non_zero_params()
                 replace_epoch += [epoch]
 
-
-        if epoch - replace_epoch[-1] == hyperparams['delete_after'] and replace_epoch[-1] != 0:
+        if epoch - replace_epoch[-1] == hyperparams['prune_after_epochs'] and replace_epoch[-1] != 0:
             len_choose = 0
-            for layer_name in hyperparams["choose_thresholds_del"].keys():
+            for layer_name in hyperparams["pruning_thresholds"].keys():
                 layer = model.__getattr__(layer_name)
-                len_choose += edge_deletion_func_new_layer(model, layer, optimizer, non_zero_masks[layer_name], hyperparams["choose_thresholds_del"][layer_name], ef)
-            
+                len_choose += edge_deletion_func_new_layer(
+                    model, layer, optimizer,
+                    non_zero_masks[layer_name],
+                    hyperparams["pruning_thresholds"][layer_name],
+                    ef
+                )
         
         params_amount = get_params_amount(model)
         replace_params = 0
-        for layer_name in hyperparams['choose_thresholds'].keys():
+        for layer_name in hyperparams['expansion_thresholds'].keys():
             layer = model.__getattr__(layer_name)
-            
-            replace_params += len(ef.choose_edges_threshold(model, layer, hyperparams['choose_thresholds'][layer_name])[0])
+            replace_params += len(ef.choose_edges_threshold(model, layer, hyperparams['expansion_thresholds'][layer_name])[0])
 
-        logs = {'val loss': val_loss, 'val accuracy': val_accuracy,
-                'train loss': train_loss, 'params amount': params_amount,
-                'params to replace amount': replace_params, 'train time': train_time,
-                'params ratio': (params_amount - replace_params) / params_amount,
-                'lr': optimizer.param_groups[0]['lr'], 'acc amount': val_accuracy / params_amount,
-                'n_params over train_time': params_amount / train_time,
-                'train_time over n_params': train_time / params_amount}
+        logs = {
+            'val loss': val_loss, 'val accuracy': val_accuracy,
+            'train loss': train_loss, 'params amount': params_amount,
+            'params to replace amount': replace_params, 'train time': train_time,
+            'params ratio': (params_amount - replace_params) / params_amount,
+            'lr': optimizer.param_groups[0]['lr'],
+            'acc amount': val_accuracy / params_amount,
+            'n_params over train_time': params_amount / train_time,
+            'train_time over n_params': train_time / params_amount
+        }
 
-        if (epoch in replace_epoch) and epoch != 0: logs['len_choose'] = len_choose
-        else: logs.pop('len_choose', None)
-        
-        if (epoch + hyperparams['delete_after'] in replace_epoch) and epoch != 0: logs['del_len_choose'] = len_choose
-        else: logs.pop('del_len_choose', None)
+        if (epoch in replace_epoch) and epoch != 0:
+            logs['len_choose'] = len_choose
+        else:
+            logs.pop('len_choose', None)
+
+        if (epoch + hyperparams['prune_after_epochs'] in replace_epoch) and epoch != 0:
+            logs['del_len_choose'] = len_choose
+        else:
+            logs.pop('del_len_choose', None)
 
         wandb.log(logs)
