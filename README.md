@@ -1,10 +1,4 @@
-# self-expanding-nets
-
----
-
-[![OSA-improved](https://img.shields.io/badge/improved%20by-OSA-yellow)](https://github.com/aimclub/OSA)
-
----
+# SSONN: Self-Scaled Optimized Neural Network
 
 ## Overview
 
@@ -14,27 +8,9 @@ The system automatically identifies which connections to add based on how much e
 
 ---
 
-## Repository content
-
-The self-expanding-nets repository implements a novel approach to neural network training called Self-Scaled Optimized Neural Networks (SSONN). The core idea is to start with a minimal network and dynamically expand it during training, rather than pre-training a large model and then compressing it. Here's a breakdown of the key components and their relationships:
-
-1. **Model (`senmodel/model`)**: This component defines the building blocks of the expanding neural networks. It includes `SparseModule`, an abstract base class for sparse network modules, and concrete implementations like `EmbedLinear` and `ExpandingLinear`. These classes manage the addition of connections (edges) and weights in a sparse manner, allowing the network to grow efficiently. The `ExpandingLinear` class is central as it handles the iterative expansion process.
-
-2. **Training (`senmodel/train`)**: This component contains the training loop and related functions. It includes `train_one_epoch` and `eval_one_epoch` for standard training and evaluation, but crucially also incorporates functions like `edge_replacement_func_new_layer` and `edge_deletion_func_new_layer`. These functions implement the core SSONN logic of adding and removing connections based on gradient information.
-
-3. **Metrics (`senmodel/metrics`)**: This component provides tools for evaluating edge importance and guiding the expansion process. The `EdgeFinder` class uses a `NonlinearityMetric` (like `AbsGradientEdgeMetric`) to calculate an importance score for each connection in the network, determining which edges should be added or removed.
-
-4. **Experiments (`experiments`)**: This directory contains Jupyter notebooks used for experimentation and demonstration. The `experiment.ipynb` notebook showcases a complete training pipeline using SSONN on a simple dataset (likely MNIST or Fashion-MNIST). It ties together the model, training loop, and metrics to demonstrate the functionality.
-
-5. **Pruning (`experiments/speed_eval`)**: This component provides functions for evaluating sensitivity of weights and performing pruning operations based on different strategies like L1, Random, and SensitivityBased pruning.
-
-The components work together as follows: The training loop uses the model to make predictions and calculate a loss.  The metrics component then analyzes the gradients to identify important edges. Based on this analysis, the training process dynamically expands or prunes the network using functions in the `senmodel/train` module. This iterative cycle continues until the desired performance is achieved. The experiments directory provides examples of how these components are used together.
-
----
-
 ## Used algorithms
 
-The codebase implements several algorithms centered around dynamically growing a neural network during training. 
+The codebase implements several algorithms centered around dynamically growing a neural network during training.
 
 **Sparse Network Initialization:** The process begins with creating a minimal, sparse network structure instead of a fully connected one. This sets the stage for efficient expansion.
 
