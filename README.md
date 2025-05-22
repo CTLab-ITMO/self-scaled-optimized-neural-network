@@ -6,10 +6,7 @@ SSONN introduces an innovative approach to building neural networks that dynamic
 
 The system automatically identifies and adds connections based on their contribution to learning, achieving performance comparable to dense networks with a fraction of the parameters. Experiments demonstrate promising results on image recognition tasks, with ongoing work to expand layer support and mitigate overfitting risks.
 
-
-
 ![Alt text](res/ssonn_diagram.svg)
-
 
 ## Installation
 
@@ -24,14 +21,19 @@ To set up SSONN, install the required dependencies using the following commands:
 
 ## Training and Evaluation
 
-Reproducible experiments are available for the following datasets:
+| Dataset | Path | Weights |
+| ------- | ---- | ------- |
+| MNIST |  [mnist.ipynb](experiments/training/mnist.ipynb) | [link](https://drive.google.com/file/d/1CsDBrzTzQtdIOACsUZEs-XzTS2Wd7GFe/view?usp=sharing) |
+| Fashion-MNIST | [fashion_mnist.ipynb](experiments/training/fashion_mnist.ipynb) | [link](https://drive.google.com/file/d/18Re93V_PgoqTeMKLxvcY1H7SEZ2SArNy/view?usp=sharing) |
+| Gutenberg | [gutenberg.ipynb](experiments/training/nas_unseen_experiments/Gutenberg.ipynb) | [link](https://drive.google.com/file/d/18yYbL89Cc-4hUPNq2Ht8d8MrXzpUiElN/view?usp=sharing) |
+| MultNIST | [multnist.ipynb](experiments/training/nas_unseen_experiments/multnist.ipynb) | [link](https://drive.google.com/file/d/1qN8tOU2oqDJL9FwWl_9W3RsRX2L6xtVW/view?usp=sharing) |
+| AddNIST | [addnist.ipynb](experiments/training/nas_unseen_experiments/addnist.ipynb) | [link](https://drive.google.com/file/d/1_sUu99tWR9qQHVZv3Fut7zvny6u2lMvz/view) |
+| CIFARTile | [ctile.ipynb](experiments/training/nas_unseen_experiments/ctile.ipynb) | [link](https://drive.google.com/file/d/1398YdTJQp2jcSg8O_WlzD5jeRt4CjFoc/view?usp=sharing) |
+| Chesseract | [chesseract.ipynb](experiments/training/nas_unseen_experiments/chesseract.ipynb) | [link](https://drive.google.com/file/d/1uXgxIeJWaBqEbNzPxJcO4fu-Vw2XIXDi/view?usp=sharing) |
+| GeoClassing | [geoclassing.ipynb](experiments/training/nas_unseen_experiments/geoclassing.ipynb) | [link](https://drive.google.com/file/d/1WGMBwHyK3Fj40L4L3KOheEUHr51msRnA/view?usp=sharing) |
+| Language | [language.ipynb](experiments/training/nas_unseen_experiments/language.ipynb) | [link](https://drive.google.com/file/d/1eVM13_f4REQOlJVXbUnGnINpucgEI7i7/view?usp=sharing) |
 
-- [MNIST](https://colab.research.google.com/drive/1oeLnB_yudncUJFEMEM4lhDAbH3Mf6SZL?usp=sharing)
-- [Gutenberg](https://colab.research.google.com/drive/1QtEhq8b_p4HR6aRlvaxHG5suqs5o_gzp?usp=sharing)
-- [MultNIST](https://colab.research.google.com/drive/1vGSCg5Tn9kiq17rPtIkUT3vG2vOK-cqO?usp=sharing)
-- [AddNIST](https://colab.research.google.com/drive/1JMz-YlqMt0ZH4yXLXqg9RUB5XPfxUsb7?usp=sharing)
-
-Additional experiments can be found in the `experiments/training` folder.
+Other experiment can be found in the `experiments/training` folder.
 
 ## Results
 
