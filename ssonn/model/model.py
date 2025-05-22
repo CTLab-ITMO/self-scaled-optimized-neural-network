@@ -11,7 +11,8 @@ class SparseModule(ABC, nn.Module):
     This class provides functionality to create, modify, and represent sparse
     connections within a neural network using a graph-like structure. It allows
     for adding edges with associated weights and constructing sparse tensors from
-    this data. 老天保佑金山银山前路有"""
+    this data.
+    """
 
     def __init__(self, weight_size, device="cpu"):
         """
