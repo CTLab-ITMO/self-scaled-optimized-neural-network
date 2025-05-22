@@ -5,6 +5,13 @@ from ..model.utils import get_model_last_layer
 
 
 class EdgeFinder:
+    """
+    Finds and selects edges in a neural network based on a calculated metric.
+
+    This class provides methods to calculate an edge metric for a given layer of a model,
+    and then select edges based on a threshold applied to this metric. It's designed
+    to help identify important connections within the network."""
+    
     def __init__(
         self,
         metric: NonlinearityMetric,
@@ -13,6 +20,21 @@ class EdgeFinder:
         aggregation_mode="mean",
         max_to_replace=None,
     ):
+        """
+        Initializes the NonlinearityAnalyzer with metric, dataloader and device settings.
+
+            Args:
+                metric: The nonlinearity metric to use for analysis.
+                dataloader: Data loader providing batches of data.
+                device:  The PyTorch device to run computations on. Defaults to CPU.
+                aggregation_mode: How to aggregate the metric across the dataset ("mean" or "variance").
+                                  Defaults to "mean".
+                max_to_replace: Maximum number of samples to replace with the calculated metric.
+
+            Returns:
+                None
+        """
+        
         self.max_to_replace = max_to_replace
         self.metric = metric
         self.dataloader = dataloader
@@ -26,6 +48,19 @@ class EdgeFinder:
     def calculate_edge_metric_for_dataloader(
         self, model, layer, to_normalise=True, embed=False
     ):
+        """
+        Calculates an edge metric for a dataloader using specified aggregation.
+
+            Args:
+                model: The model being evaluated.
+                layer: The layer for which the metric is calculated.
+                to_normalise: Whether to normalise the aggregated metric.
+                embed:  Whether to embed the data during metric calculation.
+
+            Returns:
+                torch.Tensor: The aggregated and optionally normalised edge metric.
+        """
+        
         if self.aggregation_mode == "mean":
             accumulated = None
             for data, target in self.dataloader:
@@ -76,6 +111,19 @@ class EdgeFinder:
     #     return last_layer.weight_indices[:, sorted_indices[:k]]
 
     def choose_edges_threshold(self, model, layer, threshold, embed=False):
+        """
+        Chooses edges based on a given threshold of their average metric.
+
+            Args:
+                model: The model being analyzed.
+                layer: The layer whose edges are being selected.
+                threshold: The threshold value for selecting edges (between 0 and 1).
+                embed: Whether to embed the results or not.
+
+            Returns:
+                torch.Tensor: A tensor containing the indices of the chosen edges.
+        """
+        
         assert 0 < threshold <= 1
         avg_metric = self.calculate_edge_metric_for_dataloader(
             model=model, layer=layer, to_normalise=True, embed=embed
