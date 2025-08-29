@@ -6,11 +6,11 @@ from ssonn.model.utils import *
 import torch.optim as optim
 from ssonn.metrics.train_metrics import *
 from ssonn.metrics.edge_finder import *
-import wandb
+# import wandb
 import matplotlib.pyplot as plt
 
 
-def train_one_epoch(model, optimizer, criterion, train_loader, experiment, epoch, device):
+def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, experiment=None, use_log_tool=True):
     """
     Trains the model for one epoch.
 
@@ -51,11 +51,13 @@ def train_one_epoch(model, optimizer, criterion, train_loader, experiment, epoch
     train_loss /= len(train_loader)
     train_time = time.time() - t0
 
-    log_gradient_values("expanding grads", expanding_gradients, experiment, epoch)
-    log_gradient_histograms("expanding grads hist", expanding_gradients, experiment, epoch)
-    for i in range(len(model.fc0.embed_linears)): 
-        log_gradient_values(f"embed grads {i}", [el[i] for el in embed_gradients], experiment, epoch)
-        log_gradient_histograms(f"embed grads hist {i}", [el[i] for el in embed_gradients], experiment, epoch)
+    if use_log_tool:
+        log_gradient_values("expanding grads", expanding_gradients, experiment, epoch)
+        log_gradient_histograms("expanding grads hist", expanding_gradients, experiment, epoch)
+        for i in range(len(model.fc0.embed_linears)): 
+            log_gradient_values(f"embed grads {i}", [el[i] for el in embed_gradients], experiment, epoch)
+            log_gradient_histograms(f"embed grads hist {i}", [el[i] for el in embed_gradients], experiment, epoch)
+    
     return train_loss, train_time
 
 
@@ -267,8 +269,9 @@ def train_sparse_recursive(
     criterion,
     optimizer,
     hyperparams,
-    experiment,
     device,
+    experiment=None,
+    use_log_tool=True
 ):
     """
     Trains a model with sparse recursive edge replacement and deletion.
@@ -282,7 +285,8 @@ def train_sparse_recursive(
             optimizer: The optimizer to use.
             hyperparams: A dictionary containing hyperparameters for training and sparsity.
             device: The device (CPU or GPU) to train on.
-
+            experiment: 
+            use_log_tool:
         Returns:
             None.  This method trains the model in-place and logs metrics using wandb.
     """
@@ -303,7 +307,7 @@ def train_sparse_recursive(
 
     for epoch in range(hyperparams["num_epochs"]):
         train_loss, train_time = train_one_epoch(
-            model, optimizer, criterion, train_loader, experiment, epoch, device
+            model, optimizer, criterion, train_loader, epoch, device, experiment
         )
         val_loss, val_accuracy = eval_one_epoch(
             model, criterion, test_loader, hyperparams["task_type"], device
@@ -392,5 +396,6 @@ def train_sparse_recursive(
             logs.pop("del_len_choose", None)
 
         # wandb.log(logs)
-        experiment.log_metrics(logs, epoch=epoch)
+        if use_log_tool:
+            experiment.log_metrics(logs, epoch=epoch)
 
