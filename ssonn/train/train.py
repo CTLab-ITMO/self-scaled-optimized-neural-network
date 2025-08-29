@@ -7,9 +7,10 @@ import torch.optim as optim
 from ssonn.metrics.train_metrics import *
 from ssonn.metrics.edge_finder import *
 import wandb
+import matplotlib.pyplot as plt
 
 
-def train_one_epoch(model, optimizer, criterion, train_loader, device):
+def train_one_epoch(model, optimizer, criterion, train_loader, experiment, epoch, device):
     """
     Trains the model for one epoch.
 
@@ -27,17 +28,34 @@ def train_one_epoch(model, optimizer, criterion, train_loader, device):
     t0 = time.time()
     model.train()
     train_loss = 0
+    
+    expanding_gradients = []
+    embed_gradients = []
+
     for i, (inputs, targets) in enumerate(tqdm(train_loader)):
         inputs, targets = inputs.to(device), targets.to(device)
         outputs = model(inputs)
         loss = criterion(outputs, targets)
         optimizer.zero_grad()
         loss.backward()
+        
+        expanding_gradients += [model.fc0.weight_values.grad.clone().detach().cpu()]
+        embed_gradients_temp = []
+        for i in range(len(model.fc0.embed_linears)):
+            embed_gradients_temp += [model.fc0.embed_linears[i].weight_values.grad.clone().detach().cpu()]
+        embed_gradients += [embed_gradients_temp]
+
         optimizer.step()
         train_loss += loss.item()
 
     train_loss /= len(train_loader)
     train_time = time.time() - t0
+
+    log_gradient_values("expanding grads", expanding_gradients, experiment, epoch)
+    log_gradient_histograms("expanding grads hist", expanding_gradients, experiment, epoch)
+    for i in range(len(model.fc0.embed_linears)): 
+        log_gradient_values(f"embed grads {i}", [el[i] for el in embed_gradients], experiment, epoch)
+        log_gradient_histograms(f"embed grads hist {i}", [el[i] for el in embed_gradients], experiment, epoch)
     return train_loss, train_time
 
 
@@ -185,6 +203,62 @@ def edge_deletion_func_new_layer(model, layer, optim, masks, choose_threshold, e
     return len(chosen_edges_emb[0]) + len(chosen_edges_exp[0])
 
 
+def log_gradient_image(gradients, experiment, epoch):
+    avg_gradients = torch.stack(gradients).mean(dim=0) 
+    gradient_images = []
+    for i in range(10):  
+        grad_img = avg_gradients[i*28*28:(i+1)*28*28].view(28, 28).numpy()
+        gradient_images.append(grad_img)
+    
+    fig, axes = plt.subplots(2, 5, figsize=(15, 6))
+    axes = axes.flatten()
+    
+    for i, grad_img in enumerate(gradient_images):
+        im = axes[i].imshow(grad_img, cmap='viridis')
+        axes[i].set_title(f'Neuron {i} Gradients')
+        axes[i].axis('off')
+        plt.colorbar(im, ax=axes[i])
+    
+    plt.tight_layout()
+    experiment.log_figure(f"gradients_image", fig, step=epoch)
+    plt.close(fig)
+    
+    # experiment.log_histogram_3d(avg_gradients, name="expanding linear grads", step=epoch)
+
+def log_gradient_values(name, gradients, experiment, epoch):
+    avg_gradients = torch.stack(gradients).mean(dim=0)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    ax.plot(range(len(avg_gradients)), avg_gradients, 'b-', alpha=0.7, linewidth=1)
+    ax.scatter(range(len(avg_gradients)), avg_gradients, s=10, alpha=0.5, color='blue')
+    
+    ax.set_xlabel('Neuron Index (in flattened array)')
+    ax.set_ylabel('Gradient Value')
+    ax.set_title(f'Gradient Values vs Neuron Index (Epoch {epoch})')
+    ax.grid(True, alpha=0.3)
+    
+    ax.axhline(y=0, color='red', linestyle='--', alpha=0.5, linewidth=1)
+    
+    plt.tight_layout()
+    experiment.log_figure(name, fig, step=epoch)
+    plt.close(fig)
+
+def log_gradient_histograms(name, gradients, experiment, epoch):
+    avg_gradients = torch.stack(gradients).mean(dim=0)
+    
+    fig, ax = plt.subplots(figsize=(6, 6))
+    
+    ax.hist(avg_gradients, bins=50, alpha=0.7, color='blue', edgecolor='black')
+    ax.set_xlabel('Gradient Value')
+    ax.set_ylabel('Frequency')
+    ax.grid(True, alpha=0.3)
+    
+    ax.set_xlim(-5e-4, 5e-4)
+    plt.tight_layout()
+    experiment.log_figure(name, fig, step=epoch)
+    plt.close(fig)
+
+
 def train_sparse_recursive(
     model,
     train_loader,
@@ -193,6 +267,7 @@ def train_sparse_recursive(
     criterion,
     optimizer,
     hyperparams,
+    experiment,
     device,
 ):
     """
@@ -228,7 +303,7 @@ def train_sparse_recursive(
 
     for epoch in range(hyperparams["num_epochs"]):
         train_loss, train_time = train_one_epoch(
-            model, optimizer, criterion, train_loader, device
+            model, optimizer, criterion, train_loader, experiment, epoch, device
         )
         val_loss, val_accuracy = eval_one_epoch(
             model, criterion, test_loader, hyperparams["task_type"], device
@@ -316,4 +391,6 @@ def train_sparse_recursive(
         else:
             logs.pop("del_len_choose", None)
 
-        wandb.log(logs)
+        # wandb.log(logs)
+        experiment.log_metrics(logs, epoch=epoch)
+
