@@ -8,7 +8,7 @@ from ssonn.metrics.train_metrics import *
 from ssonn.metrics.edge_finder import *
 # import wandb
 import matplotlib.pyplot as plt
-
+import numpy as np
 
 def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, experiment=None, use_log_tool=True):
     """
@@ -98,6 +98,32 @@ def eval_one_epoch(model, criterion, val_loader, task_type, device):
 
     if task_type == "classification":
         metric = accuracy_score(all_targets, all_preds)
+        
+        all_targets = np.array(all_targets)
+        all_preds = np.array(all_preds)
+        
+        print(f"\n{'Class':<10} {'Accuracy':<10} {'Samples':<10}")
+        print("-" * 30)
+        
+        class_accuracies = []
+        for class_idx in range(10):
+            class_mask = all_targets == class_idx
+            if np.sum(class_mask) > 0:
+                class_accuracy = accuracy_score(
+                    all_targets[class_mask], 
+                    all_preds[class_mask]
+                )
+                class_accuracies.append(class_accuracy)
+                print(f"{class_idx:<10} {class_accuracy:.4f}    {np.sum(class_mask):<10}")
+            else:
+                class_accuracies.append(0.0)
+                print(f"{class_idx:<10} {'N/A':<10} {0:<10}")
+        
+        avg_class_accuracy = np.mean([acc for acc in class_accuracies if acc > 0])
+        print("-" * 30)
+        print(f"{'Average':<10} {avg_class_accuracy:.4f}")
+        print(f"{'Overall':<10} {metric:.4f}")
+  
     else:
         metric = mean_squared_error(all_targets, all_preds)
 
@@ -105,7 +131,7 @@ def eval_one_epoch(model, criterion, val_loader, task_type, device):
 
 
 def edge_replacement_func_new_layer(
-    model, layer, optim, choose_threshold, ef, fully_connected=False
+    model, layer, optim, choose_threshold, ef, experiment, fully_connected=False
 ):
     """
     Replaces edges in a given layer based on a threshold and updates the optimizer.
@@ -129,6 +155,9 @@ def edge_replacement_func_new_layer(
     """
 
     chosen_edges = ef.choose_edges_threshold(model, layer, choose_threshold)
+    if len(layer.embed_linears) == 0:
+        log_replaces(chosen_edges, experiment)
+
     print("Chosen edges:", chosen_edges, len(chosen_edges[0]))
     layer.replace_many(*chosen_edges, fully_connected)
 
@@ -260,6 +289,36 @@ def log_gradient_histograms(name, gradients, experiment, epoch):
     experiment.log_figure(name, fig, step=epoch)
     plt.close(fig)
 
+def log_replaces(chosen_edges, experiment, ):
+    image_indices = chosen_edges[0].cpu().numpy()
+    pixel_indices = chosen_edges[1].cpu().numpy()
+    
+    class_masks = {}
+    for class_idx in range(10):
+        class_pixels = pixel_indices[image_indices == class_idx]
+        
+        mask = np.zeros(784)
+        for pixel in class_pixels:
+            mask[pixel] += 1
+        
+        mask = mask / mask.max()
+        class_masks[class_idx] = mask.reshape(28, 28)
+    
+    fig, axes = plt.subplots(2, 5, figsize=(15, 6))
+    axes = axes.flatten()
+    
+    for class_idx in range(10):
+        mask = class_masks.get(class_idx, np.zeros((28, 28)))
+        
+        im = axes[class_idx].imshow(mask, cmap='hot', interpolation='nearest')
+        axes[class_idx].set_title(f'Class {class_idx}\n({np.sum(mask > 0)} pixels)')
+        axes[class_idx].axis('off')
+        plt.colorbar(im, ax=axes[class_idx], shrink=0.8)
+    
+    plt.tight_layout()
+    experiment.log_figure("chosen_pixels_per_class", fig)
+    plt.close(fig)
+
 
 def train_sparse_recursive(
     model,
@@ -340,6 +399,7 @@ def train_sparse_recursive(
                         optimizer,
                         hyperparams["expansion_thresholds"][layer_name],
                         ef,
+                        experiment,
                         hyperparams["start_fully_connected"],
                     )
                     non_zero_masks[layer_name] = layer.get_non_zero_params()
