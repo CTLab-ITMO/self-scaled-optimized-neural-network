@@ -9,6 +9,7 @@ from ssonn.metrics.edge_finder import *
 # import wandb
 import matplotlib.pyplot as plt
 import numpy as np
+from copy import deepcopy
 
 def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, experiment=None, use_log_tool=True):
     """
@@ -24,13 +25,15 @@ def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, ex
         Returns:
             tuple: A tuple containing the average training loss and the time taken for the epoch.
     """
-
     t0 = time.time()
     model.train()
+
     train_loss = 0
-    
     expanding_gradients = []
     embed_gradients = []
+
+    for i in range(len(model.fc0.embed_linears)):
+        model.fc0.embed_linears[i].training = True
 
     for i, (inputs, targets) in enumerate(tqdm(train_loader)):
         inputs, targets = inputs.to(device), targets.to(device)
@@ -38,11 +41,14 @@ def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, ex
         loss = criterion(outputs, targets)
         optimizer.zero_grad()
         loss.backward()
-        
+
         expanding_gradients += [model.fc0.weight_values.grad.clone().detach().cpu()]
         embed_gradients_temp = []
         for i in range(len(model.fc0.embed_linears)):
-            embed_gradients_temp += [model.fc0.embed_linears[i].weight_values.grad.clone().detach().cpu()]
+            if model.fc0.embed_linears[i].weight_values.grad is not None:
+                embed_gradients_temp += [model.fc0.embed_linears[i].weight_values.grad.clone().detach().cpu()]
+            else:
+                embed_gradients_temp += [0]
         embed_gradients += [embed_gradients_temp]
 
         optimizer.step()
@@ -54,11 +60,17 @@ def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, ex
     if use_log_tool:
         log_gradient_values("expanding grads", expanding_gradients, experiment, epoch)
         log_gradient_histograms("expanding grads hist", expanding_gradients, experiment, epoch)
-        for i in range(len(model.fc0.embed_linears)): 
-            log_gradient_values(f"embed grads {i}", [el[i] for el in embed_gradients], experiment, epoch)
-            log_gradient_histograms(f"embed grads hist {i}", [el[i] for el in embed_gradients], experiment, epoch)
+        # for i in range(len(model.fc0.embed_linears)): 
+        #     log_gradient_values(f"embed grads {i}", [el[i] for el in embed_gradients], experiment, epoch)
+        #     log_gradient_histograms(f"embed grads hist {i}", [el[i] for el in embed_gradients], experiment, epoch)
     
-    return train_loss, train_time
+    # for name, param in model.named_parameters():
+    #     if param.requires_grad and param.grad is not None:
+    #         print(f"{name}: grad norm = {param.grad.norm()}")
+    #     elif not param.requires_grad:
+    #         print(f"{name}: frozen (no grad)")
+
+    return train_loss, train_time, expanding_gradients, embed_gradients
 
 
 def eval_one_epoch(model, criterion, val_loader, task_type, device):
@@ -80,6 +92,10 @@ def eval_one_epoch(model, criterion, val_loader, task_type, device):
     val_loss = 0
     all_targets = []
     all_preds = []
+    
+    for i in range(len(model.fc0.embed_linears)):
+        model.fc0.embed_linears[i].training = False
+
     with torch.no_grad():
         for inputs, targets in val_loader:
             inputs, targets = inputs.to(device), targets.to(device)
@@ -98,32 +114,9 @@ def eval_one_epoch(model, criterion, val_loader, task_type, device):
 
     if task_type == "classification":
         metric = accuracy_score(all_targets, all_preds)
-        
         all_targets = np.array(all_targets)
         all_preds = np.array(all_preds)
-        
-        print(f"\n{'Class':<10} {'Accuracy':<10} {'Samples':<10}")
         print("-" * 30)
-        
-        class_accuracies = []
-        for class_idx in range(10):
-            class_mask = all_targets == class_idx
-            if np.sum(class_mask) > 0:
-                class_accuracy = accuracy_score(
-                    all_targets[class_mask], 
-                    all_preds[class_mask]
-                )
-                class_accuracies.append(class_accuracy)
-                print(f"{class_idx:<10} {class_accuracy:.4f}    {np.sum(class_mask):<10}")
-            else:
-                class_accuracies.append(0.0)
-                print(f"{class_idx:<10} {'N/A':<10} {0:<10}")
-        
-        avg_class_accuracy = np.mean([acc for acc in class_accuracies if acc > 0])
-        print("-" * 30)
-        print(f"{'Average':<10} {avg_class_accuracy:.4f}")
-        print(f"{'Overall':<10} {metric:.4f}")
-  
     else:
         metric = mean_squared_error(all_targets, all_preds)
 
@@ -162,11 +155,15 @@ def edge_replacement_func_new_layer(
     layer.replace_many(*chosen_edges, fully_connected)
 
     if len(chosen_edges[0]) > 0:
+        last_lrs = [optim.param_groups[i]["lr"] for i in range(len(optim.param_groups))]
+        last_lrs.append(last_lrs[-1])
+        print(last_lrs)
         optim.param_groups.clear()
         optim.state.clear()
+        optim.add_param_group({"params": layer.weight_values, "lr": last_lrs[0]})
         for i in range(len(layer.embed_linears)):
-            optim.add_param_group({"params": layer.embed_linears[i].weight_values})
-        optim.add_param_group({"params": layer.weight_values})
+            optim.add_param_group({"params": layer.embed_linears[i].weight_values, "lr": last_lrs[i+1]})
+    
     return len(chosen_edges[0])
 
 
@@ -225,19 +222,22 @@ def edge_deletion_func_new_layer(model, layer, optim, masks, choose_threshold, e
 
     layer.delete_many(chosen_edges_emb, chosen_edges_exp)
 
+    last_lrs = [optim.param_groups[i]["lr"] for i in range(len(optim.param_groups))]
+    print(last_lrs)
     optim.param_groups.clear()
     optim.state.clear()
+
+    optim.add_param_group({"params": layer.weight_values, 'lr': last_lrs[0]})
     for i in range(len(layer.embed_linears)):
-        optim.add_param_group({"params": layer.embed_linears[i].weight_values})
-    optim.add_param_group({"params": layer.weight_values})
+        optim.add_param_group({"params": layer.embed_linears[i].weight_values, 'lr': last_lrs[i+1]})
 
     return len(chosen_edges_emb[0]) + len(chosen_edges_exp[0])
 
 
 def log_gradient_image(gradients, experiment, epoch):
-    avg_gradients = torch.stack(gradients).mean(dim=0) 
+    avg_gradients = torch.stack(gradients).mean(dim=0)
     gradient_images = []
-    for i in range(10):  
+    for i in range(10):
         grad_img = avg_gradients[i*28*28:(i+1)*28*28].view(28, 28).numpy()
         gradient_images.append(grad_img)
     
@@ -269,6 +269,7 @@ def log_gradient_values(name, gradients, experiment, epoch):
     ax.grid(True, alpha=0.3)
     
     ax.axhline(y=0, color='red', linestyle='--', alpha=0.5, linewidth=1)
+    ax.set_ylim(-1e-3, 1e-3)
     
     plt.tight_layout()
     experiment.log_figure(name, fig, step=epoch)
@@ -363,9 +364,12 @@ def train_sparse_recursive(
     non_zero_masks = {}
     replace_epoch = [0]
     val_losses = []
-
+    last_avg_expand_gradients = 0
+    last_avg_embed_gradients = 0
     for epoch in range(hyperparams["num_epochs"]):
-        train_loss, train_time = train_one_epoch(
+        # print(list(model.named_parameters()))
+
+        train_loss, train_time, expanding_gradients, embed_gradients = train_one_epoch(
             model, optimizer, criterion, train_loader, epoch, device, experiment
         )
         val_loss, val_accuracy = eval_one_epoch(
@@ -402,6 +406,7 @@ def train_sparse_recursive(
                         experiment,
                         hyperparams["start_fully_connected"],
                     )
+                    # model.fc0.freeze_embeds(len_choose)
                     non_zero_masks[layer_name] = layer.get_non_zero_params()
                 replace_epoch += [epoch]
 
@@ -419,7 +424,8 @@ def train_sparse_recursive(
                     non_zero_masks[layer_name],
                     hyperparams["pruning_thresholds"][layer_name],
                     ef,
-                )
+                ) 
+            # print(list(model.named_parameters()))
 
         params_amount = get_params_amount(model)
         replace_params = 0
@@ -431,6 +437,10 @@ def train_sparse_recursive(
                 )[0]
             )
 
+        avg_expand_gradients = torch.stack(expanding_gradients).abs().mean()
+        # print(embed_gradients)
+        # if embed_gradients[0] != []:
+        #     avg_embed_gradients = torch.stack(embed_gradients).abs().mean()
         logs = {
             "val loss": val_loss,
             "val accuracy": val_accuracy,
@@ -443,7 +453,13 @@ def train_sparse_recursive(
             "acc amount": val_accuracy / params_amount,
             "n_params over train_time": params_amount / train_time,
             "train_time over n_params": train_time / params_amount,
+            "diff_mean_expand_grads": avg_expand_gradients - last_avg_expand_gradients,
+            "mean_expand_grads": avg_expand_gradients,
         }
+        last_avg_expand_gradients = avg_expand_gradients
+        # if embed_gradients[0] != []:
+        #     logs["diff_mean_embed_grads"] = avg_embed_gradients - last_avg_embed_gradients
+            # last_avg_embed_gradients = avg_embed_gradients
 
         if (epoch in replace_epoch) and epoch != 0:
             logs["len_choose"] = len_choose

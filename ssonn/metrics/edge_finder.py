@@ -136,6 +136,59 @@ class EdgeFinder:
             and self.max_to_replace > 0
             and len(res[0]) > self.max_to_replace
         ):
+            
             sorted_indices = torch.argsort(avg_metric[mask], descending=True)
             res = res[:, sorted_indices[: self.max_to_replace]]
+
+        with open('log.txt', 'a') as file:
+            print('-'*50, file=file)
+            for i in range(len(res[0])):
+                print(f'output={res[0][i]}, input={res[1][i]}', file=file)
+
         return res
+    
+
+#    def choose_edges_threshold(self, model, layer, threshold, embed=False):
+#        assert 0 < threshold <= 1
+#        avg_metric = self.calculate_edge_metric_for_dataloader(
+#            model=model, layer=layer, to_normalise=True, embed=embed
+#        )
+#
+#        # Get all edges that meet the threshold
+#        mask = avg_metric > threshold
+#        all_edges = layer.weight_indices[:, mask.nonzero(as_tuple=True)[0]]
+#        all_metrics = avg_metric[mask]
+#
+#        input_indices = all_edges[1]
+#        mask_low = input_indices < 784
+#        mask_high = input_indices >= 784
+#
+#        edges_low = all_edges[:, mask_low]
+#        edges_high = all_edges[:, mask_high]
+#        metrics_low = all_metrics[mask_low]
+#        metrics_high = all_metrics[mask_high]
+#
+#        if self.max_to_replace is not None and self.max_to_replace > 0:
+#            max_edges = self.max_to_replace
+#        else:
+#            max_edges = len(all_edges[0])
+#
+#        n_low = min(len(edges_low[0]), max_edges // 2)
+#        n_high = min(len(edges_high[0]), max_edges - n_low)
+#
+#        if n_low > 0:
+#            sorted_indices_low = torch.argsort(metrics_low, descending=True)
+#            selected_low = edges_low[:, sorted_indices_low[:n_low]]
+#        else:
+#            selected_low = torch.empty((2, 0), dtype=all_edges.dtype, device=all_edges.device)
+#
+#        if n_high > 0:
+#            sorted_indices_high = torch.argsort(metrics_high, descending=True)
+#            selected_high = edges_high[:, sorted_indices_high[:n_high]]
+#        else:
+#            selected_high = torch.empty((2, 0), dtype=all_edges.dtype, device=all_edges.device)
+#
+#        res = torch.cat([selected_low, selected_high], dim=1)
+#        
+#        return res
+#

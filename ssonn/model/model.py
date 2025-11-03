@@ -372,34 +372,17 @@ class ExpandingLinear(SparseModule):
         self.embed_linears[self.current_iteration.item()].make_linear(children, parents)
 
     def freeze_embeds(self, len_choose):
-        """
-        Freezes the gradients of all embedding layers except the last few.
-
-            This method sets the gradients to zero for a specified number of embedding
-            layers from the beginning of the `embed_linears` list and a corresponding
-            number of weights in `weight_values`. This effectively freezes these layers
-            during training, allowing only the later layers to be updated.
-
-            Args:
-                len_choose: The number of embedding layers/weights to freeze from the beginning.
-
-            Returns:
-                None
-        """
-
-        # freeze_all_but_last
-        with torch.no_grad():
-            if self.embed_linears:
-                # print("weight grads")
-                # print(model.fc1.weight_values.grad)
-
-                for i in range(len(self.embed_linears) - 1):
-                    self.embed_linears[i].weight_values.grad.zero_()
-                for i in range(len(self.weight_values) - len_choose):
-                    self.weight_values.grad[i] = 0
-
-                # print("weight grads zero")
-                # print(model.fc1.weight_values.grad)
+        if self.embed_linears:
+            for i in range(len(self.embed_linears) - 1):
+                for param in self.embed_linears[i].parameters():
+                    param.requires_grad = False
+        if hasattr(self, 'weight_values') and self.weight_values is not None:
+            if len(self.weight_values) > len_choose:
+                self.weight_values.requires_grad = False
+                unfrozen_mask = torch.zeros_like(self.weight_values, dtype=torch.bool)
+                unfrozen_mask[28*28*10-len_choose:] = True
+                self.weight_values.requires_grad = True
+                self.weight_values.register_hook(lambda grad: grad * unfrozen_mask)
 
     def unfreeze_embeds(self):
         """
