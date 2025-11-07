@@ -364,7 +364,8 @@ def train_sparse_recursive(
     non_zero_masks = {}
     replace_epoch = [0]
     val_losses = []
-    last_avg_expand_gradients = 0
+    last_avg_abs_expand_gradients = 0
+    last_avg_signed_expand_gradients = 0
     last_avg_embed_gradients = 0
     for epoch in range(hyperparams["num_epochs"]):
         # print(list(model.named_parameters()))
@@ -437,7 +438,8 @@ def train_sparse_recursive(
                 )[0]
             )
 
-        avg_expand_gradients = torch.stack(expanding_gradients).abs().mean()
+        avg_abs_expand_gradients = torch.stack(expanding_gradients).abs().mean()
+        avg_signed_expand_gradients = torch.stack(expanding_gradients).mean()
         # print(embed_gradients)
         # if embed_gradients[0] != []:
         #     avg_embed_gradients = torch.stack(embed_gradients).abs().mean()
@@ -453,10 +455,13 @@ def train_sparse_recursive(
             "acc amount": val_accuracy / params_amount,
             "n_params over train_time": params_amount / train_time,
             "train_time over n_params": train_time / params_amount,
-            "diff_mean_expand_grads": avg_expand_gradients - last_avg_expand_gradients,
-            "mean_expand_grads": avg_expand_gradients,
+            "diff_mean_abs_expand_grads": avg_abs_expand_gradients - last_avg_abs_expand_gradients,
+            "diff_mean_signed_expand_grads": avg_signed_expand_gradients - last_avg_signed_expand_gradients,
+            "mean_abs_expand_grads": avg_abs_expand_gradients,
+            "mean_signed_expand_grads": avg_signed_expand_gradients
         }
-        last_avg_expand_gradients = avg_expand_gradients
+        last_avg_abs_expand_gradients = avg_abs_expand_gradients
+        last_avg_signed_expand_gradients = avg_signed_expand_gradients
         # if embed_gradients[0] != []:
         #     logs["diff_mean_embed_grads"] = avg_embed_gradients - last_avg_embed_gradients
             # last_avg_embed_gradients = avg_embed_gradients
