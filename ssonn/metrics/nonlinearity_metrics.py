@@ -113,37 +113,37 @@ class NonlinearityMetric(ABC):
 #         return edge_gradients
 
 
-# class AbsGradientEdgeMetric(NonlinearityMetric):
-#     """
-#     Calculates the absolute values of gradients for a given layer's weights."""
+class AbsGradientEdgeMetric(NonlinearityMetric):
+    """
+    Calculates the absolute values of gradients for a given layer's weights."""
     
-#     def calculate(self, model, layer, X_arr, y_arr, embed=False):
-#         """
-#         Calculates the gradients of a specified layer's weights.
+    def calculate(self, model, layer, X_arr, y_arr, embed=False):
+        """
+        Calculates the gradients of a specified layer's weights.
 
-#             Args:
-#                 model: The neural network model to evaluate.
-#                 layer: The layer whose gradients are to be calculated.
-#                 X_arr: Input data for the model.
-#                 y_arr: Target labels corresponding to the input data.
-#                 embed: A boolean indicating whether to calculate gradients from the last embedding linear layer if True, otherwise calculates from the specified layer's weights.
+            Args:
+                model: The neural network model to evaluate.
+                layer: The layer whose gradients are to be calculated.
+                X_arr: Input data for the model.
+                y_arr: Target labels corresponding to the input data.
+                embed: A boolean indicating whether to calculate gradients from the last embedding linear layer if True, otherwise calculates from the specified layer's weights.
 
-#             Returns:
-#                 torch.Tensor: The absolute values of the gradients of the layer's weights.
-#         """
+            Returns:
+                torch.Tensor: The absolute values of the gradients of the layer's weights.
+        """
         
-#         # model = copy.deepcopy(model)
-#         # unfreeze_all(model)
-#         model.eval()
-#         model.zero_grad()
+        # model = copy.deepcopy(model)
+        # unfreeze_all(model)
+        model.eval()
+        model.zero_grad()
 
-#         y_pred = model(X_arr).squeeze()
-#         loss = self.loss_fn(y_pred, y_arr)
-#         loss.backward()
+        y_pred = model(X_arr).squeeze()
+        loss = self.loss_fn(y_pred, y_arr)
+        loss.backward()
         
-#         edge_gradients = layer.weight_values.grad.abs() if not embed else layer.embed_linears[-1].weight_values.grad.abs()
-#         model.zero_grad()
-#         return edge_gradients
+        edge_gradients = layer.weight_values.grad.abs() if not embed else layer.embed_linears[-1].weight_values.grad.abs()
+        model.zero_grad()
+        return edge_gradients
     
 
 class ReversedAbsGradientEdgeMetric(NonlinearityMetric):
