@@ -314,9 +314,13 @@ class ExpandingLinear(SparseModule):
 
         matches = (self.weight_indices[0] == child) & (self.weight_indices[1] == parent)
 
-        original_weight = self.weight_values[matches].item()
-        self.weight_indices = self.weight_indices[:, ~matches]
-        self.weight_values = nn.Parameter(self.weight_values[~matches])
+        # original_weight = self.weight_values[matches].item()
+        # self.weight_indices = self.weight_indices[:, ~matches]
+        # self.weight_values = nn.Parameter(self.weight_values[~matches])
+        original_weight = self.weight_values[matches].item() / 2.0
+        # self.weight_indices = self.weight_indices[:, ~matches]
+        with torch.no_grad():
+            self.weight_values.data[matches] = self.weight_values.data[matches] / 2.0
 
         max_parent = self.weight_indices[1].max().item() + 1
 
