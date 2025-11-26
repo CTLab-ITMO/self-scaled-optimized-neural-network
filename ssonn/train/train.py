@@ -163,6 +163,7 @@ def edge_replacement_func_new_layer(
         optim.add_param_group({"params": layer.weight_values, "lr": last_lrs[0]})
         for i in range(len(layer.embed_linears)):
             optim.add_param_group({"params": layer.embed_linears[i].weight_values, "lr": last_lrs[i+1]})
+            optim.add_param_group({"params": layer.embed_linears[i].bias, "lr": last_lrs[i+1]})
     
     return len(chosen_edges[0])
 

@@ -201,6 +201,11 @@ class EmbedLinear(SparseModule):
                     random_weight = self.epsilon()
                     self.add_edge(i, parent, original_weight=random_weight)
         self.weight_size[0] = children.shape[0]
+        print(self.weight_size[0].item())
+
+        #TODO make some experiments to decide
+        # self.bias = nn.Parameter(torch.normal(mean=0, std=1, size=(self.weight_size[0].item(), )).to(self.device))
+        self.bias = nn.Parameter(torch.zeros(self.weight_size[0], device=self.device))
 
     def forward(self, input):
         """
@@ -216,6 +221,7 @@ class EmbedLinear(SparseModule):
 
         sparse_embed_weight = self.create_sparse_tensor()
         output = torch.sparse.mm(sparse_embed_weight, input.t()).t()
+        output += self.bias.unsqueeze(0)
         return torch.cat([input, self.activation(output)], dim=1)
 
     def delete_many(self, children, parents):
