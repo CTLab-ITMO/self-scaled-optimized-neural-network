@@ -408,9 +408,9 @@ def train_sparse_recursive(
             print(last_plateau - train_losses[-1])
             if avg_change < hyperparams["plateau_threshold"]:
                 # abs is needed to reduce lr when curr plateau is higher
-                if (last_action is None) or (abs(last_plateau - avg_change) >= hyperparams["diff_threshold"]):
+                if (last_action is None) or (abs(last_plateau - train_losses[-1]) >= hyperparams["diff_threshold"]):
                     last_action = 'lr'
-                    last_plateau = avg_change
+                    last_plateau = train_losses[-1]
                     for g in optimizer.param_groups:
                         g['lr'] /= 2
                 else:
