@@ -366,9 +366,13 @@ def train_sparse_recursive(
     non_zero_masks = {}
     replace_epoch = [0]
     val_losses = []
-    last_avg_abs_expand_gradients = 0
-    last_avg_signed_expand_gradients = 0
+    train_losses = []
+    train_losses_expand = []
+    val_losses_expand = []
+    last_plateau = float('inf')
+    last_avg_expand_gradients = 0
     last_avg_embed_gradients = 0
+    last_action = None
     for epoch in range(hyperparams["num_epochs"]):
         # print(list(model.named_parameters()))
 
@@ -379,55 +383,74 @@ def train_sparse_recursive(
             model, criterion, test_loader, hyperparams["task_type"], device
         )
 
-        val_losses.append(val_loss)
+        val_losses += [val_loss]
+        train_losses += [train_loss]
 
         print(
             f"Epoch {epoch + 1}/{hyperparams['num_epochs']}, Train Loss: {train_loss:.4f}, "
             f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}"
         )
 
+        recent_changes = None
         if epoch - replace_epoch[-1] > max(
             hyperparams["prune_after_epochs"],
             hyperparams["min_epochs_between_expansions"],
             hyperparams["plateau_window_size"],
         ):
             recent_changes = [
-                abs(val_losses[i] - val_losses[i - 1])
+                abs(train_losses[i] - train_losses[i - 1])
                 for i in range(-hyperparams["plateau_window_size"], 0)
             ]
             avg_change = sum(recent_changes) / hyperparams["plateau_window_size"]
+            print('avg_change:', avg_change)
+            
+            # val_losses_expand += [val_losses[-1]]
+            # if len(val_losses_expand) == 1 or val_losses_expand[-1] <= val_losses_expand[-2] - 0.01:
+            print(last_plateau - train_losses[-1])
             if avg_change < hyperparams["plateau_threshold"]:
-                len_choose = 0
-                for layer_name in hyperparams["expansion_thresholds"].keys():
-                    layer = model.__getattr__(layer_name)
-                    len_choose += edge_replacement_func_new_layer(
-                        model,
-                        layer,
-                        optimizer,
-                        hyperparams["expansion_thresholds"][layer_name],
-                        ef,
-                        experiment,
-                        hyperparams["start_fully_connected"],
-                    )
-                    # model.fc0.freeze_embeds(len_choose)
+                # abs is needed to reduce lr when curr plateau is higher
+                if (last_action is None) or (abs(last_plateau - train_losses[-1]) >= hyperparams["diff_threshold"]):
+                    last_action = 'lr'
+                    last_plateau = train_losses[-1]
+                    for g in optimizer.param_groups:
+                        g['lr'] /= 2
+                else:
+                    last_action = 'expand'
+                    train_losses_expand += [train_losses[-1]]
+                    # print('avg_change:', avg_change, val_losses[-1], val_losses_expand[-2] - val_losses_expand[-1])
+                    for g in optimizer.param_groups:
+                        g['lr'] = hyperparams['learning_rate']
+                    len_choose = 0
+                    for layer_name in hyperparams["expansion_thresholds"].keys():
+                        layer = model.__getattr__(layer_name)
+                        len_choose += edge_replacement_func_new_layer(
+                            model,
+                            layer,
+                            optimizer,
+                            hyperparams["expansion_thresholds"][layer_name],
+                            ef,
+                            experiment,
+                            hyperparams["start_fully_connected"],
+                        )
+                        # model.fc0.freeze_embeds(len_choose)
                     non_zero_masks[layer_name] = layer.get_non_zero_params()
                 replace_epoch += [epoch]
 
-        if (
-            epoch - replace_epoch[-1] == hyperparams["prune_after_epochs"]
-            and replace_epoch[-1] != 0
-        ):
-            len_choose = 0
-            for layer_name in hyperparams["pruning_thresholds"].keys():
-                layer = model.__getattr__(layer_name)
-                len_choose += edge_deletion_func_new_layer(
-                    model,
-                    layer,
-                    optimizer,
-                    non_zero_masks[layer_name],
-                    hyperparams["pruning_thresholds"][layer_name],
-                    ef,
-                ) 
+        # if (
+        #     epoch - replace_epoch[-1] == hyperparams["prune_after_epochs"]
+        #     and replace_epoch[-1] != 0
+        # ):
+        #     len_choose = 0
+        #     for layer_name in hyperparams["pruning_thresholds"].keys():
+        #         layer = model.__getattr__(layer_name)
+        #         len_choose += edge_deletion_func_new_layer(
+        #             model,
+        #             layer,
+        #             optimizer,
+        #             non_zero_masks[layer_name],
+        #             hyperparams["pruning_thresholds"][layer_name],
+        #             ef,
+        #         )
             # print(list(model.named_parameters()))
 
         params_amount = get_params_amount(model)
@@ -440,8 +463,8 @@ def train_sparse_recursive(
                 )[0]
             )
 
-        avg_abs_expand_gradients = torch.stack(expanding_gradients).abs().mean()
-        avg_signed_expand_gradients = torch.stack(expanding_gradients).mean()
+        # avg_abs_expand_gradients = torch.stack(expanding_gradients).abs().mean()
+        # avg_signed_expand_gradients = torch.stack(expanding_gradients).mean()
         # print(embed_gradients)
         # if embed_gradients[0] != []:
         #     avg_embed_gradients = torch.stack(embed_gradients).abs().mean()
@@ -457,21 +480,22 @@ def train_sparse_recursive(
             "acc amount": val_accuracy / params_amount,
             "n_params over train_time": params_amount / train_time,
             "train_time over n_params": train_time / params_amount,
-            "diff_mean_abs_expand_grads": avg_abs_expand_gradients - last_avg_abs_expand_gradients,
-            "diff_mean_signed_expand_grads": avg_signed_expand_gradients - last_avg_signed_expand_gradients,
-            "mean_abs_expand_grads": avg_abs_expand_gradients,
-            "mean_signed_expand_grads": avg_signed_expand_gradients
+            # "diff_mean_abs_expand_grads": avg_abs_expand_gradients - last_avg_abs_expand_gradients,
+            # "diff_mean_signed_expand_grads": avg_signed_expand_gradients - last_avg_signed_expand_gradients,
+            # "mean_abs_expand_grads": avg_abs_expand_gradients,
+            # "mean_signed_expand_grads": avg_signed_expand_gradients
         }
-        last_avg_abs_expand_gradients = avg_abs_expand_gradients
-        last_avg_signed_expand_gradients = avg_signed_expand_gradients
+        # last_avg_abs_expand_gradients = avg_abs_expand_gradients
+        # last_avg_signed_expand_gradients = avg_signed_expand_gradients
         # if embed_gradients[0] != []:
         #     logs["diff_mean_embed_grads"] = avg_embed_gradients - last_avg_embed_gradients
-            # last_avg_embed_gradients = avg_embed_gradients
+        #     last_avg_embed_gradients = avg_embed_gradients
 
-        if (epoch in replace_epoch) and epoch != 0:
-            logs["len_choose"] = len_choose
-        else:
-            logs.pop("len_choose", None)
+        #TODO add len choose
+        # if (epoch in replace_epoch) and epoch != 0:
+        #     logs["len_choose"] = len_choose
+        # else:
+        #     logs.pop("len_choose", None)
 
         if (epoch + hyperparams["prune_after_epochs"] in replace_epoch) and epoch != 0:
             logs["del_len_choose"] = len_choose
@@ -481,4 +505,3 @@ def train_sparse_recursive(
         # wandb.log(logs)
         if use_log_tool:
             experiment.log_metrics(logs, epoch=epoch)
-
