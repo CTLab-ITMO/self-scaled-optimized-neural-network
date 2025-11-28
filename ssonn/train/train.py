@@ -116,7 +116,6 @@ def eval_one_epoch(model, criterion, val_loader, task_type, device):
         metric = accuracy_score(all_targets, all_preds)
         all_targets = np.array(all_targets)
         all_preds = np.array(all_preds)
-        print("-" * 30)
     else:
         metric = mean_squared_error(all_targets, all_preds)
 
