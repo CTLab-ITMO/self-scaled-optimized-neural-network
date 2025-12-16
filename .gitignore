@@ -8,3 +8,4 @@ wandb
 .vscode
 .DS_Store
 sen-venv/
+.env

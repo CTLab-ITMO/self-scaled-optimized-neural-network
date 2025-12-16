@@ -11,6 +11,43 @@ import matplotlib.pyplot as plt
 import numpy as np
 from copy import deepcopy
 
+def log_adam_state(name, model, optimizer, experiment, epoch):
+    if not isinstance(optimizer, optim.Adam):
+        return
+
+    # We are interested in model.fc0.weight_values
+    # Check if it is in optimizer state
+    if not hasattr(model, 'fc0') or not hasattr(model.fc0, 'weight_values'):
+        return
+
+    param = model.fc0.weight_values
+    if param in optimizer.state:
+        state = optimizer.state[param]
+        if 'exp_avg_sq' in state:
+            exp_avg_sq = state['exp_avg_sq']
+            # exp_avg_sq is a tensor of same shape as param
+
+            avg_val = exp_avg_sq.mean().item()
+            max_val = exp_avg_sq.max().item()
+
+            experiment.log_metric(f"{name}_adam_exp_avg_sq_mean", avg_val, step=epoch)
+            experiment.log_metric(f"{name}_adam_exp_avg_sq_max", max_val, step=epoch)
+
+            # Log histogram
+            fig, ax = plt.subplots(figsize=(6, 6))
+            vals = exp_avg_sq.detach().cpu().numpy().flatten()
+            ax.hist(vals, bins=50, alpha=0.7, color='green', edgecolor='black')
+            ax.set_title(f"{name} Adam exp_avg_sq Histogram (Epoch {epoch})")
+            experiment.log_figure(f"{name}_adam_exp_avg_sq_hist", fig, step=epoch)
+            plt.close(fig)
+
+            # Log values plot
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.plot(range(len(vals)), vals, 'g-', alpha=0.7, linewidth=1)
+            ax.set_title(f"{name} Adam exp_avg_sq Values (Epoch {epoch})")
+            experiment.log_figure(f"{name}_adam_exp_avg_sq_values", fig, step=epoch)
+            plt.close(fig)
+
 def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, experiment=None, use_log_tool=True):
     """
     Trains the model for one epoch.
@@ -60,7 +97,8 @@ def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, ex
     if use_log_tool:
         log_gradient_values("expanding grads", expanding_gradients, experiment, epoch)
         log_gradient_histograms("expanding grads hist", expanding_gradients, experiment, epoch)
-        # for i in range(len(model.fc0.embed_linears)): 
+        log_adam_state("expanding", model, optimizer, experiment, epoch)
+        # for i in range(len(model.fc0.embed_linears)):
         #     log_gradient_values(f"embed grads {i}", [el[i] for el in embed_gradients], experiment, epoch)
         #     log_gradient_histograms(f"embed grads hist {i}", [el[i] for el in embed_gradients], experiment, epoch)
     
@@ -332,7 +370,9 @@ def train_sparse_recursive(
     hyperparams,
     device,
     experiment=None,
-    use_log_tool=True
+    use_log_tool=True,
+    start_epoch=0,
+    resume_state=None
 ):
     """
     Trains a model with sparse recursive edge replacement and deletion.
@@ -348,8 +388,10 @@ def train_sparse_recursive(
             device: The device (CPU or GPU) to train on.
             experiment: 
             use_log_tool:
+            start_epoch: The epoch to start training from.
+            resume_state: A dictionary containing the state to resume from.
         Returns:
-            None.  This method trains the model in-place and logs metrics using wandb.
+            dict: The state of the training process.
     """
 
     model = model.to(device)
@@ -362,17 +404,35 @@ def train_sparse_recursive(
         max_to_replace=hyperparams["max_new_edges_per_expansion"],
     )
 
-    non_zero_masks = {}
-    replace_epoch = [0]
-    val_losses = []
-    train_losses = []
-    train_losses_expand = []
-    val_losses_expand = []
-    last_plateau = float('inf')
+    if resume_state:
+        non_zero_masks = resume_state.get('non_zero_masks', {})
+        replace_epoch = resume_state.get('replace_epoch', [0])
+        val_losses = resume_state.get('val_losses', [])
+        train_losses = resume_state.get('train_losses', [])
+        train_losses_expand = resume_state.get('train_losses_expand', [])
+        val_losses_expand = resume_state.get('val_losses_expand', [])
+        last_plateau = resume_state.get('last_plateau', float('inf'))
+        last_action = resume_state.get('last_action', None)
+    else:
+        non_zero_masks = {}
+        replace_epoch = [0]
+        val_losses = []
+        train_losses = []
+        train_losses_expand = []
+        val_losses_expand = []
+        last_plateau = float('inf')
+        last_action = None
+
     last_avg_expand_gradients = 0
     last_avg_embed_gradients = 0
-    last_action = None
-    for epoch in range(hyperparams["num_epochs"]):
+
+    params_amount = 0
+    replace_params = 0
+    train_time = 0
+    val_accuracy = 0
+
+    for epoch in range(start_epoch, hyperparams["num_epochs"]):
+        len_choose = 0
         # print(list(model.named_parameters()))
 
         train_loss, train_time, expanding_gradients, embed_gradients = train_one_epoch(
@@ -432,7 +492,7 @@ def train_sparse_recursive(
                             hyperparams["start_fully_connected"],
                         )
                         # model.fc0.freeze_embeds(len_choose)
-                    non_zero_masks[layer_name] = layer.get_non_zero_params()
+                        non_zero_masks[layer_name] = layer.get_non_zero_params()
                 replace_epoch += [epoch]
 
         # if (
@@ -504,3 +564,19 @@ def train_sparse_recursive(
         # wandb.log(logs)
         if use_log_tool:
             experiment.log_metrics(logs, epoch=epoch)
+
+    return {
+        'non_zero_masks': non_zero_masks,
+        'replace_epoch': replace_epoch,
+        'val_losses': val_losses,
+        'train_losses': train_losses,
+        'train_losses_expand': train_losses_expand,
+        'val_losses_expand': val_losses_expand,
+        'last_plateau': last_plateau,
+        'last_action': last_action,
+        'final_params_amount': params_amount,
+        'final_replace_params': replace_params,
+        'final_lr': optimizer.param_groups[0]["lr"],
+        'final_train_time': train_time,
+        'final_val_accuracy': val_accuracy
+    }
