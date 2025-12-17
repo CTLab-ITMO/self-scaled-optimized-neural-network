@@ -11,6 +11,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from copy import deepcopy
 
+from ssonn.train.trajectory_projector import TrajectoryProjector
+from IPython.display import clear_output
+from ssonn.train.tools import color_by_id
+
+
 def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, experiment=None, use_log_tool=True):
     """
     Trains the model for one epoch.
@@ -123,7 +128,7 @@ def eval_one_epoch(model, criterion, val_loader, task_type, device):
 
 
 def edge_replacement_func_new_layer(
-    model, layer, optim, choose_threshold, ef, experiment, fully_connected=False
+    model, layer, optim, projectors, choose_threshold, ef, experiment, fully_connected=False
 ):
     """
     Replaces edges in a given layer based on a threshold and updates the optimizer.
@@ -164,6 +169,8 @@ def edge_replacement_func_new_layer(
         for i in range(len(layer.embed_linears)):
             optim.add_param_group({"params": layer.embed_linears[i].weight_values, "lr": last_lrs[i+1]})
             optim.add_param_group({"params": layer.embed_linears[i].bias, "lr": last_lrs[i+1]})
+            # for proj in projectors:
+            #     proj.update([layer.embed_linears[i].weight_values, layer.embed_linears[i].bias])
     
     return len(chosen_edges[0])
 
@@ -372,6 +379,19 @@ def train_sparse_recursive(
     last_avg_expand_gradients = 0
     last_avg_embed_gradients = 0
     last_action = None
+
+    colors = [color_by_id(i) for i in range(0,100)]
+    projector1 = TrajectoryProjector(model)
+    projector2 = TrajectoryProjector(model)
+    projector3 = TrajectoryProjector(model)
+    projector4 = TrajectoryProjector(model)
+    projector1.CollectProjection()
+    projector2.CollectProjection()
+    projector3.CollectProjection()
+    projector4.CollectProjection()
+
+    projectors = [projector1, projector2, projector3, projector4]
+
     for epoch in range(hyperparams["num_epochs"]):
         # print(list(model.named_parameters()))
 
@@ -426,6 +446,7 @@ def train_sparse_recursive(
                             model,
                             layer,
                             optimizer,
+                            projectors,
                             hyperparams["expansion_thresholds"][layer_name],
                             ef,
                             experiment,
@@ -467,6 +488,21 @@ def train_sparse_recursive(
         # print(embed_gradients)
         # if embed_gradients[0] != []:
         #     avg_embed_gradients = torch.stack(embed_gradients).abs().mean()
+
+        projector1.CollectProjection()
+        projector2.CollectProjection()
+        projector3.CollectProjection()
+        projector4.CollectProjection()
+
+        clear_output(True)
+        plt.figure(figsize=(10,10))
+        plt.subplot(2, 2, 1); projector1.draw(colors[:max(2, epoch+1)]); plt.title("Trajectory")
+        plt.subplot(2, 2, 2); projector2.draw(colors[:max(2, epoch+1)])
+        plt.subplot(2, 2, 3); projector3.draw(colors[:max(2, epoch+1)])
+        plt.subplot(2, 2, 4); projector4.draw(colors[:max(2, epoch+1)])
+        # plt.savefig(f"{dir_path}step{epoch}_trajectory.png")
+        plt.show()
+
         logs = {
             "val loss": val_loss,
             "val accuracy": val_accuracy,
