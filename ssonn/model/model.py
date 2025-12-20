@@ -1,4 +1,6 @@
 from abc import abstractmethod, ABC
+from jaxtyping import Float
+from typing import List
 
 import torch
 from torch import nn
@@ -510,3 +512,44 @@ class ExpandingLinear(SparseModule):
         embed_weight_mask = torch.abs(last_embed_linear.weight_values) > epsilon
         expanding_weight_mask = torch.abs(self.weight_values) > epsilon
         return embed_weight_mask, expanding_weight_mask
+
+
+class ScaledNet(nn.Module):
+    def __init__(self, weight: Float[torch.Tensor, "dim0 dim1"], bias: Float[torch.Tensor, "dim0"], device: str='cpu'):
+        self.weight = weight
+        self.bias = bias
+        self.device = device
+
+        self.sub_linears = nn.ModuleList()
+
+    def put_sub_linear(self, children: Float[torch.Tensor, "dim0"], parents: Float[torch.Tensor, "dim0"]):
+        """
+        Args:
+            children: nodes, which takes output from parent nodes
+            parents: nodes, which gives output to children nodes
+        """
+        sub_linear_weight = torch.zeros(())
+        sub_linear_bias = ...
+        self.sub_linears.append(SubLinear(sub_linear_weight, sub_linear_bias))
+
+
+    def forward(self,): ...
+
+
+class SubLinear(nn.Module):
+    def __init__(self, weight: Float[torch.Tensor, "dim0 dim1"], bias: Float[torch.Tensor, "dim0"], device: str='cpu'):
+        self.weight = weight
+        self.bias = bias
+        self.device = device
+
+
+    def forward(self): ...
+
+
+    
+
+
+
+
+
+
