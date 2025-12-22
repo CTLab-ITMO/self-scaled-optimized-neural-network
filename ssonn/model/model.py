@@ -537,16 +537,22 @@ class ScaledNet(nn.Module):
         self.sub_linears.append(SubLinear(children, parents, self.linear.in_features, self.device))
 
 
+
+
     def forward(self, input: Float[torch.Tensor, "batch dim0 dim1"]) -> Float[torch.Tensor, "batch dim0 dim1"]:
         for sub_linear in self.sub_linears:
             input = sub_linear(input)
         return input
+
 
 class SubLinear(nn.Module):
     def __init__(self, children: Float[torch.Tensor, "dim0"], parents: Float[torch.Tensor, "dim0"], input_dim: int, device: str):
         super(SubLinear, self).__init__()
 
         weight = nn.Parameter(torch.zeros((input_dim, input_dim), device=device))
+        for child in children:
+            for parent in parents:
+                weight.data[child, parent] = torch.rand((1)) * 1e-9
         weight.data[children, parents] = 1.
         bias = nn.Parameter(torch.zeros((1, input_dim), device=device))
 
