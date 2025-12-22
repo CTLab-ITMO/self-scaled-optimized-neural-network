@@ -549,8 +549,10 @@ class ScaledNet(nn.Module):
 
     def forward(self, input: Float[torch.Tensor, "batch dim0 dim1"]) -> Float[torch.Tensor, "batch dim0 dim1"]:
         for sub_linear in self.sub_linears:
+            print(input.shape)
             input = sub_linear(input)
-        return input
+            print(input.shape)
+        return self.linear(input)
 
 
 class SubLinear(nn.Module):
@@ -574,7 +576,7 @@ class SubLinear(nn.Module):
 
     def forward(self, input: Float[torch.Tensor, "batch dim0 dim1"]) -> Float[torch.Tensor, "batch dim0 dim1"]:
         out = self.act(self.linear(input))
-        return torch.cat([input, out])
+        return torch.cat([input, out], dim=-1)
 
 
     
