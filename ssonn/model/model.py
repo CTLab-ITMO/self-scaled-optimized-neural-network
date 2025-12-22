@@ -536,6 +536,9 @@ class ScaledNet(nn.Module):
         """
         self.sub_linears.append(SubLinear(children, parents, self.linear.in_features, self.device))
 
+        weight = torch.zeros((2 * self.linear.in_features, self.linear.out_features), device=self.device)
+        weight.data[children, parents] = 0.
+
 
 
 
@@ -550,10 +553,10 @@ class SubLinear(nn.Module):
         super(SubLinear, self).__init__()
 
         weight = nn.Parameter(torch.zeros((input_dim, input_dim), device=device))
-        for child in children:
+        for child in range(0, input_dim):
             for parent in parents:
                 weight.data[child, parent] = torch.rand((1)) * 1e-9
-        weight.data[children, parents] = 1.
+        weight.data[torch.arange(0, input_dim), parents] = 1.
         bias = nn.Parameter(torch.zeros((1, input_dim), device=device))
 
         self.linear = nn.Linear(in_features=input_dim, out_features=input_dim, bias=True)
