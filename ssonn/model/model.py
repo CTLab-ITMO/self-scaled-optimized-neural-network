@@ -515,9 +515,15 @@ class ExpandingLinear(SparseModule):
 
 
 class ScaledNet(nn.Module):
-    def __init__(self, weight: Float[torch.Tensor, "dim0 dim1"], bias: Float[torch.Tensor, "dim0"], device: str='cpu'):
-        self.weight = weight
-        self.bias = bias
+    def __init__(self, weight: Float[torch.Tensor, "out in"], bias: Float[torch.Tensor, "out"], device: str):
+        super(ScaledNet, self).__init__()
+
+        weight = nn.Parameter(weight)
+        bias = nn.Parameter(bias)
+        self.linear = nn.Linear(in_features=weight.shape[1], out_features=weight.shape[0])
+        self.linear.weight = weight
+        self.linear.bias = bias
+
         self.device = device
 
         self.sub_linears = nn.ModuleList()
@@ -528,22 +534,33 @@ class ScaledNet(nn.Module):
             children: nodes, which takes output from parent nodes
             parents: nodes, which gives output to children nodes
         """
-        sub_linear_weight = torch.zeros(())
-        sub_linear_bias = ...
-        self.sub_linears.append(SubLinear(sub_linear_weight, sub_linear_bias))
+        self.sub_linears.append(SubLinear(children, parents, self.linear.in_features, self.device))
 
 
-    def forward(self,): ...
-
+    def forward(self, input: Float[torch.Tensor, "batch dim0 dim1"]) -> Float[torch.Tensor, "batch dim0 dim1"]:
+        for sub_linear in self.sub_linears:
+            input = sub_linear(input)
+        return input
 
 class SubLinear(nn.Module):
-    def __init__(self, weight: Float[torch.Tensor, "dim0 dim1"], bias: Float[torch.Tensor, "dim0"], device: str='cpu'):
-        self.weight = weight
-        self.bias = bias
+    def __init__(self, children: Float[torch.Tensor, "dim0"], parents: Float[torch.Tensor, "dim0"], input_dim: int, device: str):
+        super(SubLinear, self).__init__()
+
+        weight = nn.Parameter(torch.zeros((input_dim, input_dim), device=device))
+        weight.data[children, parents] = 1.
+        bias = nn.Parameter(torch.zeros((1, input_dim), device=device))
+
+        self.linear = nn.Linear(in_features=input_dim, out_features=input_dim, bias=True)
+        self.linear.weight = weight
+        self.linear.bias = bias
+
+        self.act = nn.ReLU()
+
         self.device = device
 
-
-    def forward(self): ...
+    def forward(self, input: Float[torch.Tensor, "batch dim0 dim1"]) -> Float[torch.Tensor, "batch dim0 dim1"]:
+        out = self.act(self.linear(input))
+        return torch.cat([input, out])
 
 
     
