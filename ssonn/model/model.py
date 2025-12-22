@@ -534,7 +534,7 @@ class ScaledNet(nn.Module):
             children: nodes, which takes output from parent nodes
             parents: nodes, which gives output to children nodes
         """
-        self.sub_linears.append(SubLinear(children, parents, self.linear.in_features, self.device))
+        self.sub_linears.append(SubLinear(parents, self.linear.in_features, self.device))
 
         weight = self.linear.weight
 
@@ -552,7 +552,7 @@ class ScaledNet(nn.Module):
 
 
 class SubLinear(nn.Module):
-    def __init__(self, children: Float[torch.Tensor, "dim0"], parents: Float[torch.Tensor, "dim0"], input_dim: int, device: str):
+    def __init__(self, parents: Float[torch.Tensor, "dim0"], input_dim: int, device: str):
         super(SubLinear, self).__init__()
 
         weight = nn.Parameter(torch.zeros((input_dim, input_dim), device=device))
