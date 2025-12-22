@@ -544,6 +544,8 @@ class ScaledNet(nn.Module):
         weight.data[children, parents] = 0.
 
         weight.data = torch.cat([weight.data, weight_cat], dim=1)
+        
+        self.linear.in_features *= 2
 
     def forward(self, input: Float[torch.Tensor, "batch dim0 dim1"]) -> Float[torch.Tensor, "batch dim0 dim1"]:
         for sub_linear in self.sub_linears:
@@ -576,9 +578,4 @@ class SubLinear(nn.Module):
 
 
     
-
-
-
-
-
 
