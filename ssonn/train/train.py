@@ -9,7 +9,13 @@ from ssonn.metrics.edge_finder import *
 # import wandb
 import matplotlib.pyplot as plt
 import numpy as np
+import os
+import torch
 from copy import deepcopy
+from ssonn.metrics.trajectory_viz import HashedRandomProjection2D, TrajectoryLogger
+from ssonn.metrics.trajectory_viz import plot_trajectory_direction
+
+
 
 def log_adam_state(name, model, optimizer, experiment, epoch):
     if not isinstance(optimizer, optim.Adam):
@@ -48,7 +54,9 @@ def log_adam_state(name, model, optimizer, experiment, epoch):
             experiment.log_figure(f"{name}_adam_exp_avg_sq_values", fig, step=epoch)
             plt.close(fig)
 
-def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, experiment=None, use_log_tool=True):
+def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device,
+                    experiment=None, use_log_tool=True,
+                    traj_loggers=None, global_step=0):
     """
     Trains the model for one epoch.
 
@@ -89,6 +97,13 @@ def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, ex
         embed_gradients += [embed_gradients_temp]
 
         optimizer.step()
+
+        global_step += 1
+        if traj_loggers is not None:
+            for lg in traj_loggers:
+                lg.maybe_log(model, global_step, loss=float(loss.item()), epoch=int(epoch))
+
+
         train_loss += loss.item()
 
     train_loss /= len(train_loader)
@@ -108,7 +123,7 @@ def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, ex
     #     elif not param.requires_grad:
     #         print(f"{name}: frozen (no grad)")
 
-    return train_loss, train_time, expanding_gradients, embed_gradients
+    return train_loss, train_time, expanding_gradients, embed_gradients, global_step
 
 
 def eval_one_epoch(model, criterion, val_loader, task_type, device):
@@ -423,6 +438,15 @@ def train_sparse_recursive(
         last_plateau = float('inf')
         last_action = None
 
+    projectors = [
+        HashedRandomProjection2D(base_seed=0),
+        HashedRandomProjection2D(base_seed=1),
+        HashedRandomProjection2D(base_seed=2),
+        HashedRandomProjection2D(base_seed=3),
+    ]
+    traj_loggers = [TrajectoryLogger(p, every=10) for p in projectors]  # every=10 чтобы не жирно
+    global_step = 0
+
     last_avg_expand_gradients = 0
     last_avg_embed_gradients = 0
 
@@ -435,9 +459,11 @@ def train_sparse_recursive(
         len_choose = 0
         # print(list(model.named_parameters()))
 
-        train_loss, train_time, expanding_gradients, embed_gradients = train_one_epoch(
-            model, optimizer, criterion, train_loader, epoch, device, experiment
+        train_loss, train_time, expanding_gradients, embed_gradients, global_step = train_one_epoch(
+            model, optimizer, criterion, train_loader, epoch, device, experiment,
+            traj_loggers=traj_loggers, global_step=global_step
         )
+
         val_loss, val_accuracy = eval_one_epoch(
             model, criterion, test_loader, hyperparams["task_type"], device
         )
@@ -493,6 +519,10 @@ def train_sparse_recursive(
                         )
                         # model.fc0.freeze_embeds(len_choose)
                         non_zero_masks[layer_name] = layer.get_non_zero_params()
+                    if traj_loggers is not None:
+                        for lg in traj_loggers:
+                            lg.break_line(global_step)
+
                 replace_epoch += [epoch]
 
         # if (
@@ -564,6 +594,32 @@ def train_sparse_recursive(
         # wandb.log(logs)
         if use_log_tool:
             experiment.log_metrics(logs, epoch=epoch)
+
+
+    out_dir = "traj_plots"
+    os.makedirs(out_dir, exist_ok=True)
+
+    # сохранить точки (чтобы сравнивать оптимизаторы между запусками)
+    torch.save(
+        {"seed": [lg.projector.base_seed for lg in traj_loggers],
+         "points": [lg.points for lg in traj_loggers]},
+        os.path.join(out_dir, "trajectory_points.pt")
+    )
+
+    for lg in traj_loggers:
+        if len(lg.points) < 2:
+            continue
+        fig = plot_trajectory_direction(
+            lg.points,
+            title=f"Trajectory seed={lg.projector.base_seed}",
+            cmap="viridis",
+            add_arrows=True,
+            arrow_every=80,  # подстрой: 30..200
+            show_colorbar=False,  # можно True, если хочешь шкалу времени
+        )
+        path = os.path.join(out_dir, f"trajectory_seed{lg.projector.base_seed}.png")
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
 
     return {
         'non_zero_masks': non_zero_masks,

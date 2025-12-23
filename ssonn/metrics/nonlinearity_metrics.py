@@ -100,14 +100,14 @@ class NonlinearityMetric(ABC):
 #             Returns:
 #                 torch.Tensor: The values of the gradients of the layer's weights.
 #         """
-        
+
 #         model.eval()
 #         model.zero_grad()
 
 #         y_pred = model(X_arr).squeeze()
 #         loss = self.loss_fn(y_pred, y_arr)
 #         loss.backward()
-        
+
 #         edge_gradients = layer.weight_values.grad if not embed else layer.embed_linears[-1].weight_values.grad
 #         model.zero_grad()
 #         return edge_gradients
