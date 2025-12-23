@@ -126,7 +126,7 @@ PETIMAGES_ROOT=<PETIMAGES_ROOT> bash run_all_experiments_sequential.sh
 Если хочешь поменять:
 
 ```bash
-MNIST_EPOCHS=200 FASHION_EPOCHS=200 CATSDOGS_EPOCHS=100 PETIMAGES_ROOT=<PETIMAGES_ROOT> bash run_all_experiments_sequential.sh
+MNIST_EPOCHS=200 MNIST_DENSE_EPOCHS=100 FASHION_EPOCHS=200 CATSDOGS_EPOCHS=100 PETIMAGES_ROOT=<PETIMAGES_ROOT> bash run_all_experiments_sequential.sh
 ```
 
 Пример (параллельно на GPU 0 и 1):

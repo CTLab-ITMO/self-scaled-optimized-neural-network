@@ -567,6 +567,12 @@ def apply_sparse_growth_and_prune(
     non_zero_masks,
     logs,
 ):
+    # Default debug fields
+    logs.setdefault("plateau_checked", 0)
+    logs.setdefault("plateau_triggered", 0)
+    logs.setdefault("added_edges", 0)
+    logs.setdefault("deleted_edges", logs.get("deleted_edges", 0))
+
     if len(val_losses) < hyperparams["plateau_window_size"]:
         return
 
@@ -575,14 +581,16 @@ def apply_sparse_growth_and_prune(
         hyperparams["min_epochs_between_expansions"],
         hyperparams["plateau_window_size"],
     ):
+        logs["plateau_checked"] = 1
         recent_changes = [
             abs(val_losses[i] - val_losses[i - 1])
             for i in range(-hyperparams["plateau_window_size"], 0)
         ]
         avg_change = sum(recent_changes) / hyperparams["plateau_window_size"]
         logs["plateau_avg_change"] = avg_change
-
+        print(avg_change)
         if avg_change < hyperparams["plateau_threshold"]:
+            logs["plateau_triggered"] = 1
             len_choose = 0
             for layer_name in hyperparams["expansion_thresholds"].keys():
                 layer = getattr(model, layer_name)
@@ -603,6 +611,7 @@ def apply_sparse_growth_and_prune(
                     fully_connected=hyperparams["start_fully_connected"],
                 )
                 non_zero_masks[layer_name] = expanding_layer.get_non_zero_params()
+            logs["added_edges"] = int(len_choose)
             replace_epoch.append(epoch)
 
     if (
@@ -750,7 +759,27 @@ def train_sparse_vit(
                 non_zero_masks=non_zero_masks,
                 logs=epoch_logs,
             )
+            # Human-readable debug line (why expansion did/didn't happen)
+            if epoch_logs.get("plateau_checked", 0):
+                avg = epoch_logs.get("plateau_avg_change", None)
+                thr = hyperparams.get("plateau_threshold", None)
+                trig = int(epoch_logs.get("plateau_triggered", 0))
+                added = int(epoch_logs.get("added_edges", 0))
+                deleted = int(epoch_logs.get("deleted_edges", 0) or 0)
+                print(
+                    f"[plateau] avg_change={avg:.6f} thr={thr} triggered={trig} "
+                    f"added_edges={added} deleted_edges={deleted}"
+                )
+            else:
+                # Not checked because of min-epochs-between-expansions / prune window
+                print(
+                    "[plateau] skipped (min_epochs_between_expansions/prune/window constraint)"
+                )
             print("p", get_params_amount(model))
+        elif enable_expansion:
+            # Not enough val points yet
+            need = hyperparams["plateau_window_size"]
+            print(f"[plateau] waiting: val_losses={len(val_losses)}/{need}")
 
     (run_dir / "hyperparams.json").write_text(json.dumps(hyperparams, indent=2))
     return saved
@@ -916,6 +945,27 @@ def build_hyperparams(depth: int, max_new_edges: int, start_fully_connected: boo
     }
 
 
+def build_hyperparams_from_args(depth: int, args) -> dict:
+    """
+    Create hyperparams with CLI overrides.
+    """
+    expansion_thresholds = {f"qkv_layer_{i}": float(args.expansion_threshold) for i in range(depth)}
+    pruning_thresholds = {f"qkv_layer_{i}": float(args.pruning_threshold) for i in range(depth)}
+    return {
+        "task_type": "classification",
+        "edge_importance_metric": AbsGradientEdgeMetric(nn.CrossEntropyLoss()),
+        "edge_score_aggregation": str(args.edge_score_aggregation),
+        "max_new_edges_per_expansion": int(args.max_new_edges),
+        "prune_after_epochs": int(args.prune_after_epochs),
+        "min_epochs_between_expansions": int(args.min_epochs_between_expansions),
+        "plateau_window_size": int(args.plateau_window_size),
+        "plateau_threshold": float(args.plateau_threshold),
+        "start_fully_connected": False,  # запрещено
+        "expansion_thresholds": expansion_thresholds,
+        "pruning_thresholds": pruning_thresholds,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=["mnist", "fashion_mnist", "catsdogs"], required=True)
@@ -933,6 +983,15 @@ def main():
     ap.add_argument("--start-fully-connected", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--max-new-edges", type=int, default=100)
     ap.add_argument("--no-expansion", action="store_true", help="Отключить growth/prune (чистый запуск без расширения)")
+
+    # Sparse growth/prune knobs (important for noisy datasets like CatsDogs)
+    ap.add_argument("--plateau-threshold", type=float, default=None, help="Порог плато по val-loss для запуска расширения")
+    ap.add_argument("--plateau-window-size", type=int, default=None, help="Окно (эпохи) для оценки плато")
+    ap.add_argument("--min-epochs-between-expansions", type=int, default=None, help="Мин. эпох между расширениями")
+    ap.add_argument("--prune-after-epochs", type=int, default=None, help="Через сколько эпох после расширения делать pruning")
+    ap.add_argument("--expansion-threshold", type=float, default=None, help="Порог метрики ребра для добавления (один на все QKV)")
+    ap.add_argument("--pruning-threshold", type=float, default=None, help="Порог метрики ребра для удаления (один на все QKV)")
+    ap.add_argument("--edge-score-aggregation", choices=["mean", "sum", "max"], default="mean")
 
     # override model params
     ap.add_argument("--img-size", type=int, default=None)
@@ -1040,11 +1099,37 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr)
 
-    hyperparams = build_hyperparams(
-        depth=depth,
-        max_new_edges=args.max_new_edges,
-        start_fully_connected=False,
-    )
+    # dataset-specific defaults for growth/prune (CatsDogs loss is noisy, needs higher plateau_threshold)
+    if args.dataset == "catsdogs":
+        default_plateau_threshold = 0.02
+        default_plateau_window = 2
+        default_min_between = 6
+        default_prune_after = 2
+        default_expansion_thr = 0.08
+        default_pruning_thr = 0.04
+    else:
+        default_plateau_threshold = 0.002
+        default_plateau_window = 3
+        default_min_between = 2
+        default_prune_after = 3
+        default_expansion_thr = 0.12
+        default_pruning_thr = 0.06
+
+    # fill None with defaults
+    if args.plateau_threshold is None:
+        args.plateau_threshold = default_plateau_threshold
+    if args.plateau_window_size is None:
+        args.plateau_window_size = default_plateau_window
+    if args.min_epochs_between_expansions is None:
+        args.min_epochs_between_expansions = default_min_between
+    if args.prune_after_epochs is None:
+        args.prune_after_epochs = default_prune_after
+    if args.expansion_threshold is None:
+        args.expansion_threshold = default_expansion_thr
+    if args.pruning_threshold is None:
+        args.pruning_threshold = default_pruning_thr
+
+    hyperparams = build_hyperparams_from_args(depth=depth, args=args)
 
     print("Model params:", get_params_amount(model))
     print("Starting training...")

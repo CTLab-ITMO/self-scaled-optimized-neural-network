@@ -23,9 +23,10 @@ PETIMAGES_ROOT="${PETIMAGES_ROOT:-}"
 GPU_LIST="${GPU_LIST:-0 1}"
 
 # Epoch defaults (can be overridden):
-#   MNIST_EPOCHS=200 FASHION_EPOCHS=200 CATSDOGS_EPOCHS=100 GPU_LIST="0 1" bash run_all_experiments_parallel.sh
-MNIST_EPOCHS="${MNIST_EPOCHS:-200}"
-FASHION_EPOCHS="${FASHION_EPOCHS:-200}"
+#   MNIST_EPOCHS=200 MNIST_DENSE_EPOCHS=100 FASHION_EPOCHS=200 CATSDOGS_EPOCHS=100 GPU_LIST="0 1" bash run_all_experiments_parallel.sh
+MNIST_EPOCHS="${MNIST_EPOCHS:-100}"
+MNIST_DENSE_EPOCHS="${MNIST_DENSE_EPOCHS:-100}"
+FASHION_EPOCHS="${FASHION_EPOCHS:-100}"
 CATSDOGS_EPOCHS="${CATSDOGS_EPOCHS:-100}"
 
 mkdir -p "$DATA_ROOT" "$RUNS_ROOT" "$LOGS_DIR"
@@ -41,6 +42,7 @@ echo "LOGS_DIR:     $LOGS_DIR"
 echo "GPU_LIST:     $GPU_LIST"
 echo "PETIMAGES_ROOT: ${PETIMAGES_ROOT:-<not set>}"
 echo "MNIST_EPOCHS:    $MNIST_EPOCHS"
+echo "MNIST_DENSE_EPOCHS: $MNIST_DENSE_EPOCHS"
 echo "FASHION_EPOCHS:  $FASHION_EPOCHS"
 echo "CATSDOGS_EPOCHS: $CATSDOGS_EPOCHS"
 echo
@@ -70,6 +72,29 @@ pick_gpu () {
   echo "$g"
 }
 
+# CatsDogs (если есть датасет) — запускаем первым
+if [[ -n "$PETIMAGES_ROOT" ]]; then
+  run_bg "catsdogs_sparse_expand" "$(pick_gpu)" \
+    --dataset catsdogs --model sparse --preset catsdogs \
+    --petimages-root "$PETIMAGES_ROOT" \
+    --run-dir "$RUN_DIR_BASE" \
+    --epochs "$CATSDOGS_EPOCHS" --max-new-edges 200 \
+    --plateau-threshold 0.02 \
+    --plateau-window-size 2 \
+    --min-epochs-between-expansions 1 \
+    --prune-after-epochs 2 \
+    --expansion-threshold 0.08 \
+    --pruning-threshold 0.04
+
+  run_bg "catsdogs_dense" "$(pick_gpu)" \
+    --dataset catsdogs --model dense --preset catsdogs \
+    --petimages-root "$PETIMAGES_ROOT" \
+    --run-dir "$RUN_DIR_BASE" \
+    --epochs "$CATSDOGS_EPOCHS"
+else
+  echo "SKIP catsdogs: PETIMAGES_ROOT не задан."
+fi
+
 # MNIST dense + sparse
 run_bg "mnist_sparse_expand" "$(pick_gpu)" \
   --dataset mnist --model sparse --preset mnist_small \
@@ -81,7 +106,7 @@ run_bg "mnist_dense" "$(pick_gpu)" \
   --dataset mnist --model dense --preset mnist_small \
   --data-root "$DATA_ROOT" \
   --run-dir "$RUN_DIR_BASE" \
-  --epochs "$MNIST_EPOCHS"
+  --epochs "$MNIST_DENSE_EPOCHS"
 
 # Fashion dense + sparse
 run_bg "fashion_sparse_expand" "$(pick_gpu)" \
@@ -95,23 +120,6 @@ run_bg "fashion_dense" "$(pick_gpu)" \
   --data-root "$DATA_ROOT" \
   --run-dir "$RUN_DIR_BASE" \
   --epochs "$FASHION_EPOCHS"
-
-# CatsDogs (если есть датасет)
-if [[ -n "$PETIMAGES_ROOT" ]]; then
-  run_bg "catsdogs_sparse_expand" "$(pick_gpu)" \
-    --dataset catsdogs --model sparse --preset catsdogs \
-    --petimages-root "$PETIMAGES_ROOT" \
-    --run-dir "$RUN_DIR_BASE" \
-    --epochs "$CATSDOGS_EPOCHS" --max-new-edges 100
-
-  run_bg "catsdogs_dense" "$(pick_gpu)" \
-    --dataset catsdogs --model dense --preset catsdogs \
-    --petimages-root "$PETIMAGES_ROOT" \
-    --run-dir "$RUN_DIR_BASE" \
-    --epochs "$CATSDOGS_EPOCHS"
-else
-  echo "SKIP catsdogs: PETIMAGES_ROOT не задан."
-fi
 
 echo
 echo "Ждём завершения всех задач..."

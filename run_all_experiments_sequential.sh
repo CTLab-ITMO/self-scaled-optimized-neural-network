@@ -21,9 +21,10 @@ LOGS_DIR="${LOGS_DIR:-./logs}"
 PETIMAGES_ROOT="${PETIMAGES_ROOT:-}"
 
 # Epoch defaults (can be overridden):
-#   MNIST_EPOCHS=200 FASHION_EPOCHS=200 CATSDOGS_EPOCHS=100 bash run_all_experiments_sequential.sh
-MNIST_EPOCHS="${MNIST_EPOCHS:-200}"
-FASHION_EPOCHS="${FASHION_EPOCHS:-200}"
+#   MNIST_EPOCHS=200 MNIST_DENSE_EPOCHS=100 FASHION_EPOCHS=200 CATSDOGS_EPOCHS=100 bash run_all_experiments_sequential.sh
+MNIST_EPOCHS="${MNIST_EPOCHS:-100}"
+MNIST_DENSE_EPOCHS="${MNIST_DENSE_EPOCHS:-100}"
+FASHION_EPOCHS="${FASHION_EPOCHS:-100}"
 CATSDOGS_EPOCHS="${CATSDOGS_EPOCHS:-100}"
 
 mkdir -p "$DATA_ROOT" "$RUNS_ROOT" "$LOGS_DIR"
@@ -38,6 +39,7 @@ echo "RUN_DIR_BASE: $RUN_DIR_BASE"
 echo "LOGS_DIR:     $LOGS_DIR"
 echo "PETIMAGES_ROOT: ${PETIMAGES_ROOT:-<not set>}"
 echo "MNIST_EPOCHS:    $MNIST_EPOCHS"
+echo "MNIST_DENSE_EPOCHS: $MNIST_DENSE_EPOCHS"
 echo "FASHION_EPOCHS:  $FASHION_EPOCHS"
 echo "CATSDOGS_EPOCHS: $CATSDOGS_EPOCHS"
 echo
@@ -52,37 +54,7 @@ run_one () {
   python -u train_sparse_vit.py "$@" 2>&1 | tee "$LOGS_DIR/${name}.log"
 }
 
-# 1) MNIST sparse + expansion
-run_one "mnist_sparse_expand" \
-  --dataset mnist --model sparse --preset mnist_small \
-  --data-root "$DATA_ROOT" \
-  --run-dir "$RUN_DIR_BASE" \
-  --epochs "$MNIST_EPOCHS" \
-  --max-new-edges 50
-
-# 2) MNIST dense baseline (без расширения)
-run_one "mnist_dense" \
-  --dataset mnist --model dense --preset mnist_small \
-  --data-root "$DATA_ROOT" \
-  --run-dir "$RUN_DIR_BASE" \
-  --epochs "$MNIST_EPOCHS"
-
-# 3) FashionMNIST sparse + expansion
-run_one "fashion_sparse_expand" \
-  --dataset fashion_mnist --model sparse --preset fashion_small \
-  --data-root "$DATA_ROOT" \
-  --run-dir "$RUN_DIR_BASE" \
-  --epochs "$FASHION_EPOCHS" \
-  --max-new-edges 50
-
-# 4) FashionMNIST dense baseline (без расширения)
-run_one "fashion_dense" \
-  --dataset fashion_mnist --model dense --preset fashion_small \
-  --data-root "$DATA_ROOT" \
-  --run-dir "$RUN_DIR_BASE" \
-  --epochs "$FASHION_EPOCHS"
-
-# 5) CatsDogs sparse + expansion
+# 1) CatsDogs sparse + expansion
 if [[ -z "$PETIMAGES_ROOT" ]]; then
   echo "SKIP catsdogs: PETIMAGES_ROOT не задан."
   echo "Чтобы запустить catsdogs, сделай:"
@@ -95,14 +67,50 @@ run_one "catsdogs_sparse_expand" \
   --petimages-root "$PETIMAGES_ROOT" \
   --run-dir "$RUN_DIR_BASE" \
   --epochs "$CATSDOGS_EPOCHS" \
-  --max-new-edges 100
+  --max-new-edges 200 \
+  --plateau-threshold 0.02 \
+  --plateau-window-size 2 \
+  --min-epochs-between-expansions 1 \
+  --prune-after-epochs 2 \
+  --expansion-threshold 0.08 \
+  --pruning-threshold 0.04
 
-# 6) CatsDogs dense baseline (без расширения)
+# 2) CatsDogs dense baseline (без расширения)
 run_one "catsdogs_dense" \
   --dataset catsdogs --model dense --preset catsdogs \
   --petimages-root "$PETIMAGES_ROOT" \
   --run-dir "$RUN_DIR_BASE" \
   --epochs "$CATSDOGS_EPOCHS"
+
+# 3) MNIST sparse + expansion
+run_one "mnist_sparse_expand" \
+  --dataset mnist --model sparse --preset mnist_small \
+  --data-root "$DATA_ROOT" \
+  --run-dir "$RUN_DIR_BASE" \
+  --epochs "$MNIST_EPOCHS" \
+  --max-new-edges 50
+
+# 4) MNIST dense baseline (без расширения) — "обычный" MNIST
+run_one "mnist_dense" \
+  --dataset mnist --model dense --preset mnist_small \
+  --data-root "$DATA_ROOT" \
+  --run-dir "$RUN_DIR_BASE" \
+  --epochs "$MNIST_DENSE_EPOCHS"
+
+# 5) FashionMNIST sparse + expansion
+run_one "fashion_sparse_expand" \
+  --dataset fashion_mnist --model sparse --preset fashion_small \
+  --data-root "$DATA_ROOT" \
+  --run-dir "$RUN_DIR_BASE" \
+  --epochs "$FASHION_EPOCHS" \
+  --max-new-edges 50
+
+# 6) FashionMNIST dense baseline (без расширения)
+run_one "fashion_dense" \
+  --dataset fashion_mnist --model dense --preset fashion_small \
+  --data-root "$DATA_ROOT" \
+  --run-dir "$RUN_DIR_BASE" \
+  --epochs "$FASHION_EPOCHS"
 
 echo
 echo "DONE. Все результаты лежат в: $RUN_DIR_BASE"

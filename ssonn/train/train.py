@@ -235,6 +235,8 @@ def edge_deletion_func_new_layer(model, layer, optim, masks, choose_threshold, e
 
 
 def log_gradient_image(gradients, experiment, epoch):
+    if experiment is None:
+        return
     avg_gradients = torch.stack(gradients).mean(dim=0)
     gradient_images = []
     for i in range(10):
@@ -257,6 +259,8 @@ def log_gradient_image(gradients, experiment, epoch):
     # experiment.log_histogram_3d(avg_gradients, name="expanding linear grads", step=epoch)
 
 def log_gradient_values(name, gradients, experiment, epoch):
+    if experiment is None:
+        return
     avg_gradients = torch.stack(gradients).mean(dim=0)
     fig, ax = plt.subplots(figsize=(12, 6))
     
@@ -276,6 +280,8 @@ def log_gradient_values(name, gradients, experiment, epoch):
     plt.close(fig)
 
 def log_gradient_histograms(name, gradients, experiment, epoch):
+    if experiment is None:
+        return
     avg_gradients = torch.stack(gradients).mean(dim=0)
     
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -290,7 +296,9 @@ def log_gradient_histograms(name, gradients, experiment, epoch):
     experiment.log_figure(name, fig, step=epoch)
     plt.close(fig)
 
-def log_replaces(chosen_edges, experiment, ):
+def log_replaces(chosen_edges, experiment):
+    if experiment is None:
+        return
     image_indices = chosen_edges[0].cpu().numpy()
     pixel_indices = chosen_edges[1].cpu().numpy()
     
@@ -302,7 +310,9 @@ def log_replaces(chosen_edges, experiment, ):
         for pixel in class_pixels:
             mask[pixel] += 1
         
-        mask = mask / mask.max()
+        m = mask.max()
+        if m > 0:
+            mask = mask / m
         class_masks[class_idx] = mask.reshape(28, 28)
     
     fig, axes = plt.subplots(2, 5, figsize=(15, 6))
