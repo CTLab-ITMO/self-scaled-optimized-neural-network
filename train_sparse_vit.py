@@ -14,6 +14,7 @@ import argparse
 import csv
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,8 +31,11 @@ from PIL import Image, ImageFile
 # Allow truncated images in PetImages-like datasets
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# Ensure project imports work when launched from anywhere (cluster/sbatch).
-import setup_project_path  # noqa: F401
+# Ensure project imports work when launched from anywhere (server/cluster/sbatch),
+# without relying on an extra helper module.
+_REPO_ROOT = Path(__file__).resolve().parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from ssonn.metrics.edge_finder import EdgeFinder
 from ssonn.metrics.nonlinearity_metrics import AbsGradientEdgeMetric
@@ -298,6 +302,11 @@ def make_sparse_qkv_module(d_model: int, device: str):
     return sparse_qkv
 
 
+def make_dense_qkv_module(d_model: int):
+    # Same API/shape as sparse QKV: [B,N,d] -> [B,N,3d]
+    return SimpleFCN(input_size=d_model, output_size=3 * d_model)
+
+
 class CustomMHA(nn.Module):
     def __init__(self, d_model, num_heads, qkv_module, dropout=0.1):
         super().__init__()
@@ -408,6 +417,63 @@ class SparseViT(nn.Module):
         return self.head(x)
 
 
+class DenseViT(nn.Module):
+    """Architecturally same as SparseViT, but QKV is dense nn.Linear (inside SimpleFCN)."""
+
+    def __init__(
+        self,
+        num_classes,
+        img_size=224,
+        patch_size=16,
+        dim=768,
+        depth=2,
+        num_heads=8,
+        channels=3,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.dim = dim
+
+        self.patch_embeddings = nn.Conv2d(
+            in_channels=channels,
+            out_channels=dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+
+        self.class_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.position_embeddings = nn.Parameter(torch.zeros(1, self.num_patches + 1, dim))
+
+        self.encoder_blocks = nn.ModuleList()
+        for i in range(depth):
+            qkv_dense = make_dense_qkv_module(dim)
+            setattr(self, f"qkv_layer_{i}", qkv_dense)  # for name parity in logs/configs
+            block = ViTEncoderBlock(dim, num_heads, qkv_dense, dropout=dropout)
+            self.encoder_blocks.append(block)
+
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Linear(dim, num_classes)
+
+    def forward(self, x, mask=None):
+        x = self.patch_embeddings(x)
+        x = x.flatten(2).transpose(1, 2)  # [B, N, d]
+
+        B = x.size(0)
+        cls = self.class_token.expand(B, 1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = x + self.position_embeddings
+
+        for block in self.encoder_blocks:
+            x = block(x, mask)
+
+        x = x[:, 0]
+        x = self.dropout(x)
+        return self.head(x)
+
+
 # -----------------------------
 # Training + sparse growth/prune
 # -----------------------------
@@ -426,7 +492,18 @@ def _confusion_matrix_binary(y_true: torch.Tensor, y_pred: torch.Tensor) -> torc
     return cm
 
 
-def run_epoch(dataloader, model, criterion, optimizer, device, phase: str):
+@torch.no_grad()
+def _confusion_matrix_multiclass(
+    y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int
+) -> torch.Tensor:
+    cm = torch.zeros((num_classes, num_classes), dtype=torch.long)
+    for t, p in zip(y_true.tolist(), y_pred.tolist()):
+        if 0 <= t < num_classes and 0 <= p < num_classes:
+            cm[t][p] += 1
+    return cm
+
+
+def run_epoch(dataloader, model, criterion, optimizer, device, phase: str, num_classes: int):
     assert phase in {"train", "eval"}
     if phase == "train":
         model.train()
@@ -470,8 +547,12 @@ def run_epoch(dataloader, model, criterion, optimizer, device, phase: str):
     y = torch.cat(all_y) if all_y else torch.tensor([], dtype=torch.long)
     p = torch.cat(all_pred) if all_pred else torch.tensor([], dtype=torch.long)
 
-    # simple metrics (binary task for catsdogs)
-    cm = _confusion_matrix_binary(y, p) if y.numel() else torch.zeros((2, 2), dtype=torch.long)
+    if not y.numel():
+        cm = torch.zeros((num_classes, num_classes), dtype=torch.long)
+    elif num_classes == 2:
+        cm = _confusion_matrix_binary(y, p)
+    else:
+        cm = _confusion_matrix_multiclass(y, p, num_classes=num_classes)
     return epoch_loss, epoch_acc, cm
 
 
@@ -557,6 +638,8 @@ def train_sparse_vit(
     device,
     num_epochs,
     run_dir: Path,
+    num_classes: int,
+    enable_expansion: bool,
 ):
     model = model.to(device)
 
@@ -589,6 +672,7 @@ def train_sparse_vit(
                 "p01",
                 "p10",
                 "p11",
+                "cm_json",
                 "params",
                 "plateau_avg_change",
                 "deleted_edges",
@@ -605,7 +689,7 @@ def train_sparse_vit(
         for phase in phases:
             dl = dataloaders[phase]
             phase_mode = "train" if phase == "train" else "eval"
-            loss, acc, cm = run_epoch(dl, model, criterion, optimizer, device, phase_mode)
+            loss, acc, cm = run_epoch(dl, model, criterion, optimizer, device, phase_mode, num_classes=num_classes)
 
             saved[phase]["loss"].append(loss)
             saved[phase]["acc"].append(acc)
@@ -629,21 +713,24 @@ def train_sparse_vit(
                         "p01",
                         "p10",
                         "p11",
+                        "cm_json",
                         "params",
                         "plateau_avg_change",
                         "deleted_edges",
                     ],
                 )
+                cm_json = json.dumps(cm.tolist())
                 writer.writerow(
                     {
                         "epoch": epoch,
                         "phase": phase,
                         "loss": loss,
                         "acc": acc,
-                        "p00": int(cm[0, 0]),
-                        "p01": int(cm[0, 1]),
-                        "p10": int(cm[1, 0]),
-                        "p11": int(cm[1, 1]),
+                        "p00": int(cm[0, 0]) if num_classes == 2 else "",
+                        "p01": int(cm[0, 1]) if num_classes == 2 else "",
+                        "p10": int(cm[1, 0]) if num_classes == 2 else "",
+                        "p11": int(cm[1, 1]) if num_classes == 2 else "",
+                        "cm_json": cm_json,
                         "params": params_amount,
                         "plateau_avg_change": epoch_logs.get("plateau_avg_change", ""),
                         "deleted_edges": epoch_logs.get("deleted_edges", ""),
@@ -651,7 +738,7 @@ def train_sparse_vit(
                 )
 
         # growth/prune once per epoch (after all phases)
-        if len(val_losses) >= hyperparams["plateau_window_size"]:
+        if enable_expansion and len(val_losses) >= hyperparams["plateau_window_size"]:
             apply_sparse_growth_and_prune(
                 model=model,
                 optimizer=optimizer,
@@ -666,6 +753,89 @@ def train_sparse_vit(
             print("p", get_params_amount(model))
 
     (run_dir / "hyperparams.json").write_text(json.dumps(hyperparams, indent=2))
+    return saved
+
+
+def train_dense_vit(
+    model,
+    dataloaders,
+    criterion,
+    optimizer,
+    device,
+    num_epochs,
+    run_dir: Path,
+    num_classes: int,
+):
+    model = model.to(device)
+    phases = ["train", "val", "test"] if "val" in dataloaders else ["train", "test"]
+
+    saved = {p: {"loss": [], "acc": []} for p in phases}
+
+    metrics_path = run_dir / "metrics.csv"
+    with metrics_path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "epoch",
+                "phase",
+                "loss",
+                "acc",
+                "p00",
+                "p01",
+                "p10",
+                "p11",
+                "cm_json",
+                "params",
+            ],
+        )
+        writer.writeheader()
+
+    for epoch in range(1, num_epochs + 1):
+        print("=" * 80)
+        print(f"[DENSE] Epoch {epoch}/{num_epochs}")
+
+        for phase in phases:
+            dl = dataloaders[phase]
+            phase_mode = "train" if phase == "train" else "eval"
+            loss, acc, cm = run_epoch(dl, model, criterion, optimizer, device, phase_mode, num_classes=num_classes)
+
+            saved[phase]["loss"].append(loss)
+            saved[phase]["acc"].append(acc)
+
+            print(f"{phase}: loss={loss:.6f} acc={acc:.4f} cm={cm.tolist()}")
+
+            params_amount = get_params_amount(model)
+            with metrics_path.open("a", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "epoch",
+                        "phase",
+                        "loss",
+                        "acc",
+                        "p00",
+                        "p01",
+                        "p10",
+                        "p11",
+                        "cm_json",
+                        "params",
+                    ],
+                )
+                writer.writerow(
+                    {
+                        "epoch": epoch,
+                        "phase": phase,
+                        "loss": loss,
+                        "acc": acc,
+                        "p00": int(cm[0, 0]) if num_classes == 2 else "",
+                        "p01": int(cm[0, 1]) if num_classes == 2 else "",
+                        "p10": int(cm[1, 0]) if num_classes == 2 else "",
+                        "p11": int(cm[1, 1]) if num_classes == 2 else "",
+                        "cm_json": json.dumps(cm.tolist()),
+                        "params": params_amount,
+                    }
+                )
+
     return saved
 
 
@@ -749,6 +919,7 @@ def build_hyperparams(depth: int, max_new_edges: int, start_fully_connected: boo
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=["mnist", "fashion_mnist", "catsdogs"], required=True)
+    ap.add_argument("--model", choices=["sparse", "dense"], default="sparse")
     ap.add_argument("--preset", choices=list(PRESETS.keys()), default=None)
     ap.add_argument("--data-root", default="./data")
     ap.add_argument("--petimages-root", default=None)
@@ -758,8 +929,10 @@ def main():
     ap.add_argument("--test-ratio", type=float, default=0.1)
     ap.add_argument("--max-items", type=int, default=None)
 
-    ap.add_argument("--start-fully-connected", action="store_true")
+    # We intentionally do NOT support start_fully_connected=True here (it was unstable in our setup).
+    ap.add_argument("--start-fully-connected", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--max-new-edges", type=int, default=100)
+    ap.add_argument("--no-expansion", action="store_true", help="Отключить growth/prune (чистый запуск без расширения)")
 
     # override model params
     ap.add_argument("--img-size", type=int, default=None)
@@ -773,6 +946,11 @@ def main():
     ap.add_argument("--epochs", type=int, default=None)
 
     args = ap.parse_args()
+    if args.start_fully_connected:
+        raise ValueError(
+            "start_fully_connected=True запрещён в этом проекте (из-за нестабильностей). "
+            "Убери флаг --start-fully-connected."
+        )
 
     if args.preset is None:
         if args.dataset == "mnist":
@@ -835,17 +1013,29 @@ def main():
         )
         num_classes = 2
 
-    model = SparseViT(
-        num_classes=num_classes,
-        img_size=img_size,
-        patch_size=patch_size,
-        dim=dim,
-        depth=depth,
-        num_heads=num_heads,
-        channels=3,
-        dropout=dropout,
-        device=str(device),
-    ).to(device)
+    if args.model == "dense":
+        model = DenseViT(
+            num_classes=num_classes,
+            img_size=img_size,
+            patch_size=patch_size,
+            dim=dim,
+            depth=depth,
+            num_heads=num_heads,
+            channels=3,
+            dropout=dropout,
+        ).to(device)
+    else:
+        model = SparseViT(
+            num_classes=num_classes,
+            img_size=img_size,
+            patch_size=patch_size,
+            dim=dim,
+            depth=depth,
+            num_heads=num_heads,
+            channels=3,
+            dropout=dropout,
+            device=str(device),
+        ).to(device)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr)
@@ -853,21 +1043,37 @@ def main():
     hyperparams = build_hyperparams(
         depth=depth,
         max_new_edges=args.max_new_edges,
-        start_fully_connected=args.start_fully_connected,
+        start_fully_connected=False,
     )
 
     print("Model params:", get_params_amount(model))
     print("Starting training...")
-    train_sparse_vit(
-        model=model,
-        dataloaders=dataloaders,
-        criterion=criterion,
-        optimizer=optimizer,
-        hyperparams=hyperparams,
-        device=device,
-        num_epochs=epochs,
-        run_dir=run_dir,
-    )
+    enable_expansion = (args.model == "sparse") and (not args.no_expansion) and (args.max_new_edges > 0)
+
+    if args.model == "dense":
+        train_dense_vit(
+            model=model,
+            dataloaders=dataloaders,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
+            num_epochs=epochs,
+            run_dir=run_dir,
+            num_classes=num_classes,
+        )
+    else:
+        train_sparse_vit(
+            model=model,
+            dataloaders=dataloaders,
+            criterion=criterion,
+            optimizer=optimizer,
+            hyperparams=hyperparams,
+            device=device,
+            num_epochs=epochs,
+            run_dir=run_dir,
+            num_classes=num_classes,
+            enable_expansion=enable_expansion,
+        )
 
 
 if __name__ == "__main__":
