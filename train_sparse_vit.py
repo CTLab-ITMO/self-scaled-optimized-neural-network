@@ -40,7 +40,12 @@ if str(_REPO_ROOT) not in sys.path:
 from ssonn.metrics.edge_finder import EdgeFinder
 from ssonn.metrics.nonlinearity_metrics import AbsGradientEdgeMetric
 from ssonn.model.model import ExpandingLinear
-from ssonn.train.train import edge_deletion_func_new_layer, edge_replacement_func_new_layer
+from ssonn.train.train import (
+    edge_deletion_func_new_layer,
+    edge_replacement_func_new_layer,
+    log_gradient_values,
+    log_gradient_histograms,
+)
 
 
 # -----------------------------
@@ -503,7 +508,26 @@ def _confusion_matrix_multiclass(
     return cm
 
 
-def run_epoch(dataloader, model, criterion, optimizer, device, phase: str, num_classes: int):
+def run_epoch(
+    dataloader,
+    model,
+    criterion,
+    optimizer,
+    device,
+    phase: str,
+    num_classes: int,
+    experiment=None,
+    collect_gradients: bool = False,
+):
+    """
+    Run one epoch of training or evaluation.
+    
+    Args:
+        collect_gradients: If True, collect gradients for each qkv_layer_i (only for train phase).
+    Returns:
+        (epoch_loss, epoch_acc, cm, layer_gradients_dict)
+        layer_gradients_dict: {layer_name: [grad_batch1, grad_batch2, ...]} or None
+    """
     assert phase in {"train", "eval"}
     if phase == "train":
         model.train()
@@ -516,8 +540,18 @@ def run_epoch(dataloader, model, criterion, optimizer, device, phase: str, num_c
 
     all_y = []
     all_pred = []
+    
+    # Collect gradients for each qkv_layer if needed
+    layer_gradients = {} if (collect_gradients and phase == "train") else None
 
+    # TEMPORARY: Limit batches for testing (remove after verification)
+    MAX_BATCHES = 10
+    batch_count = 0
+    
     for inputs, labels in dataloader:
+        batch_count += 1
+        if batch_count > MAX_BATCHES:
+            break
         inputs = inputs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
@@ -531,6 +565,36 @@ def run_epoch(dataloader, model, criterion, optimizer, device, phase: str, num_c
             _, preds = torch.max(outputs, 1)
             if phase == "train":
                 loss.backward()
+                
+                # Collect gradients for each qkv_layer_i
+                if collect_gradients:
+                    # Real path is encoder_blocks.X.attn.qkv_module.fc0
+                    # We map it to qkv_layer_X for consistency with hyperparams
+                    for name, module in model.named_modules():
+                        if isinstance(module, ExpandingLinear):
+                            # Check if this is the fc0 inside qkv_module
+                            # Path format: encoder_blocks.{i}.attn.qkv_module.fc0
+                            if "encoder_blocks." in name and ".attn.qkv_module.fc0" in name:
+                                # Extract layer index from path: encoder_blocks.0.attn.qkv_module.fc0 -> 0
+                                try:
+                                    parts = name.split(".")
+                                    # Find encoder_blocks index
+                                    encoder_idx = None
+                                    for i, part in enumerate(parts):
+                                        if part == "encoder_blocks" and i + 1 < len(parts):
+                                            encoder_idx = int(parts[i + 1])
+                                            break
+                                    
+                                    if encoder_idx is not None:
+                                        layer_name = f"qkv_layer_{encoder_idx}"
+                                        if module.weight_values.grad is not None:
+                                            grad = module.weight_values.grad.clone().detach().cpu()
+                                            if layer_name not in layer_gradients:
+                                                layer_gradients[layer_name] = []
+                                            layer_gradients[layer_name].append(grad)
+                                except (ValueError, IndexError):
+                                    pass
+                
                 optimizer.step()
 
         bs = labels.size(0)
@@ -553,7 +617,8 @@ def run_epoch(dataloader, model, criterion, optimizer, device, phase: str, num_c
         cm = _confusion_matrix_binary(y, p)
     else:
         cm = _confusion_matrix_multiclass(y, p, num_classes=num_classes)
-    return epoch_loss, epoch_acc, cm
+    
+    return epoch_loss, epoch_acc, cm, layer_gradients
 
 
 def apply_sparse_growth_and_prune(
@@ -566,6 +631,7 @@ def apply_sparse_growth_and_prune(
     replace_epoch,
     non_zero_masks,
     logs,
+    experiment=None,
 ):
     # Default debug fields
     logs.setdefault("plateau_checked", 0)
@@ -606,9 +672,9 @@ def apply_sparse_growth_and_prune(
                     expanding_layer,
                     optimizer,
                     hyperparams["expansion_thresholds"][layer_name],
-                    edge_finder,
-                    experiment=None,
-                    fully_connected=hyperparams["start_fully_connected"],
+                edge_finder,
+                experiment=experiment,
+                fully_connected=hyperparams["start_fully_connected"],
                 )
                 non_zero_masks[layer_name] = expanding_layer.get_non_zero_params()
             logs["added_edges"] = int(len_choose)
@@ -649,6 +715,7 @@ def train_sparse_vit(
     run_dir: Path,
     num_classes: int,
     enable_expansion: bool,
+    experiment=None,
 ):
     model = model.to(device)
 
@@ -698,12 +765,63 @@ def train_sparse_vit(
         for phase in phases:
             dl = dataloaders[phase]
             phase_mode = "train" if phase == "train" else "eval"
-            loss, acc, cm = run_epoch(dl, model, criterion, optimizer, device, phase_mode, num_classes=num_classes)
+            collect_grads = (experiment is not None) and (phase == "train")
+            loss, acc, cm, layer_gradients = run_epoch(
+                dl, model, criterion, optimizer, device, phase_mode, num_classes=num_classes,
+                experiment=experiment, collect_gradients=collect_grads
+            )
+            
+            # Log gradients to Comet ML for each layer
+            if experiment is not None and phase == "train" and layer_gradients:
+                for layer_name, gradients in layer_gradients.items():
+                    if gradients:  # Only log if we have gradients
+                        try:
+                            # Stack gradients and compute statistics
+                            stacked_grads = torch.stack(gradients)
+                            grad_mean = stacked_grads.mean(dim=0)
+                            grad_std = stacked_grads.std(dim=0)
+                            grad_variance = stacked_grads.var(dim=0)
+                            
+                            # Log gradient statistics
+                            experiment.log_metrics({
+                                f"{layer_name}/gradient_mean": grad_mean.mean().item(),
+                                f"{layer_name}/gradient_std": grad_std.mean().item(),
+                                f"{layer_name}/gradient_variance": grad_variance.mean().item(),
+                                f"{layer_name}/gradient_max": grad_mean.max().item(),
+                                f"{layer_name}/gradient_min": grad_mean.min().item(),
+                            }, step=epoch)
+                            
+                            # Log gradient plots
+                            log_gradient_values(
+                                f"{layer_name}/gradient_values",
+                                gradients,
+                                experiment,
+                                epoch,
+                            )
+                            log_gradient_histograms(
+                                f"{layer_name}/gradient_histogram",
+                                gradients,
+                                experiment,
+                                epoch,
+                            )
+                        except Exception as e:
+                            print(f"Warning: Failed to log gradients for {layer_name}: {e}")
 
             saved[phase]["loss"].append(loss)
             saved[phase]["acc"].append(acc)
 
             print(f"{phase}: loss={loss:.6f} acc={acc:.4f} cm={cm.tolist()}")
+            
+            # Log metrics to Comet ML
+            if experiment is not None:
+                try:
+                    experiment.log_metrics({
+                        f"{phase}/loss": loss,
+                        f"{phase}/accuracy": acc,
+                        f"{phase}/params": get_params_amount(model),
+                    }, step=epoch)
+                except Exception as e:
+                    print(f"Warning: Failed to log metrics to Comet ML: {e}")
 
             # plateau tracking: prefer val, else test
             if ("val" in dataloaders and phase == "val") or ("val" not in dataloaders and phase == "test"):
@@ -758,6 +876,7 @@ def train_sparse_vit(
                 replace_epoch=replace_epoch,
                 non_zero_masks=non_zero_masks,
                 logs=epoch_logs,
+                experiment=experiment,
             )
             # Human-readable debug line (why expansion did/didn't happen)
             if epoch_logs.get("plateau_checked", 0):
@@ -770,6 +889,17 @@ def train_sparse_vit(
                     f"[plateau] avg_change={avg:.6f} thr={thr} triggered={trig} "
                     f"added_edges={added} deleted_edges={deleted}"
                 )
+                # Log sparse growth/prune metrics to Comet ML
+                if experiment is not None:
+                    try:
+                        experiment.log_metrics({
+                            "sparse/plateau_avg_change": avg if avg is not None else 0.0,
+                            "sparse/plateau_triggered": trig,
+                            "sparse/added_edges": added,
+                            "sparse/deleted_edges": deleted,
+                        }, step=epoch)
+                    except Exception as e:
+                        print(f"Warning: Failed to log sparse metrics to Comet ML: {e}")
             else:
                 # Not checked because of min-epochs-between-expansions / prune window
                 print(
@@ -794,6 +924,7 @@ def train_dense_vit(
     num_epochs,
     run_dir: Path,
     num_classes: int,
+    experiment=None,
 ):
     model = model.to(device)
     phases = ["train", "val", "test"] if "val" in dataloaders else ["train", "test"]
@@ -826,12 +957,26 @@ def train_dense_vit(
         for phase in phases:
             dl = dataloaders[phase]
             phase_mode = "train" if phase == "train" else "eval"
-            loss, acc, cm = run_epoch(dl, model, criterion, optimizer, device, phase_mode, num_classes=num_classes)
+            loss, acc, cm, _ = run_epoch(
+                dl, model, criterion, optimizer, device, phase_mode, num_classes=num_classes,
+                experiment=experiment, collect_gradients=False
+            )
 
             saved[phase]["loss"].append(loss)
             saved[phase]["acc"].append(acc)
 
             print(f"{phase}: loss={loss:.6f} acc={acc:.4f} cm={cm.tolist()}")
+            
+            # Log metrics to Comet ML
+            if experiment is not None:
+                try:
+                    experiment.log_metrics({
+                        f"{phase}/loss": loss,
+                        f"{phase}/accuracy": acc,
+                        f"{phase}/params": get_params_amount(model),
+                    }, step=epoch)
+                except Exception as e:
+                    print(f"Warning: Failed to log metrics to Comet ML: {e}")
 
             params_amount = get_params_amount(model)
             with metrics_path.open("a", newline="") as f:
@@ -893,12 +1038,12 @@ PRESETS: Dict[str, Preset] = {
         img_size=32,
         patch_size=4,
         dim=128,
-        depth=2,
+        depth=3,
         num_heads=4,
         dropout=0.1,
         lr=1e-4,
         batch_size=64,
-        num_epochs=10,
+        num_epochs=100,
     ),
     "fashion_small": Preset(
         num_classes=10,
@@ -1003,6 +1148,11 @@ def main():
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--epochs", type=int, default=None)
+
+    # Comet ML logging (optional)
+    ap.add_argument("--comet-api-key", type=str, default=None, help="Comet ML API key (optional)")
+    ap.add_argument("--comet-project", type=str, default=None, help="Comet ML project name (optional)")
+    ap.add_argument("--comet-workspace", type=str, default=None, help="Comet ML workspace (optional)")
 
     args = ap.parse_args()
     if args.start_fully_connected:
@@ -1131,6 +1281,38 @@ def main():
 
     hyperparams = build_hyperparams_from_args(depth=depth, args=args)
 
+    # Initialize Comet ML experiment (optional)
+    experiment = None
+    if args.comet_api_key:
+        try:
+            from comet_ml import Experiment
+            
+            experiment = Experiment(
+                api_key=args.comet_api_key,
+                project_name=args.comet_project or f"sparse_vit_{args.dataset}",
+                workspace=args.comet_workspace,
+            )
+            # Log hyperparameters
+            experiment.log_parameters({
+                "dataset": args.dataset,
+                "model": args.model,
+                "img_size": img_size,
+                "patch_size": patch_size,
+                "dim": dim,
+                "depth": depth,
+                "num_heads": num_heads,
+                "dropout": dropout,
+                "batch_size": batch_size,
+                "lr": lr,
+                "epochs": epochs,
+                **hyperparams,
+            })
+            print(f"Comet ML experiment started: {experiment.get_key()}")
+        except ImportError:
+            print("Warning: comet_ml not installed. Install with: pip install comet_ml")
+        except Exception as e:
+            print(f"Warning: Failed to initialize Comet ML: {e}")
+
     print("Model params:", get_params_amount(model))
     print("Starting training...")
     enable_expansion = (args.model == "sparse") and (not args.no_expansion) and (args.max_new_edges > 0)
@@ -1145,6 +1327,7 @@ def main():
             num_epochs=epochs,
             run_dir=run_dir,
             num_classes=num_classes,
+            experiment=experiment,
         )
     else:
         train_sparse_vit(
@@ -1158,10 +1341,16 @@ def main():
             run_dir=run_dir,
             num_classes=num_classes,
             enable_expansion=enable_expansion,
+            experiment=experiment,
         )
+    
+    if experiment is not None:
+        try:
+            experiment.end()
+            print("Comet ML experiment ended")
+        except Exception as e:
+            print(f"Warning: Failed to end Comet ML experiment: {e}")
 
 
 if __name__ == "__main__":
     main()
-
-
