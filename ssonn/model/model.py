@@ -1,5 +1,4 @@
 from abc import abstractmethod, ABC
-from jaxtyping import Float
 from typing import List
 
 import torch
@@ -515,7 +514,7 @@ class ExpandingLinear(SparseModule):
 
 
 class ScaledNet(nn.Module):
-    def __init__(self, weight: Float[torch.Tensor, "out in"], bias: Float[torch.Tensor, "out"], device: str):
+    def __init__(self, weight: torch.Tensor, bias: torch.Tensor, device: str):
         super(ScaledNet, self).__init__()
 
         weight = nn.Parameter(weight)
@@ -528,7 +527,7 @@ class ScaledNet(nn.Module):
 
         self.sub_linears = nn.ModuleList()
 
-    def put_sub_linear(self, children: Float[torch.Tensor, "dim0"], parents: Float[torch.Tensor, "dim0"]):
+    def put_sub_linear(self, children: torch.Tensor, parents: torch.Tensor):
         """
         Args:
             children: nodes, which takes output from parent nodes
@@ -543,7 +542,7 @@ class ScaledNet(nn.Module):
         weight.data = torch.cat([weight.data, weight_cat], dim=1)
         self.linear.in_features *= 2
 
-    def forward(self, input: Float[torch.Tensor, "batch dim0 dim1"]) -> Float[torch.Tensor, "batch dim0 dim1"]:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         for sub_linear in self.sub_linears:
             print(input.shape)
             input = sub_linear(input)
@@ -552,7 +551,7 @@ class ScaledNet(nn.Module):
 
 
 class SubLinear(nn.Module):
-    def __init__(self, parents: Float[torch.Tensor, "dim0"], input_dim: int, device: str):
+    def __init__(self, parents: torch.Tensor, input_dim: int, device: str):
         super(SubLinear, self).__init__()
 
         weight = nn.Parameter(torch.zeros((input_dim, input_dim), device=device))
@@ -570,7 +569,7 @@ class SubLinear(nn.Module):
 
         self.device = device
 
-    def forward(self, input: Float[torch.Tensor, "batch dim0 dim1"]) -> Float[torch.Tensor, "batch dim0 dim1"]:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = self.act(self.linear(input))
         return torch.cat([input, out], dim=-1)
 
