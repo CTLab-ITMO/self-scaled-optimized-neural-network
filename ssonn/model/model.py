@@ -3,6 +3,7 @@ from typing import List
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 class SparseModule(ABC, nn.Module):
@@ -563,21 +564,13 @@ class SubLinear(nn.Module):
 
         weight_data = torch.empty((output_dim, input_dim), device=device).uniform_(0, 1e-8)
         weight_data[torch.arange(output_dim, device=device), parents] = 1.0
-        weight = nn.Parameter(weight_data)
+        self.weight = nn.Parameter(weight_data)
 
-        bias = nn.Parameter(torch.zeros((1, output_dim), device=device))
-
-        self.linear = nn.Linear(in_features=input_dim, out_features=output_dim, bias=True)
-        self.linear.weight = weight
-        self.linear.bias = bias
+        self.bias = nn.Parameter(torch.zeros((1, output_dim), device=device))
 
         self.act = nn.ReLU()
 
-        self.device = device
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        print(input.shape, self.linear.weight.shape, self.linear.in_features, self.linear.out_features)
-        print(self.linear.bias.shape)
-        out = self.act(self.linear(input))
-        return torch.cat([input, out], dim=-1)
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = F.linear(x, self.weight, self.bias)
+        out = self.act(out)
+        return torch.cat([x, out], dim=-1)
