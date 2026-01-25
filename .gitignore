@@ -8,3 +8,5 @@ wandb
 .vscode
 .DS_Store
 sen-venv/
+*.txt
+*.pt
