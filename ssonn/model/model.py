@@ -527,16 +527,19 @@ class ScaledNet(nn.Module):
 
         self.sub_linears = nn.ModuleList()
 
-    def put_sub_linear(self, children: torch.Tensor, parents: torch.Tensor):
+    def put_sub_linear(self, parents: torch.Tensor, children: torch.Tensor):
         """
         Args:
-            children: nodes, which takes output from parent nodes
-            parents: nodes, which gives output to children nodes
+            children
+            parents
         """
         self.sub_linears.append(SubLinear(parents, self.linear.in_features, self.device))
+        print(self.sub_linears[0].linear.weight)
 
         weight = self.linear.weight
         weight_cat = torch.zeros((self.linear.in_features, self.linear.out_features))
+        print(weight.data, weight.data[children, parents])
+        print(weight_cat)
         weight_cat[children, torch.arange(0, self.linear.in_features)] = weight.data[children, parents]
         weight.data[children, parents] = 0.
         weight.data = torch.cat([weight.data, weight_cat], dim=1)
@@ -554,11 +557,12 @@ class SubLinear(nn.Module):
     def __init__(self, parents: torch.Tensor, input_dim: int, device: str):
         super(SubLinear, self).__init__()
 
-        weight = nn.Parameter(torch.zeros((input_dim, input_dim), device=device))
+        output_dim = parents.shape[0]
+        weight = nn.Parameter(torch.zeros((input_dim, output_dim), device=device))
         for child in range(0, input_dim):
-            for parent in parents:
+            for parent in range(0, output_dim):
                 weight.data[child, parent] = torch.rand((1)) * 1e-9
-        weight.data[torch.arange(0, input_dim), parents] = 1.
+        weight.data[parents, torch.arange(0, output_dim)] = 1.
         bias = nn.Parameter(torch.zeros((1, input_dim), device=device))
 
         self.linear = nn.Linear(in_features=input_dim, out_features=input_dim, bias=True)
@@ -572,7 +576,4 @@ class SubLinear(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = self.act(self.linear(input))
         return torch.cat([input, out], dim=-1)
-
-
-    
 
