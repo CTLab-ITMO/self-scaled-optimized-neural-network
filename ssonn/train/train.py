@@ -1,44 +1,74 @@
 import time
+import copy
+from typing import Callable, Dict, Tuple, Any
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, mean_squared_error
-from ssonn.model.utils import *
-from ssonn.metrics.train_metrics import *
-from ssonn.metrics.edge_finder import *
-import numpy as np
 
-from torch.utils.data import DataLoader
+from ssonn.model.model import ScaledNet
+from ssonn.metrics.edge_finder import EdgeFinder
 
-def train_one_epoch(model: nn.Module, train_loader: DataLoader, optimizer, criterion, device):
+
+def apply_sparsity_mask(model: nn.Module):
+    for module in model.modules():
+        if isinstance(module, ScaledNet):
+            def get_mask_hook(param):
+                def hook(grad):
+                    mask = (param.data != 0).float()
+                    return grad * mask
+                return hook
+
+            if hasattr(module, 'weight') and module.weight.requires_grad:
+                module.weight.register_hook(get_mask_hook(module.weight))
+            
+
+def train_one_epoch(
+    model: nn.Module, 
+    train_loader: DataLoader, 
+    optimizer: optim.Optimizer, 
+    criterion: Callable, 
+    device: str
+) -> Tuple[float, float]:
+    
     t0 = time.time()
     model.train()
-
-    train_loss = 0
-    for i in range(len(model.fc0.embed_linears)):
-        model.fc0.embed_linears[i].training = True
-
-    for i, (inputs, targets) in enumerate(tqdm(train_loader)):
+    train_loss = 0.0
+    
+    pbar = tqdm(train_loader, desc="Train", leave=False)
+    
+    for inputs, targets in pbar:
         inputs, targets = inputs.to(device), targets.to(device)
+        
+        optimizer.zero_grad()
         outputs = model(inputs)
         loss = criterion(outputs, targets)
-        optimizer.zero_grad()
         loss.backward()
-
+        
         optimizer.step()
+        
         train_loss += loss.item()
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     train_loss /= len(train_loader)
     train_time = time.time() - t0
     return train_loss, train_time
 
-
-def eval_one_epoch(model, criterion, val_loader, task_type, device):
+def eval_one_epoch(
+    model: nn.Module, 
+    criterion: Callable, 
+    val_loader: DataLoader, 
+    task_type: str, 
+    device: str
+) -> Tuple[float, float]:
+    
     model.eval()
-    val_loss = 0
+    val_loss = 0.0
     all_targets = []
     all_preds = []
-    
-    for i in range(len(model.fc0.embed_linears)):
-        model.fc0.embed_linears[i].training = False
 
     with torch.no_grad():
         for inputs, targets in val_loader:
@@ -54,155 +84,172 @@ def eval_one_epoch(model, criterion, val_loader, task_type, device):
 
             all_targets.extend(targets.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
+
     val_loss /= len(val_loader)
 
     if task_type == "classification":
         metric = accuracy_score(all_targets, all_preds)
-        all_targets = np.array(all_targets)
-        all_preds = np.array(all_preds)
     else:
         metric = mean_squared_error(all_targets, all_preds)
 
     return val_loss, metric
 
+def expand_model(
+    model: nn.Module, 
+    edge_finder: EdgeFinder, 
+    thresholds: Dict[str, float]
+) -> Tuple[bool, int]:
+    expansion_happened = False
+    total_new_edges = 0
 
-def edge_replacement_func_new_layer(
-    model, layer, optim, choose_threshold, ef, experiment, fully_connected=False
-):
-    chosen_edges = ef.choose_edges_threshold(model, layer, choose_threshold)
+    for layer_name, threshold in thresholds.items():
+        if hasattr(model, layer_name):
+            layer = getattr(model, layer_name)
+        else:
+            continue
 
-    print("Chosen edges:", chosen_edges, len(chosen_edges[0]))
-    layer.replace_many(*chosen_edges, fully_connected)
-    return len(chosen_edges[0])
+        if isinstance(layer, ScaledNet):
+            parents, children = edge_finder.choose_edges_threshold(
+                model, layer, threshold, embed=False
+            )
+            
+            if len(parents) > 0:
+                print(f"[Expansion] Layer '{layer_name}': Adding sub-layer for {len(parents)} edges.")
+                layer.put_sub_linear(parents, children)
+                expansion_happened = True
+                total_new_edges += len(parents)
+    
+    return expansion_happened, total_new_edges
+
+def prune_model(
+    model: nn.Module, 
+    edge_finder: EdgeFinder, 
+    thresholds: Dict[str, float]
+) -> int:
+    pruned_count = 0
+    for layer_name, threshold in thresholds.items():
+        if hasattr(model, layer_name):
+            layer = getattr(model, layer_name)
+        else:
+            continue
+
+        if isinstance(layer, ScaledNet):
+            metric = edge_finder.calculate_edge_metric_for_dataloader(
+                model=model, layer=layer, to_normalise=True, embed=False
+            )
+            
+            current_nonzero = layer.weight.data.abs() > 1e-9
+            mask_to_prune = (metric < threshold) & current_nonzero
+            
+            count = mask_to_prune.sum().item()
+            if count > 0:
+                with torch.no_grad():
+                    layer.weight.data[mask_to_prune] = 0.0
+                pruned_count += count
+                
+    if pruned_count > 0:
+        print(f"Pruned: {pruned_count} weights.")
+
+    return pruned_count
 
 
-def edge_deletion_func_new_layer(model, layer, optim, masks, choose_threshold, ef):
-    metr_edges_emb = ef.calculate_edge_metric_for_dataloader(
-        model=model, layer=layer, to_normalise=False, embed=True
-    )
-    metr_edges_exp = ef.calculate_edge_metric_for_dataloader(
-        model=model, layer=layer, to_normalise=False, embed=False
-    )
-    print(metr_edges_emb.shape, metr_edges_exp.shape)
-
-    combined_metrics = torch.cat([metr_edges_emb, metr_edges_exp])
-    print("combined_metrics", combined_metrics.shape)
-
-    min_val = combined_metrics.min()
-    max_val = combined_metrics.max()
-    normalized = (combined_metrics - min_val) / (max_val - min_val + 1e-8)
-
-    mask = normalized < choose_threshold
-    print("mask", mask.shape)
-    print(mask.sum())
-
-    num_emb_edges = len(metr_edges_emb)
-    print("num_emb_edges", num_emb_edges)
-    mask_emb = mask[:num_emb_edges]
-    mask_exp = mask[num_emb_edges:]
-
-    mask_emb = ~masks[0] & ~mask_emb
-    mask_exp = ~masks[1] & ~mask_exp
-
-    print(mask_emb.sum(), mask_exp.sum())
-
-    chosen_edges_emb = layer.embed_linears[-1].weight_indices[
-        :, mask_emb.nonzero(as_tuple=True)[0]
-    ]
-    chosen_edges_exp = layer.weight_indices[:, mask_exp.nonzero(as_tuple=True)[0]]
-
-    print("Chosen edges to del emb:", chosen_edges_emb, len(chosen_edges_emb[0]))
-    print("Chosen edges to del exp:", chosen_edges_exp, len(chosen_edges_exp[0]))
-
-    layer.delete_many(chosen_edges_emb, chosen_edges_exp)
-
-    last_lrs = [optim.param_groups[i]["lr"] for i in range(len(optim.param_groups))]
-    print(last_lrs)
-    optim.param_groups.clear()
-    optim.state.clear()
-
-    optim.add_param_group({"params": layer.weight_values, 'lr': last_lrs[0]})
-    for i in range(len(layer.embed_linears)):
-        optim.add_param_group({"params": layer.embed_linears[i].weight_values, 'lr': last_lrs[i+1]})
-
-    return len(chosen_edges_emb[0]) + len(chosen_edges_exp[0])
-
-def train_sparse_recursive(
-    model,
-    train_loader,
-    val_loader,
-    test_loader,
-    criterion,
-    optimizer,
-    hyperparams,
-    device,
-    experiment=None,
-    use_log_tool=True
-):
+def train_ssonn(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: Callable,
+    optimizer_factory: Callable[[nn.Module], optim.Optimizer],
+    hyperparams: Dict[str, Any],
+    device: str
+) -> nn.Module:
+    """
+    Main training loop for SSONN with dynamic expansion and pruning.
+    
+    Args:
+        model: The model containing ScaledNet layers.
+        train_loader: DataLoader for training.
+        val_loader: DataLoader for validation/metrics.
+        criterion: Loss function.
+        optimizer_factory: A function that takes the model and returns an optimizer.
+                           Required because model parameters change during expansion.
+        hyperparams: Dictionary of hyperparameters.
+        device: 'cpu' or 'cuda'.
+    """
     model = model.to(device)
+    optimizer = optimizer_factory(model)
+    
+    apply_sparsity_mask(model)
 
     ef = EdgeFinder(
-        hyperparams["edge_importance_metric"],
-        val_loader,
+        metric=hyperparams["edge_importance_metric"],
+        dataloader=val_loader,
         device=device,
-        aggregation_mode=hyperparams["edge_score_aggregation"],
-        max_to_replace=hyperparams["max_new_edges_per_expansion"],
+        aggregation_mode=hyperparams.get("edge_score_aggregation", "mean"),
+        max_to_replace=hyperparams.get("max_new_edges_per_expansion", None),
     )
 
-    non_zero_masks = {}
-    replace_epoch = [0]
-    val_losses = []
     train_losses = []
-    train_losses_expand = []
-    val_losses_expand = []
-    last_plateau = float('inf')
-    last_avg_expand_gradients = 0
-    last_avg_embed_gradients = 0
-    last_action = None
+    val_losses = []
+    last_expansion_epoch = 0
+
+    print("--- Starting SSONN Training ---")
+    
     for epoch in range(hyperparams["num_epochs"]):
-        # print(list(model.named_parameters()))
+        t_loss, t_time = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        v_loss, v_metric = eval_one_epoch(model, criterion, val_loader, hyperparams["task_type"], device)
+        
+        train_losses.append(t_loss)
+        val_losses.append(v_loss)
 
-        train_loss, train_time, expanding_gradients, embed_gradients = train_one_epoch(
-            model, optimizer, criterion, train_loader, epoch, device, experiment
-        )
-        val_loss, val_accuracy = eval_one_epoch(
-            model, criterion, test_loader, hyperparams["task_type"], device
-        )
+        print(f"Epoch {epoch+1}/{hyperparams['num_epochs']} | "
+              f"Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f} | "
+              f"Metric: {v_metric:.4f}")
 
-        val_losses += [val_loss]
-        train_losses += [train_loss]
+        if epoch - last_expansion_epoch > hyperparams.get("min_epochs_between_expansions", 5):
+            window = hyperparams.get("plateau_window_size", 5)
+            if len(train_losses) >= window:
+                recent = train_losses[-window:]
+                avg_change = sum(abs(recent[i] - recent[i-1]) for i in range(1, len(recent))) / (window - 1)
+                
+                if avg_change < hyperparams.get("plateau_threshold", 0.01):
+                    print(f"   -> Plateau detected (change {avg_change:.5f}). Checking expansion...")
+                    
+                    expanded, num_new = expand_model(
+                        model, ef, hyperparams["expansion_thresholds"]
+                    )
+                    
+                    if expanded:
+                        print(f"   -> Model expanded. Re-initializing optimizer.")
+                        optimizer = optimizer_factory(model)
+                        apply_sparsity_mask(model)
+                        
+                        last_expansion_epoch = epoch
+        
+        if epoch > hyperparams.get("prune_after_epochs", 10):
+            prune_model(model, ef, hyperparams.get("pruning_thresholds", {}))
 
-        print(
-            f"Epoch {epoch + 1}/{hyperparams['num_epochs']}, Train Loss: {train_loss:.4f}, "
-            f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}"
-        )
+    print("--- Training Finished ---")
+    return model
 
-        recent_changes = None
-        if epoch - replace_epoch[-1] > max(
-            hyperparams["prune_after_epochs"],
-            hyperparams["min_epochs_between_expansions"],
-            hyperparams["plateau_window_size"],
-        ):
-            recent_changes = [
-                abs(train_losses[i] - train_losses[i - 1])
-                for i in range(-hyperparams["plateau_window_size"], 0)
-            ]
-            avg_change = sum(recent_changes) / hyperparams["plateau_window_size"]
-            print('avg_change:', avg_change)
+def convert_to_scaled_net(model: nn.Module, layers_to_convert: list, device="cpu") -> nn.Module:
+    new_model = copy.deepcopy(model)
+    
+    layer_map = {}
+    for name, module in model.named_children():
+        layer_map[module] = name
+        
+    for layer in layers_to_convert:
+        if layer in layer_map:
+            name = layer_map[layer]
+            print(f"Converting layer '{name}' to ScaledNet...")
             
-            # val_losses_expand += [val_losses[-1]]
-            # if len(val_losses_expand) == 1 or val_losses_expand[-1] <= val_losses_expand[-2] - 0.01:
-            print(last_plateau - train_losses[-1])
-            if avg_change < hyperparams["plateau_threshold"]:
-                    len_choose = 0
-                    for layer_name in hyperparams["expansion_thresholds"].keys():
-                        layer = model.__getattr__(layer_name)
-                        len_choose += edge_replacement_func_new_layer(
-                            model,
-                            layer,
-                            optimizer,
-                            hyperparams["expansion_thresholds"][layer_name],
-                            ef,
-                            experiment,
-                            hyperparams["start_fully_connected"],
-                        )
+            scaled_layer = ScaledNet(
+                layer.weight.data, 
+                layer.bias.data if layer.bias is not None else torch.zeros(layer.out_features),
+                device=device
+            )
+            setattr(new_model, name, scaled_layer)
+        else:
+            print(f"Warning: Layer {layer} not found in model children.")
+            
+    return new_model.to(device)
