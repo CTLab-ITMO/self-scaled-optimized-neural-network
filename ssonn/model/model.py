@@ -514,12 +514,15 @@ class ExpandingLinear(SparseModule):
 
 
 class ScaledNet(nn.Module):
+    """
+    stores transposed weight
+    """
     def __init__(self, weight: torch.Tensor, bias: torch.Tensor, device: str):
         super(ScaledNet, self).__init__()
 
         weight = nn.Parameter(weight)
         bias = nn.Parameter(bias)
-        self.linear = nn.Linear(in_features=weight.shape[1], out_features=weight.shape[0])
+        self.linear = nn.Linear(in_features=weight.shape[1], out_features=weight.shape[0], bias=True)
         self.linear.weight = weight
         self.linear.bias = bias
 
@@ -528,44 +531,43 @@ class ScaledNet(nn.Module):
         self.sub_linears = nn.ModuleList()
 
     def put_sub_linear(self, parents: torch.Tensor, children: torch.Tensor):
-        """
-        Args:
-            children
-            parents
-        """
+        chosen_dim = parents.shape[0]
+
         self.sub_linears.append(SubLinear(parents, self.linear.in_features, self.device))
-        print(self.sub_linears[0].linear.weight)
 
         weight = self.linear.weight
-        weight_cat = torch.zeros((self.linear.in_features, self.linear.out_features))
-        print(weight.data, weight.data[children, parents])
-        print(weight_cat)
-        weight_cat[children, torch.arange(0, self.linear.in_features)] = weight.data[children, parents]
+        weight_cat = torch.zeros((self.linear.out_features, chosen_dim))
+        weight_cat[children, torch.arange(0, chosen_dim)] = weight.data[children, parents]
         weight.data[children, parents] = 0.
+
         weight.data = torch.cat([weight.data, weight_cat], dim=1)
-        self.linear.in_features *= 2
+        self.linear.in_features += chosen_dim
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        print(input.shape, self.linear.weight.shape, self.linear.in_features, self.linear.out_features)
         for sub_linear in self.sub_linears:
-            print(input.shape)
+            print(input.shape, self.linear.weight.shape)
             input = sub_linear(input)
             print(input.shape)
         return self.linear(input)
 
 
 class SubLinear(nn.Module):
+    """
+    stores transposed weight
+    """
     def __init__(self, parents: torch.Tensor, input_dim: int, device: str):
         super(SubLinear, self).__init__()
 
         output_dim = parents.shape[0]
-        weight = nn.Parameter(torch.zeros((input_dim, output_dim), device=device))
-        for child in range(0, input_dim):
-            for parent in range(0, output_dim):
-                weight.data[child, parent] = torch.rand((1)) * 1e-9
-        weight.data[parents, torch.arange(0, output_dim)] = 1.
-        bias = nn.Parameter(torch.zeros((1, input_dim), device=device))
+        weight = nn.Parameter(torch.zeros((output_dim, input_dim), device=device))
+        for i in range(0, output_dim):
+            for j in range(0, input_dim):
+                weight.data[i, j] = torch.rand((1)) * 1e-9
+        weight.data[torch.arange(0, output_dim), parents] = 1.
+        bias = nn.Parameter(torch.zeros((1, output_dim), device=device))
 
-        self.linear = nn.Linear(in_features=input_dim, out_features=input_dim, bias=True)
+        self.linear = nn.Linear(in_features=input_dim, out_features=output_dim, bias=True)
         self.linear.weight = weight
         self.linear.bias = bias
 
@@ -574,6 +576,8 @@ class SubLinear(nn.Module):
         self.device = device
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        print(input.shape, self.linear.weight.shape, self.linear.in_features, self.linear.out_features)
+        print(self.linear.bias.shape)
         out = self.act(self.linear(input))
         return torch.cat([input, out], dim=-1)
 
