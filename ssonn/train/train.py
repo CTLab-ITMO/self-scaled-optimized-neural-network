@@ -316,7 +316,7 @@ def train_ssonn(
                 optimizer = optimizer_factory(model)
                 apply_sparsity_mask(model) # Re-apply hooks to new parameters
                 if use_log_tool and experiment:
-                    experiment.log_metric("expansion_event", num_new, epoch=epoch)
+                    experiment.log_metric("expansion event", num_new, epoch=epoch)
             else:
                 print(f"   -> Expansion attempted but no edges selected.")
         
@@ -324,7 +324,7 @@ def train_ssonn(
             # if epoch > hyperparams.get("prune_after_epochs", 999999):
             #     prune_model(model, optimizer, ef, hyperparams.get("pruning_thresholds", {}))
                 # if pruned > 0 and use_log_tool and experiment:
-                #      experiment.log_metric("pruned_weights", pruned, epoch=epoch)
+                #      experiment.log_metric("pruned weights", pruned, epoch=epoch)
 
         # 5. Calculate Params stats, Logging (Comet ML)
         total_params, non_zero_params = get_param_counts(model)
@@ -335,12 +335,12 @@ def train_ssonn(
         if use_log_tool and experiment is not None:
             # Metrics
             logs = {
-                "train_loss": t_loss,
-                "val_loss": v_loss,
-                "val_metric": v_metric,
+                "train loss": t_loss,
+                "val loss": v_loss,
+                "val accuracy": v_metric,
                 "lr": optimizer.param_groups[0]["lr"],
                 "total_params": total_params,
-                "active_params": non_zero_params,
+                "params amount": non_zero_params,
                 "sparsity": 1.0 - (non_zero_params / total_params),
             }
             experiment.log_metrics(logs, epoch=epoch)
