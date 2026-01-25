@@ -1,6 +1,5 @@
-import time
 import copy
-from typing import Callable, Dict, Tuple, Any, List, Union
+from typing import Callable, Dict, Tuple, Any, List
 
 import torch
 import torch.nn as nn
@@ -9,7 +8,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, mean_squared_error
 
-from ssonn.model.model import ScaledNet
+from ssonn.model.model import ScaledNet, SubLinear
 from ssonn.metrics.edge_finder import EdgeFinder
 
 
@@ -18,7 +17,8 @@ def apply_sparsity_mask(model: nn.Module) -> None:
     Registers backward hooks to enforce sparsity on dense tensors.
     """
     for module in model.modules():
-        if isinstance(module, ScaledNet):
+        if isinstance(module, (ScaledNet, SubLinear)):
+
             def get_mask_hook(param: nn.Parameter) -> Callable[[torch.Tensor], torch.Tensor]:
                 def hook(grad: torch.Tensor) -> torch.Tensor:
                     mask = (param.data != 0).float()
@@ -147,20 +147,17 @@ def expand_model(
     
     return expansion_happened, total_new_edges
 
-
-# TODO: add pruning on SubLinear
 def prune_model(
     model: nn.Module, 
+    optimizer: optim.Optimizer,
     edge_finder: EdgeFinder, 
     thresholds: Dict[str, float]
 ) -> int:
     """
-    Zeros out weights that fall below the importance threshold.
-
-    Returns:
-        int: Total number of weights pruned.
+    Zeros out weights AND clears optimizer state to prevent resurrection.
     """
     pruned_count = 0
+    
     for layer_name, threshold in thresholds.items():
         if hasattr(model, layer_name):
             layer = getattr(model, layer_name)
@@ -168,25 +165,70 @@ def prune_model(
             continue
 
         if isinstance(layer, ScaledNet):
-            # Calculate importance metrics for all weights
-            metric = edge_finder.calculate_edge_metric_for_dataloader(
-                model=model, layer=layer, to_normalise=True, embed=False
+            # 1. Compute metrics (ScaledNet)
+            metric_exp = edge_finder.calculate_edge_metric_for_dataloader(
+                model=model, layer=layer, to_normalise=False, embed=False
             )
             
-            # Pruning Condition: (Metric < Threshold) AND (Weight is currently active)
-            # We check > 1e-9 to avoid re-pruning already zeroed weights
-            current_nonzero = layer.weight.data.abs() > 1e-9
-            mask_to_prune = (metric < threshold) & current_nonzero
-            
-            count = mask_to_prune.sum().item()
-            if count > 0:
-                with torch.no_grad():
-                    # Set weights to exactly 0.0
-                    layer.weight.data[mask_to_prune] = 0.0
-                pruned_count += count
+            # 2. Compute metrics (SubLinear), if exists 
+            has_sub_layers = len(layer.sub_linears) > 0
+            if has_sub_layers:
+                metric_emb = edge_finder.calculate_edge_metric_for_dataloader(
+                    model=model, layer=layer, to_normalise=False, embed=True
+                )
                 
+                flat_exp = metric_exp.flatten()
+                flat_emb = metric_emb.flatten()
+                combined = torch.cat([flat_emb, flat_exp])
+                min_v, max_v = combined.min(), combined.max()
+                norm = (combined - min_v) / (max_v - min_v + 1e-8)
+                
+                global_mask = norm < threshold
+                
+                num_emb = flat_emb.numel()
+                mask_emb = global_mask[:num_emb].view_as(metric_emb)
+                mask_exp = global_mask[num_emb:].view_as(metric_exp)
+                
+                target_sub = layer.sub_linears[-1]
+                # Only non-zero params
+                nonzero_emb = target_sub.weight.data.abs() > 1e-9
+                final_mask_emb = mask_emb & nonzero_emb
+                
+                if final_mask_emb.sum() > 0:
+                    with torch.no_grad():
+                        target_sub.weight.data[final_mask_emb] = 0.0
+                        # !!! IMPORTANT !!!
+                        if target_sub.weight in optimizer.state:
+                            state = optimizer.state[target_sub.weight]
+                            if 'exp_avg' in state:
+                                state['exp_avg'][final_mask_emb] = 0.0
+                            if 'exp_avg_sq' in state:
+                                state['exp_avg_sq'][final_mask_emb] = 0.0
+                    pruned_count += final_mask_emb.sum().item()
+
+            else:
+                min_v, max_v = metric_exp.min(), metric_exp.max()
+                norm = (metric_exp - min_v) / (max_v - min_v + 1e-8)
+                mask_exp = norm < threshold
+
+            nonzero_exp = layer.weight.data.abs() > 1e-9
+            final_mask_exp = mask_exp & nonzero_exp
+            
+            if final_mask_exp.sum() > 0:
+                with torch.no_grad():
+                    layer.weight.data[final_mask_exp] = 0.0
+                    # !!! IMPORTANT !!!
+                    if layer.weight in optimizer.state:
+                        state = optimizer.state[layer.weight]
+                        if 'exp_avg' in state:
+                            state['exp_avg'][final_mask_exp] = 0.0
+                        if 'exp_avg_sq' in state:
+                            state['exp_avg_sq'][final_mask_exp] = 0.0
+                            
+                pruned_count += final_mask_exp.sum().item()
+
     if pruned_count > 0:
-        print(f"[Pruning] Zeroed out {pruned_count} weights.")
+        print(f"[Pruning] Total weights zeroed out: {pruned_count}")
 
     return pruned_count
 
@@ -255,6 +297,7 @@ def train_ssonn(
               f"Metric: {v_metric:.4f}")
 
         # 3. Expansion Logic: Check for loss plateau
+        # TODO: replace this algorithm to lr/expand
         if epoch - last_expansion_epoch > hyperparams.get("min_epochs_between_expansions", 5):
             window = hyperparams.get("plateau_window_size", 5)
             
@@ -284,7 +327,7 @@ def train_ssonn(
         
         # 4. Pruning Logic
         if epoch > hyperparams.get("prune_after_epochs", 10):
-            prune_model(model, ef, hyperparams.get("pruning_thresholds", {}))
+            prune_model(model, optimizer, ef, hyperparams.get("pruning_thresholds", {}))
 
     print("--- Training Finished ---")
     return model
