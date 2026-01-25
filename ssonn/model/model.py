@@ -558,13 +558,13 @@ class SubLinear(nn.Module):
     """
     def __init__(self, parents: torch.Tensor, input_dim: int, device: str):
         super(SubLinear, self).__init__()
-
+        self.device = device
         output_dim = parents.shape[0]
-        weight = nn.Parameter(torch.zeros((output_dim, input_dim), device=device))
-        for i in range(0, output_dim):
-            for j in range(0, input_dim):
-                weight.data[i, j] = torch.rand((1)) * 1e-9
-        weight.data[torch.arange(0, output_dim), parents] = 1.
+
+        weight_data = torch.empty((output_dim, input_dim), device=device).uniform_(0, 1e-8)
+        weight_data[torch.arange(output_dim, device=device), parents] = 1.0
+        weight = nn.Parameter(weight_data)
+
         bias = nn.Parameter(torch.zeros((1, output_dim), device=device))
 
         self.linear = nn.Linear(in_features=input_dim, out_features=output_dim, bias=True)
