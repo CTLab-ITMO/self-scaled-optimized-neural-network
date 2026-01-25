@@ -23,16 +23,16 @@ class SSONNPlateauScheduler:
         """
         # 1. Check cooldown period
         cooldown = max(
-            self.hp.get("prune_after_epochs", 0),
-            self.hp.get("min_epochs_between_expansions", 5),
-            self.hp.get("plateau_window_size", 5)
+            self.hp["prune_after_epochs"],
+            self.hp["min_epochs_between_expansions"],
+            self.hp["plateau_window_size"]
         )
         
         if epoch - self.last_action_epoch <= cooldown:
             return None
 
         # 2. Check for Plateau
-        window = self.hp.get("plateau_window_size", 5)
+        window = self.hp["plateau_window_size"]
         if len(self.train_losses) < window:
             return None
 
@@ -40,9 +40,9 @@ class SSONNPlateauScheduler:
         avg_change = sum(abs(recent[i] - recent[i-1]) for i in range(1, len(recent))) / (window - 1)
         
         # Debug info
-        print(f"DEBUG: Epoch {epoch}, Avg Change: {avg_change:.5f}, Threshold: {self.hp.get('plateau_threshold', 0.01)}")
+        print(f"DEBUG: Epoch {epoch}, Avg Change: {avg_change:.5f}, Threshold: {self.hp['plateau_threshold']}")
 
-        if avg_change >= self.hp.get("plateau_threshold", 0.01):
+        if avg_change >= self.hp["plateau_threshold"]:
             return None # No plateau
 
         print(f"   -> Plateau detected (change {avg_change:.5f}).")
@@ -52,7 +52,7 @@ class SSONNPlateauScheduler:
         diff_from_last_plateau = abs(self.last_plateau_loss - current_loss)
         
         # If we haven't acted yet OR the loss has improved significantly since the last plateau action -> Decay LR
-        if (self.last_action is None) or (diff_from_last_plateau >= self.hp.get("diff_threshold", 0.05)):
+        if (self.last_action is None) or (diff_from_last_plateau >= self.hp["diff_threshold"]):
             self.last_plateau_loss = current_loss
             self.last_action = 'lr'
             self.last_action_epoch = epoch
