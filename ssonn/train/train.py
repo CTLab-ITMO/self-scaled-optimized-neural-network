@@ -11,6 +11,7 @@ from sklearn.metrics import accuracy_score, mean_squared_error
 from ssonn.model.model import ScaledNet, SubLinear
 from ssonn.metrics.edge_finder import EdgeFinder
 from .scheduler import SSONNPlateauScheduler
+from .logging import *
 
 
 def apply_sparsity_mask(model: nn.Module) -> None:
@@ -241,7 +242,9 @@ def train_ssonn(
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     optimizer_factory: Callable[[nn.Module], optim.Optimizer],
     hyperparams: Dict[str, Any],
-    device: str
+    device: str,
+    experiment: Any = None,   # Added experiment
+    use_log_tool: bool = True # Added flag
 ) -> nn.Module:
     """
     Manupulate the SSONN training lifecycle with dynamic expansion and pruning.
@@ -295,10 +298,6 @@ def train_ssonn(
         train_losses.append(t_loss)
         val_losses.append(v_loss)
 
-        print(f"Epoch {epoch+1}/{hyperparams['num_epochs']} | "
-              f"Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f} | "
-              f"Metric: {v_metric:.4f}")
-
         # 3. Scheduler Logic (LR / Expand)
         action = scheduler.check_for_action(epoch)
 
@@ -316,12 +315,50 @@ def train_ssonn(
                 # Re-create optimizer (this resets LR to initial value defined in factory)
                 optimizer = optimizer_factory(model)
                 apply_sparsity_mask(model) # Re-apply hooks to new parameters
+                if use_log_tool and experiment:
+                    experiment.log_metric("expansion_event", num_new, epoch=epoch)
             else:
                 print(f"   -> Expansion attempted but no edges selected.")
         
         # 4. Pruning Logic
             # if epoch > hyperparams.get("prune_after_epochs", 999999):
             #     prune_model(model, optimizer, ef, hyperparams.get("pruning_thresholds", {}))
+                # if pruned > 0 and use_log_tool and experiment:
+                #      experiment.log_metric("pruned_weights", pruned, epoch=epoch)
+
+        # 5. Calculate Params stats, Logging (Comet ML)
+        total_params, non_zero_params = get_param_counts(model)
+        print(f"Epoch {epoch+1}/{hyperparams['num_epochs']} | "
+              f"T-Loss: {t_loss:.4f} | V-Loss: {v_loss:.4f} | Met: {v_metric:.4f} | "
+              f"Params: {non_zero_params}/{total_params}")
+
+        if use_log_tool and experiment is not None:
+            # Metrics
+            logs = {
+                "train_loss": t_loss,
+                "val_loss": v_loss,
+                "val_metric": v_metric,
+                "lr": optimizer.param_groups[0]["lr"],
+                "total_params": total_params,
+                "active_params": non_zero_params,
+                "sparsity": 1.0 - (non_zero_params / total_params),
+            }
+            experiment.log_metrics(logs, epoch=epoch)
+            
+            # Gradient Visualization (Snapshot of last batch gradients)
+            # Find the first ScaledNet to log (e.g. fc0)
+            target_layer = None
+            for name, mod in model.named_modules():
+                if isinstance(mod, ScaledNet):
+                    target_layer = mod
+                    break
+            
+            if target_layer and target_layer.weight.grad is not None:
+                log_gradient_values("main_layer_grads", target_layer.weight.grad, experiment, epoch)
+                log_gradient_histograms("main_layer_grads_hist", target_layer.weight.grad, experiment, epoch)
+                # log_gradient_image(target_layer, experiment, epoch)
+
+
 
     print("--- Training Finished ---")
     return model
