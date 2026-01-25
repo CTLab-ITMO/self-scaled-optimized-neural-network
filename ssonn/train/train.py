@@ -1,100 +1,92 @@
-import time
+import copy
+from typing import Callable, Dict, Tuple, Any, List
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, mean_squared_error
-from ssonn.metrics.nonlinearity_metrics import AbsGradientEdgeMetric
-from ssonn.model.utils import *
-import torch.optim as optim
-from ssonn.metrics.train_metrics import *
-from ssonn.metrics.edge_finder import *
-# import wandb
-import matplotlib.pyplot as plt
-import numpy as np
-from copy import deepcopy
 
-def train_one_epoch(model, optimizer, criterion, train_loader, epoch, device, experiment=None, use_log_tool=True):
+from ssonn.model.model import ScaledNet, SubLinear
+from ssonn.metrics.edge_finder import EdgeFinder
+from .scheduler import SSONNPlateauScheduler
+from .logging import *
+
+
+def apply_sparsity_mask(model: nn.Module) -> None:
     """
-    Trains the model for one epoch.
-
-        Args:
-            model: The neural network model to train.
-            optimizer: The optimization algorithm used for training.
-            criterion: The loss function used to compute the loss.
-            train_loader: DataLoader for the training data.
-            device:  The device (CPU or GPU) on which to perform the training.
-
-        Returns:
-            tuple: A tuple containing the average training loss and the time taken for the epoch.
+    Registers backward hooks to enforce sparsity on dense tensors.
     """
-    t0 = time.time()
-    model.train()
+    for module in model.modules():
+        if isinstance(module, (ScaledNet, SubLinear)):
 
-    train_loss = 0
-    expanding_gradients = []
-    embed_gradients = []
+            def get_mask_hook(param: nn.Parameter) -> Callable[[torch.Tensor], torch.Tensor]:
+                def hook(grad: torch.Tensor) -> torch.Tensor:
+                    mask = (param.data != 0).float()
+                    return grad * mask
+                return hook
 
-    for i in range(len(model.fc0.embed_linears)):
-        model.fc0.embed_linears[i].training = True
-
-    for i, (inputs, targets) in enumerate(tqdm(train_loader)):
-        inputs, targets = inputs.to(device), targets.to(device)
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-        optimizer.zero_grad()
-        loss.backward()
-
-        expanding_gradients += [model.fc0.weight_values.grad.clone().detach().cpu()]
-        embed_gradients_temp = []
-        for i in range(len(model.fc0.embed_linears)):
-            if model.fc0.embed_linears[i].weight_values.grad is not None:
-                embed_gradients_temp += [model.fc0.embed_linears[i].weight_values.grad.clone().detach().cpu()]
-            else:
-                embed_gradients_temp += [0]
-        embed_gradients += [embed_gradients_temp]
-
-        optimizer.step()
-        train_loss += loss.item()
-
-    train_loss /= len(train_loader)
-    train_time = time.time() - t0
-
-    if use_log_tool:
-        log_gradient_values("expanding grads", expanding_gradients, experiment, epoch)
-        log_gradient_histograms("expanding grads hist", expanding_gradients, experiment, epoch)
-        # for i in range(len(model.fc0.embed_linears)): 
-        #     log_gradient_values(f"embed grads {i}", [el[i] for el in embed_gradients], experiment, epoch)
-        #     log_gradient_histograms(f"embed grads hist {i}", [el[i] for el in embed_gradients], experiment, epoch)
-    
-    # for name, param in model.named_parameters():
-    #     if param.requires_grad and param.grad is not None:
-    #         print(f"{name}: grad norm = {param.grad.norm()}")
-    #     elif not param.requires_grad:
-    #         print(f"{name}: frozen (no grad)")
-
-    return train_loss, train_time, expanding_gradients, embed_gradients
+            # Register the hook if the weight parameter exists and requires gradients
+            if hasattr(module, 'weight') and module.weight.requires_grad:
+                module.weight.register_hook(get_mask_hook(module.weight))
 
 
-def eval_one_epoch(model, criterion, val_loader, task_type, device):
+def train_one_epoch(
+    model: nn.Module, 
+    train_loader: DataLoader, 
+    optimizer: optim.Optimizer, 
+    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor], 
+    device: str
+) -> float:
     """
-    Args:
-        model (torch.nn.Module)
-        criterion (torch.nn.Module)
-        val_loader (torch.utils.data.DataLoader)
-        task_type (str): 'regression' or 'classification'.
+    Performs one epoch of training.
 
     Returns:
-        tuple: A tuple containing:
-            - val_loss (float): Average loss over the validation set.
-            - val_accuracy (float) / MSE (float): Accuracy score for classification tasks,
-                                   or MSE for regression tasks.
+        Tuple[float, float]: Average training loss and the time taken for the epoch.
     """
+    model.train()
+    train_loss = 0.0
+    
+    pbar = tqdm(train_loader, desc="Train", leave=False)
+    
+    for inputs, targets in pbar:
+        inputs, targets = inputs.to(device), targets.to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        
+        optimizer.step()
+        
+        train_loss += loss.item()
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
+    train_loss /= len(train_loader)
+    return train_loss
+
+
+def eval_one_epoch(
+    model: nn.Module, 
+    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor], 
+    val_loader: DataLoader, 
+    task_type: str, 
+    device: str
+) -> Tuple[float, float]:
+    """
+    Evaluates the model on the validation set.
+
+    Args:
+        task_type: 'classification' (uses Accuracy) or 'regression' (uses MSE).
+
+    Returns:
+        Tuple[float, float]: Average validation loss and the calculated metric.
+    """
     model.eval()
-    val_loss = 0
+    val_loss = 0.0
     all_targets = []
     all_preds = []
-    
-    for i in range(len(model.fc0.embed_linears)):
-        model.fc0.embed_linears[i].training = False
 
     with torch.no_grad():
         for inputs, targets in val_loader:
@@ -110,397 +102,298 @@ def eval_one_epoch(model, criterion, val_loader, task_type, device):
 
             all_targets.extend(targets.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
+
     val_loss /= len(val_loader)
 
     if task_type == "classification":
         metric = accuracy_score(all_targets, all_preds)
-        all_targets = np.array(all_targets)
-        all_preds = np.array(all_preds)
     else:
         metric = mean_squared_error(all_targets, all_preds)
 
     return val_loss, metric
 
 
-def edge_replacement_func_new_layer(
-    model, layer, optim, choose_threshold, ef, experiment, fully_connected=False
-):
+def expand_model(
+    model: nn.Module, 
+    edge_finder: EdgeFinder, 
+    thresholds: Dict[str, float]
+) -> Tuple[bool, int]:
     """
-    Replaces edges in a given layer based on a threshold and updates the optimizer.
+    Checks if layers need expansion and applies the SSONN expansion operation.
 
-        This function selects edges to replace within a specified layer using a provided
-        edge selection function and threshold. It then replaces these edges and
-        reinitializes the optimizer with parameters from the modified layer, ensuring
-        correct optimization for the new network structure.
-
-        Args:
-            model: The overall model containing the layer to be modified.
-            layer: The specific layer in which edges will be replaced.
-            optim: The optimizer used for training the model.
-            choose_threshold: The threshold value used by the edge selection function.
-            ef: An object providing the edge selection functionality (e.g., choose_edges_threshold).
-            fully_connected: A boolean indicating whether the layer is fully connected,
-                             influencing the replacement process.
-
-        Returns:
-            int: The number of edges that were successfully replaced in the layer.
+    Returns:
+        Tuple[bool, int]: (True if architecture changed, Number of new edges added).
     """
+    expansion_happened = False
+    total_new_edges = 0
 
-    chosen_edges = ef.choose_edges_threshold(model, layer, choose_threshold)
-    if len(layer.embed_linears) == 0:
-        log_replaces(chosen_edges, experiment)
-
-    print("Chosen edges:", chosen_edges, len(chosen_edges[0]))
-    layer.replace_many(*chosen_edges, fully_connected)
-
-    if len(chosen_edges[0]) > 0:
-        last_lrs = [optim.param_groups[i]["lr"] for i in range(len(optim.param_groups))]
-        last_lrs.append(last_lrs[-1])
-        print(last_lrs)
-        optim.param_groups.clear()
-        optim.state.clear()
-        optim.add_param_group({"params": layer.weight_values, "lr": last_lrs[0]})
-        optim.add_param_group({"params": layer.bias_values, "lr": last_lrs[0]})
-        for i in range(len(layer.embed_linears)):
-            optim.add_param_group({"params": layer.embed_linears[i].weight_values, "lr": last_lrs[i+1]})
-            optim.add_param_group({"params": layer.embed_linears[i].bias, "lr": last_lrs[i+1]})
-    
-    return len(chosen_edges[0])
-
-
-def edge_deletion_func_new_layer(model, layer, optim, masks, choose_threshold, ef):
-    """
-    Deletes edges from a given layer based on calculated metrics and thresholds.
-
-        Args:
-            model: The model containing the layer to modify.
-            layer: The layer from which edges will be deleted.
-            optim: The optimizer used for updating the model's parameters.
-            masks: A tuple of masks indicating existing edge deletions.
-            choose_threshold: The threshold value for determining edges to delete.
-            ef: An object providing functions for calculating edge metrics.
-
-        Returns:
-            int: The total number of deleted edges (both embedding and expansion edges).
-    """
-
-    metr_edges_emb = ef.calculate_edge_metric_for_dataloader(
-        model=model, layer=layer, to_normalise=False, embed=True
-    )
-    metr_edges_exp = ef.calculate_edge_metric_for_dataloader(
-        model=model, layer=layer, to_normalise=False, embed=False
-    )
-    print(metr_edges_emb.shape, metr_edges_exp.shape)
-
-    combined_metrics = torch.cat([metr_edges_emb, metr_edges_exp])
-    print("combined_metrics", combined_metrics.shape)
-
-    min_val = combined_metrics.min()
-    max_val = combined_metrics.max()
-    normalized = (combined_metrics - min_val) / (max_val - min_val + 1e-8)
-
-    mask = normalized < choose_threshold
-    print("mask", mask.shape)
-    print(mask.sum())
-
-    num_emb_edges = len(metr_edges_emb)
-    print("num_emb_edges", num_emb_edges)
-    mask_emb = mask[:num_emb_edges]
-    mask_exp = mask[num_emb_edges:]
-
-    mask_emb = ~masks[0] & ~mask_emb
-    mask_exp = ~masks[1] & ~mask_exp
-
-    print(mask_emb.sum(), mask_exp.sum())
-
-    chosen_edges_emb = layer.embed_linears[-1].weight_indices[
-        :, mask_emb.nonzero(as_tuple=True)[0]
-    ]
-    chosen_edges_exp = layer.weight_indices[:, mask_exp.nonzero(as_tuple=True)[0]]
-
-    print("Chosen edges to del emb:", chosen_edges_emb, len(chosen_edges_emb[0]))
-    print("Chosen edges to del exp:", chosen_edges_exp, len(chosen_edges_exp[0]))
-
-    layer.delete_many(chosen_edges_emb, chosen_edges_exp)
-
-    last_lrs = [optim.param_groups[i]["lr"] for i in range(len(optim.param_groups))]
-    print(last_lrs)
-    optim.param_groups.clear()
-    optim.state.clear()
-
-    optim.add_param_group({"params": layer.weight_values, 'lr': last_lrs[0]})
-    for i in range(len(layer.embed_linears)):
-        optim.add_param_group({"params": layer.embed_linears[i].weight_values, 'lr': last_lrs[i+1]})
-
-    return len(chosen_edges_emb[0]) + len(chosen_edges_exp[0])
-
-
-def log_gradient_image(gradients, experiment, epoch):
-    avg_gradients = torch.stack(gradients).mean(dim=0)
-    gradient_images = []
-    for i in range(10):
-        grad_img = avg_gradients[i*28*28:(i+1)*28*28].view(28, 28).numpy()
-        gradient_images.append(grad_img)
-    
-    fig, axes = plt.subplots(2, 5, figsize=(15, 6))
-    axes = axes.flatten()
-    
-    for i, grad_img in enumerate(gradient_images):
-        im = axes[i].imshow(grad_img, cmap='viridis')
-        axes[i].set_title(f'Neuron {i} Gradients')
-        axes[i].axis('off')
-        plt.colorbar(im, ax=axes[i])
-    
-    plt.tight_layout()
-    experiment.log_figure(f"gradients_image", fig, step=epoch)
-    plt.close(fig)
-    
-    # experiment.log_histogram_3d(avg_gradients, name="expanding linear grads", step=epoch)
-
-def log_gradient_values(name, gradients, experiment, epoch):
-    avg_gradients = torch.stack(gradients).mean(dim=0)
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
-    ax.plot(range(len(avg_gradients)), avg_gradients, 'b-', alpha=0.7, linewidth=1)
-    ax.scatter(range(len(avg_gradients)), avg_gradients, s=10, alpha=0.5, color='blue')
-    
-    ax.set_xlabel('Neuron Index (in flattened array)')
-    ax.set_ylabel('Gradient Value')
-    ax.set_title(f'Gradient Values vs Neuron Index (Epoch {epoch})')
-    ax.grid(True, alpha=0.3)
-    
-    ax.axhline(y=0, color='red', linestyle='--', alpha=0.5, linewidth=1)
-    ax.set_ylim(-1e-3, 1e-3)
-    
-    plt.tight_layout()
-    experiment.log_figure(name, fig, step=epoch)
-    plt.close(fig)
-
-def log_gradient_histograms(name, gradients, experiment, epoch):
-    avg_gradients = torch.stack(gradients).mean(dim=0)
-    
-    fig, ax = plt.subplots(figsize=(6, 6))
-    
-    ax.hist(avg_gradients, bins=50, alpha=0.7, color='blue', edgecolor='black')
-    ax.set_xlabel('Gradient Value')
-    ax.set_ylabel('Frequency')
-    ax.grid(True, alpha=0.3)
-    
-    ax.set_xlim(-5e-4, 5e-4)
-    plt.tight_layout()
-    experiment.log_figure(name, fig, step=epoch)
-    plt.close(fig)
-
-def log_replaces(chosen_edges, experiment, ):
-    image_indices = chosen_edges[0].cpu().numpy()
-    pixel_indices = chosen_edges[1].cpu().numpy()
-    
-    class_masks = {}
-    for class_idx in range(10):
-        class_pixels = pixel_indices[image_indices == class_idx]
-        
-        mask = np.zeros(784)
-        for pixel in class_pixels:
-            mask[pixel] += 1
-        
-        mask = mask / mask.max()
-        class_masks[class_idx] = mask.reshape(28, 28)
-    
-    fig, axes = plt.subplots(2, 5, figsize=(15, 6))
-    axes = axes.flatten()
-    
-    for class_idx in range(10):
-        mask = class_masks.get(class_idx, np.zeros((28, 28)))
-        
-        im = axes[class_idx].imshow(mask, cmap='hot', interpolation='nearest')
-        axes[class_idx].set_title(f'Class {class_idx}\n({np.sum(mask > 0)} pixels)')
-        axes[class_idx].axis('off')
-        plt.colorbar(im, ax=axes[class_idx], shrink=0.8)
-    
-    plt.tight_layout()
-    experiment.log_figure("chosen_pixels_per_class", fig)
-    plt.close(fig)
-
-
-def train_sparse_recursive(
-    model,
-    train_loader,
-    val_loader,
-    test_loader,
-    criterion,
-    optimizer,
-    hyperparams,
-    device,
-    experiment=None,
-    use_log_tool=True
-):
-    """
-    Trains a model with sparse recursive edge replacement and deletion.
-
-        Args:
-            model: The neural network model to train.
-            train_loader: DataLoader for the training dataset.
-            val_loader: DataLoader for the validation dataset.
-            test_loader: DataLoader for the test dataset.
-            criterion: The loss function to use.
-            optimizer: The optimizer to use.
-            hyperparams: A dictionary containing hyperparameters for training and sparsity.
-            device: The device (CPU or GPU) to train on.
-            experiment: 
-            use_log_tool:
-        Returns:
-            None.  This method trains the model in-place and logs metrics using wandb.
-    """
-
-    model = model.to(device)
-
-    ef = EdgeFinder(
-        hyperparams["edge_importance_metric"],
-        val_loader,
-        device=device,
-        aggregation_mode=hyperparams["edge_score_aggregation"],
-        max_to_replace=hyperparams["max_new_edges_per_expansion"],
-    )
-
-    non_zero_masks = {}
-    replace_epoch = [0]
-    val_losses = []
-    train_losses = []
-    train_losses_expand = []
-    val_losses_expand = []
-    last_plateau = float('inf')
-    last_avg_expand_gradients = 0
-    last_avg_embed_gradients = 0
-    last_action = None
-    for epoch in range(hyperparams["num_epochs"]):
-        # print(list(model.named_parameters()))
-
-        train_loss, train_time, expanding_gradients, embed_gradients = train_one_epoch(
-            model, optimizer, criterion, train_loader, epoch, device, experiment
-        )
-        val_loss, val_accuracy = eval_one_epoch(
-            model, criterion, test_loader, hyperparams["task_type"], device
-        )
-
-        val_losses += [val_loss]
-        train_losses += [train_loss]
-
-        print(
-            f"Epoch {epoch + 1}/{hyperparams['num_epochs']}, Train Loss: {train_loss:.4f}, "
-            f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}"
-        )
-
-        recent_changes = None
-        if epoch - replace_epoch[-1] > max(
-            hyperparams["prune_after_epochs"],
-            hyperparams["min_epochs_between_expansions"],
-            hyperparams["plateau_window_size"],
-        ):
-            recent_changes = [
-                abs(train_losses[i] - train_losses[i - 1])
-                for i in range(-hyperparams["plateau_window_size"], 0)
-            ]
-            avg_change = sum(recent_changes) / hyperparams["plateau_window_size"]
-            print('avg_change:', avg_change)
-            
-            # val_losses_expand += [val_losses[-1]]
-            # if len(val_losses_expand) == 1 or val_losses_expand[-1] <= val_losses_expand[-2] - 0.01:
-            print(last_plateau - train_losses[-1])
-            if avg_change < hyperparams["plateau_threshold"]:
-                # abs is needed to reduce lr when curr plateau is higher
-                if (last_action is None) or (abs(last_plateau - train_losses[-1]) >= hyperparams["diff_threshold"]):
-                    last_action = 'lr'
-                    last_plateau = train_losses[-1]
-                    for g in optimizer.param_groups:
-                        g['lr'] /= 2
-                else:
-                    last_action = 'expand'
-                    train_losses_expand += [train_losses[-1]]
-                    # print('avg_change:', avg_change, val_losses[-1], val_losses_expand[-2] - val_losses_expand[-1])
-                    for g in optimizer.param_groups:
-                        g['lr'] = hyperparams['learning_rate']
-                    len_choose = 0
-                    for layer_name in hyperparams["expansion_thresholds"].keys():
-                        layer = model.__getattr__(layer_name)
-                        len_choose += edge_replacement_func_new_layer(
-                            model,
-                            layer,
-                            optimizer,
-                            hyperparams["expansion_thresholds"][layer_name],
-                            ef,
-                            experiment,
-                            hyperparams["start_fully_connected"],
-                        )
-                        # model.fc0.freeze_embeds(len_choose)
-                    non_zero_masks[layer_name] = layer.get_non_zero_params()
-                replace_epoch += [epoch]
-
-        # if (
-        #     epoch - replace_epoch[-1] == hyperparams["prune_after_epochs"]
-        #     and replace_epoch[-1] != 0
-        # ):
-        #     len_choose = 0
-        #     for layer_name in hyperparams["pruning_thresholds"].keys():
-        #         layer = model.__getattr__(layer_name)
-        #         len_choose += edge_deletion_func_new_layer(
-        #             model,
-        #             layer,
-        #             optimizer,
-        #             non_zero_masks[layer_name],
-        #             hyperparams["pruning_thresholds"][layer_name],
-        #             ef,
-        #         )
-            # print(list(model.named_parameters()))
-
-        params_amount = get_params_amount(model)
-        replace_params = 0
-        for layer_name in hyperparams["expansion_thresholds"].keys():
-            layer = model.__getattr__(layer_name)
-            replace_params += len(
-                ef.choose_edges_threshold(
-                    model, layer, hyperparams["expansion_thresholds"][layer_name]
-                )[0]
-            )
-
-        # avg_abs_expand_gradients = torch.stack(expanding_gradients).abs().mean()
-        # avg_signed_expand_gradients = torch.stack(expanding_gradients).mean()
-        # print(embed_gradients)
-        # if embed_gradients[0] != []:
-        #     avg_embed_gradients = torch.stack(embed_gradients).abs().mean()
-        logs = {
-            "val loss": val_loss,
-            "val accuracy": val_accuracy,
-            "train loss": train_loss,
-            "params amount": params_amount,
-            "params to replace amount": replace_params,
-            "train time": train_time,
-            "params ratio": (params_amount - replace_params) / params_amount,
-            "lr": optimizer.param_groups[0]["lr"],
-            "acc amount": val_accuracy / params_amount,
-            "n_params over train_time": params_amount / train_time,
-            "train_time over n_params": train_time / params_amount,
-            # "diff_mean_abs_expand_grads": avg_abs_expand_gradients - last_avg_abs_expand_gradients,
-            # "diff_mean_signed_expand_grads": avg_signed_expand_gradients - last_avg_signed_expand_gradients,
-            # "mean_abs_expand_grads": avg_abs_expand_gradients,
-            # "mean_signed_expand_grads": avg_signed_expand_gradients
-        }
-        # last_avg_abs_expand_gradients = avg_abs_expand_gradients
-        # last_avg_signed_expand_gradients = avg_signed_expand_gradients
-        # if embed_gradients[0] != []:
-        #     logs["diff_mean_embed_grads"] = avg_embed_gradients - last_avg_embed_gradients
-        #     last_avg_embed_gradients = avg_embed_gradients
-
-        #TODO add len choose
-        # if (epoch in replace_epoch) and epoch != 0:
-        #     logs["len_choose"] = len_choose
-        # else:
-        #     logs.pop("len_choose", None)
-
-        if (epoch + hyperparams["prune_after_epochs"] in replace_epoch) and epoch != 0:
-            logs["del_len_choose"] = len_choose
+    for layer_name, threshold in thresholds.items():
+        if hasattr(model, layer_name):
+            layer = getattr(model, layer_name)
         else:
-            logs.pop("del_len_choose", None)
+            continue
 
-        # wandb.log(logs)
-        if use_log_tool:
+        if isinstance(layer, ScaledNet):
+            # Identify high-importance edges to expand
+            # embed=False targets the main projection matrix
+            parents, children = edge_finder.choose_edges_threshold(
+                model, layer, threshold, embed=False
+            )
+            
+            if len(parents) > 0:
+                print(f"[Expansion] Layer '{layer_name}': Adding sub-layer for {len(parents)} edges.")
+                # Apply structural expansion
+                layer.put_sub_linear(parents, children)
+                expansion_happened = True
+                total_new_edges += len(parents)
+    
+    return expansion_happened, total_new_edges
+
+def prune_model(
+    model: nn.Module, 
+    optimizer: optim.Optimizer,
+    edge_finder: EdgeFinder, 
+    thresholds: Dict[str, float]
+) -> int:
+    """
+    Zeros out weights AND clears optimizer state to prevent resurrection.
+    """
+    pruned_count = 0
+    
+    for layer_name, threshold in thresholds.items():
+        if hasattr(model, layer_name):
+            layer = getattr(model, layer_name)
+        else:
+            continue
+
+        if isinstance(layer, ScaledNet):
+            # 1. Compute metrics (ScaledNet)
+            metric_exp = edge_finder.calculate_edge_metric_for_dataloader(
+                model=model, layer=layer, to_normalise=False, embed=False
+            )
+            
+            # 2. Compute metrics (SubLinear), if exists 
+            has_sub_layers = len(layer.sub_linears) > 0
+            if has_sub_layers:
+                metric_emb = edge_finder.calculate_edge_metric_for_dataloader(
+                    model=model, layer=layer, to_normalise=False, embed=True
+                )
+                
+                flat_exp = metric_exp.flatten()
+                flat_emb = metric_emb.flatten()
+                combined = torch.cat([flat_emb, flat_exp])
+                min_v, max_v = combined.min(), combined.max()
+                norm = (combined - min_v) / (max_v - min_v + 1e-8)
+                
+                global_mask = norm < threshold
+                
+                num_emb = flat_emb.numel()
+                mask_emb = global_mask[:num_emb].view_as(metric_emb)
+                mask_exp = global_mask[num_emb:].view_as(metric_exp)
+                
+                target_sub = layer.sub_linears[-1]
+                # Only non-zero params
+                nonzero_emb = target_sub.weight.data.abs() > 1e-9
+                final_mask_emb = mask_emb & nonzero_emb
+                
+                if final_mask_emb.sum() > 0:
+                    with torch.no_grad():
+                        target_sub.weight.data[final_mask_emb] = 0.0
+                        # !!! IMPORTANT !!!
+                        if target_sub.weight in optimizer.state:
+                            state = optimizer.state[target_sub.weight]
+                            if 'exp_avg' in state:
+                                state['exp_avg'][final_mask_emb] = 0.0
+                            if 'exp_avg_sq' in state:
+                                state['exp_avg_sq'][final_mask_emb] = 0.0
+                    pruned_count += final_mask_emb.sum().item()
+
+            else:
+                min_v, max_v = metric_exp.min(), metric_exp.max()
+                norm = (metric_exp - min_v) / (max_v - min_v + 1e-8)
+                mask_exp = norm < threshold
+
+            nonzero_exp = layer.weight.data.abs() > 1e-9
+            final_mask_exp = mask_exp & nonzero_exp
+            
+            if final_mask_exp.sum() > 0:
+                with torch.no_grad():
+                    layer.weight.data[final_mask_exp] = 0.0
+                    # !!! IMPORTANT !!!
+                    if layer.weight in optimizer.state:
+                        state = optimizer.state[layer.weight]
+                        if 'exp_avg' in state:
+                            state['exp_avg'][final_mask_exp] = 0.0
+                        if 'exp_avg_sq' in state:
+                            state['exp_avg_sq'][final_mask_exp] = 0.0
+                            
+                pruned_count += final_mask_exp.sum().item()
+
+    if pruned_count > 0:
+        print(f"[Pruning] Total weights zeroed out: {pruned_count}")
+
+    return pruned_count
+
+
+def train_ssonn(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    optimizer_factory: Callable[[nn.Module], optim.Optimizer],
+    hyperparams: Dict[str, Any],
+    device: str,
+    experiment: Any = None,   # Added experiment
+    use_log_tool: bool = True # Added flag
+) -> nn.Module:
+    """
+    Manupulate the SSONN training lifecycle with dynamic expansion and pruning.
+
+    This function handles:
+    1. Standard training/evaluation loops.
+    2. Plateau detection to trigger model expansion.
+    3. Structural updates (Expansion/Pruning).
+    4. Optimizer re-initialization (required when model parameters change).
+
+    Args:
+        model: The initial neural network.
+        optimizer_factory: A function that returns a new optimizer instance for a given model.
+                           This is crucial because `ScaledNet` creates new parameter tensors 
+                           during expansion, invalidating the old optimizer state.
+        hyperparams: Configuration dictionary.
+    """
+    model = model.to(device)
+    # Initialize optimizer using the factory
+    optimizer = optimizer_factory(model)
+    
+    # Register hooks to keep zeroed weights at zero
+    apply_sparsity_mask(model)
+
+    # Initialize EdgeFinder for importance scoring
+    # TODO: add train_weight, train_architecture datasets splitting @shivan
+    # TODO: move EdgeFinder init from train_ssonn to experiments
+    ef = EdgeFinder(
+        metric=hyperparams["edge_importance_metric"],
+        dataloader=val_loader,
+        device=device,
+        aggregation_mode=hyperparams.get("edge_score_aggregation", "mean"),
+        max_to_replace=hyperparams.get("max_new_edges_per_expansion", None),
+    )
+    scheduler = SSONNPlateauScheduler(hyperparams)
+
+    train_losses = []
+    val_losses = []
+    last_expansion_epoch = 0
+
+    print("--- Starting SSONN Training ---")
+    
+    for epoch in range(hyperparams["num_epochs"]):
+        # 1. Train Step
+        t_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        scheduler.update_metrics(t_loss)
+        
+        # 2. Eval Step
+        v_loss, v_metric = eval_one_epoch(model, criterion, val_loader, hyperparams["task_type"], device)
+        
+        train_losses.append(t_loss)
+        val_losses.append(v_loss)
+
+        # 3. Scheduler Logic (LR / Expand)
+        action = scheduler.check_for_action(epoch)
+
+        if action == 'lr':
+            print(f"   -> Action: Decreasing Learning Rate.")
+            for g in optimizer.param_groups:
+                g['lr'] /= 2
+        
+        elif action == 'expand':
+            print(f"   -> Action: Expanding Model.")
+            expanded, num_new = expand_model(model, ef, hyperparams["expansion_thresholds"])
+            
+            if expanded:
+                print(f"   -> Re-initializing optimizer and resetting LR.")
+                # Re-create optimizer (this resets LR to initial value defined in factory)
+                optimizer = optimizer_factory(model)
+                apply_sparsity_mask(model) # Re-apply hooks to new parameters
+                if use_log_tool and experiment:
+                    experiment.log_metric("expansion event", num_new, epoch=epoch)
+            else:
+                print(f"   -> Expansion attempted but no edges selected.")
+        
+        # 4. Pruning Logic
+            # if epoch > hyperparams.get("prune_after_epochs", 999999):
+            #     prune_model(model, optimizer, ef, hyperparams.get("pruning_thresholds", {}))
+                # if pruned > 0 and use_log_tool and experiment:
+                #      experiment.log_metric("pruned weights", pruned, epoch=epoch)
+
+        # 5. Calculate Params stats, Logging (Comet ML)
+        total_params, non_zero_params = get_param_counts(model)
+        print(f"Epoch {epoch+1}/{hyperparams['num_epochs']} | "
+              f"T-Loss: {t_loss:.4f} | V-Loss: {v_loss:.4f} | Met: {v_metric:.4f} | "
+              f"Params: {non_zero_params}/{total_params}")
+
+        if use_log_tool and experiment is not None:
+            # Metrics
+            logs = {
+                "train loss": t_loss,
+                "val loss": v_loss,
+                "val accuracy": v_metric,
+                "lr": optimizer.param_groups[0]["lr"],
+                "total_params": total_params,
+                "params amount": non_zero_params,
+                "sparsity": 1.0 - (non_zero_params / total_params),
+            }
             experiment.log_metrics(logs, epoch=epoch)
+            
+            # Gradient Visualization (Snapshot of last batch gradients)
+            # Find the first ScaledNet to log (e.g. fc0)
+            target_layer = None
+            for name, mod in model.named_modules():
+                if isinstance(mod, ScaledNet):
+                    target_layer = mod
+                    break
+            
+            if target_layer and target_layer.weight.grad is not None:
+                log_gradient_values("main_layer_grads", target_layer.weight.grad, experiment, epoch)
+                log_gradient_histograms("main_layer_grads_hist", target_layer.weight.grad, experiment, epoch)
+                # log_gradient_image(target_layer, experiment, epoch)
+
+
+
+    print("--- Training Finished ---")
+    return model
+
+
+def convert_to_scaled_net(
+    model: nn.Module, 
+    layers_to_convert: List[ScaledNet], 
+    device: str
+) -> nn.Module:
+    """
+    Replaces specified standard linear layers with SSONN `ScaledNet` layers.
+    
+    Useful for starting SSONN training from a pre-trained standard model.
+    """
+    new_model = copy.deepcopy(model)
+    
+    # Create a mapping from layer object to its name in the module
+    layer_map = {}
+    for name, module in model.named_children():
+        layer_map[module] = name
+        
+    for layer in layers_to_convert:
+        if layer in layer_map:
+            name = layer_map[layer]
+            print(f"Converting layer '{name}' to ScaledNet...")
+            
+            # Initialize ScaledNet with the weights of the original layer
+            scaled_layer = ScaledNet(
+                layer.weight.data, 
+                layer.bias.data if layer.bias is not None else torch.zeros(layer.out_features),
+                device=device
+            )
+            setattr(new_model, name, scaled_layer)
+        else:
+            print(f"Warning: Layer {layer} not found in model children.")
+            
+    return new_model.to(device)
