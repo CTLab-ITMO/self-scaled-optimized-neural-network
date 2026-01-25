@@ -10,6 +10,7 @@ from sklearn.metrics import accuracy_score, mean_squared_error
 
 from ssonn.model.model import ScaledNet, SubLinear
 from ssonn.metrics.edge_finder import EdgeFinder
+from .scheduler import SSONNPlateauScheduler
 
 
 def apply_sparsity_mask(model: nn.Module) -> None:
@@ -275,6 +276,7 @@ def train_ssonn(
         aggregation_mode=hyperparams.get("edge_score_aggregation", "mean"),
         max_to_replace=hyperparams.get("max_new_edges_per_expansion", None),
     )
+    scheduler = SSONNPlateauScheduler(hyperparams)
 
     train_losses = []
     val_losses = []
@@ -285,6 +287,7 @@ def train_ssonn(
     for epoch in range(hyperparams["num_epochs"]):
         # 1. Train Step
         t_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        scheduler.update_metrics(t_loss)
         
         # 2. Eval Step
         v_loss, v_metric = eval_one_epoch(model, criterion, val_loader, hyperparams["task_type"], device)
@@ -296,38 +299,29 @@ def train_ssonn(
               f"Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f} | "
               f"Metric: {v_metric:.4f}")
 
-        # 3. Expansion Logic: Check for loss plateau
-        # TODO: replace this algorithm to lr/expand
-        if epoch - last_expansion_epoch > hyperparams.get("min_epochs_between_expansions", 5):
-            window = hyperparams.get("plateau_window_size", 5)
+        # 3. Scheduler Logic (LR / Expand)
+        action = scheduler.check_for_action(epoch)
+
+        if action == 'lr':
+            print(f"   -> Action: Decreasing Learning Rate.")
+            for g in optimizer.param_groups:
+                g['lr'] /= 2
+        
+        elif action == 'expand':
+            print(f"   -> Action: Expanding Model.")
+            expanded, num_new = expand_model(model, ef, hyperparams["expansion_thresholds"])
             
-            if len(train_losses) >= window:
-                # Calculate average absolute change in loss over the window
-                recent = train_losses[-window:]
-                avg_change = sum(abs(recent[i] - recent[i-1]) for i in range(1, len(recent))) / (window - 1)
-                
-                # If loss has stabilized (plateau), attempt to expand capacity
-                if avg_change < hyperparams.get("plateau_threshold", 0.01):
-                    print(f"   -> Plateau detected (change {avg_change:.5f}). Checking expansion...")
-                    
-                    expanded, num_new = expand_model(
-                        model, ef, hyperparams["expansion_thresholds"]
-                    )
-                    
-                    if expanded:
-                        print(f"   -> Model expanded. Re-initializing optimizer.")
-                        # Architecture changed: Old optimizer references dead parameters.
-                        # We must create a new optimizer for the updated model.
-                        optimizer = optimizer_factory(model)
-                        
-                        # Re-apply hooks to the new parameter tensors
-                        apply_sparsity_mask(model)
-                        
-                        last_expansion_epoch = epoch
+            if expanded:
+                print(f"   -> Re-initializing optimizer and resetting LR.")
+                # Re-create optimizer (this resets LR to initial value defined in factory)
+                optimizer = optimizer_factory(model)
+                apply_sparsity_mask(model) # Re-apply hooks to new parameters
+            else:
+                print(f"   -> Expansion attempted but no edges selected.")
         
         # 4. Pruning Logic
-        if epoch > hyperparams.get("prune_after_epochs", 10):
-            prune_model(model, optimizer, ef, hyperparams.get("pruning_thresholds", {}))
+            # if epoch > hyperparams.get("prune_after_epochs", 999999):
+            #     prune_model(model, optimizer, ef, hyperparams.get("pruning_thresholds", {}))
 
     print("--- Training Finished ---")
     return model
