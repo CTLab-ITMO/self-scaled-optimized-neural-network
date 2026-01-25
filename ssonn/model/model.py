@@ -516,9 +516,15 @@ class ExpandingLinear(SparseModule):
 
 class ScaledNet(nn.Module):
     """
-    stores transposed weight
+    Implements the Self-Scaled Optimized Neural Network core module.
     """
     def __init__(self, weight: torch.Tensor, bias: torch.Tensor, device: str):
+        """
+        Args:
+            weight (Tensor): Initial weight matrix of shape (out_features, in_features).
+            bias (Tensor): Initial bias vector of shape (out_features).
+            device (str): Computation device ('cpu' or 'cuda').
+        """
         super(ScaledNet, self).__init__()
         self.device = device
 
@@ -530,6 +536,18 @@ class ScaledNet(nn.Module):
         self.sub_linears = nn.ModuleList()
 
     def put_sub_linear(self, parents: torch.Tensor, children: torch.Tensor):
+        """
+        Performs network expansion by inserting a new sub-layer and restructuring weights.
+
+        1. Adds a new SubLinear layer to generate intermediate features.
+        2. Expands the main weight matrix to accommodate these new features.
+        3. Transfers weights from the old direct connections to the new paths.
+        4. Prunes (zeros out) the original direct connections.
+
+        Args:
+            parents (Tensor): Indices of input neurons triggering expansion.
+            children (Tensor): Indices of output neurons affected by expansion.
+        """
         parents = parents.to(self.device).long()
         children = children.to(self.device).long()
         chosen_dim = parents.shape[0]
@@ -547,6 +565,9 @@ class ScaledNet(nn.Module):
         self.in_features += chosen_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Input 'x' grows in size as it passes through each SubLinear layer.
+        """
         for sub_linear in self.sub_linears:
             x = sub_linear(x)
 
@@ -555,9 +576,14 @@ class ScaledNet(nn.Module):
 
 class SubLinear(nn.Module):
     """
-    stores transposed weight
+    Represents an intermediate expansion layer.
     """
     def __init__(self, parents: torch.Tensor, input_dim: int, device: str):
+        """
+        Args:
+            parents (Tensor): Indices of parent neurons to connect to.
+            input_dim (int): Current size of the input feature vector.
+        """
         super(SubLinear, self).__init__()
         self.device = device
         output_dim = parents.shape[0]
