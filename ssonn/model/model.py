@@ -520,37 +520,37 @@ class ScaledNet(nn.Module):
     """
     def __init__(self, weight: torch.Tensor, bias: torch.Tensor, device: str):
         super(ScaledNet, self).__init__()
-
-        weight = nn.Parameter(weight)
-        bias = nn.Parameter(bias)
-        self.linear = nn.Linear(in_features=weight.shape[1], out_features=weight.shape[0], bias=True)
-        self.linear.weight = weight
-        self.linear.bias = bias
-
         self.device = device
+
+        self.weight = nn.Parameter(weight.to(device))
+        self.bias = nn.Parameter(bias.to(device))
+
+        self.out_features, self.in_features = weight.shape
 
         self.sub_linears = nn.ModuleList()
 
     def put_sub_linear(self, parents: torch.Tensor, children: torch.Tensor):
+        parents = parents.to(self.device).long()
+        children = children.to(self.device).long()
         chosen_dim = parents.shape[0]
 
-        self.sub_linears.append(SubLinear(parents, self.linear.in_features, self.device))
+        self.sub_linears.append(SubLinear(parents, self.in_features, self.device))
 
-        weight = self.linear.weight
-        weight_cat = torch.zeros((self.linear.out_features, chosen_dim))
-        weight_cat[children, torch.arange(0, chosen_dim)] = weight.data[children, parents]
-        weight.data[children, parents] = 0.
+        old_weight_data = self.weight.data
+        weight_cat = torch.zeros((self.out_features, chosen_dim), device=self.device)
+        weight_cat[children, torch.arange(0, chosen_dim)] = old_weight_data[children, parents]
+        old_weight_data[children, parents] = 0.
+        new_weight_data = torch.cat([old_weight_data, weight_cat], dim=1)
 
-        weight.data = torch.cat([weight.data, weight_cat], dim=1)
-        self.linear.in_features += chosen_dim
+        self.weight = nn.Parameter(new_weight_data)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        print(input.shape, self.linear.weight.shape, self.linear.in_features, self.linear.out_features)
+        self.in_features += chosen_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for sub_linear in self.sub_linears:
-            print(input.shape, self.linear.weight.shape)
-            input = sub_linear(input)
-            print(input.shape)
-        return self.linear(input)
+            x = sub_linear(x)
+
+        return F.linear(x, self.weight, self.bias)
 
 
 class SubLinear(nn.Module):
