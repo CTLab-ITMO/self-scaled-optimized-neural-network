@@ -239,6 +239,7 @@ def train_ssonn(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
+    finder_loader: DataLoader,
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     optimizer_factory: Callable[[nn.Module], optim.Optimizer],
     hyperparams: Dict[str, Any],
@@ -274,7 +275,7 @@ def train_ssonn(
     # TODO: move EdgeFinder init from train_ssonn to experiments
     ef = EdgeFinder(
         metric=hyperparams["edge_importance_metric"],
-        dataloader=val_loader,
+        dataloader=finder_loader,
         device=device,
         aggregation_mode=hyperparams.get("edge_score_aggregation", "mean"),
         max_to_replace=hyperparams.get("max_new_edges_per_expansion", None),
