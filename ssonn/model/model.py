@@ -44,7 +44,7 @@ class ScaledNet(nn.Module):
         self.sub_linears.append(SubLinear(parents, self.in_features, self.device))
 
         old_weight_data = self.weight.data
-        weight_cat = torch.zeros((self.out_features, chosen_dim), device=self.device)
+        weight_cat = torch.rand((self.out_features, chosen_dim), device=self.device) * 1e-6
         weight_cat[children, torch.arange(0, chosen_dim)] = old_weight_data[children, parents]
         old_weight_data[children, parents] = 0.
         new_weight_data = torch.cat([old_weight_data, weight_cat], dim=1)
