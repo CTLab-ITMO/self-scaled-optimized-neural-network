@@ -38,7 +38,7 @@ def train_one_epoch(
     optimizer: optim.Optimizer, 
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor], 
     device: str
-) -> float:
+) -> Tuple[float, float]:
     """
     Performs one epoch of training.
 
@@ -47,7 +47,10 @@ def train_one_epoch(
     """
     model.train()
     train_loss = 0.0
-    
+    all_targets = []
+    all_preds = []
+
+   
     pbar = tqdm(train_loader, desc="Train", leave=False)
     
     for inputs, targets in pbar:
@@ -57,14 +60,21 @@ def train_one_epoch(
         outputs = model(inputs)
         loss = criterion(outputs, targets)
         loss.backward()
-        
         optimizer.step()
         
         train_loss += loss.item()
+
+        preds = torch.argmax(outputs, dim=1)
+        all_targets.extend(targets.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
+
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     train_loss /= len(train_loader)
-    return train_loss
+
+    metric = accuracy_score(all_targets, all_preds)
+
+    return train_loss, metric
 
 
 def eval_one_epoch(
