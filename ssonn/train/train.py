@@ -300,7 +300,7 @@ def train_ssonn(
     
     for epoch in range(hyperparams["num_epochs"]):
         # 1. Train Step
-        t_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        t_loss, t_metric = train_one_epoch(model, train_loader, optimizer, criterion, device)
         scheduler.update_metrics(t_loss)
         
         # 2. Eval Step
@@ -349,6 +349,7 @@ def train_ssonn(
                 "train loss": t_loss,
                 "val loss": v_loss,
                 "val accuracy": v_metric,
+                "train accuracy": t_metric,
                 "lr": optimizer.param_groups[0]["lr"],
                 "total_params": total_params,
                 "params amount": non_zero_params,
