@@ -292,6 +292,14 @@ def train_ssonn(
     )
     scheduler = SSONNPlateauScheduler(hyperparams)
 
+    target_layer = None
+    target_layer_name = "unknown"
+    for name, mod in model.named_modules():
+        if isinstance(mod, ScaledNet):
+            target_layer = mod
+            target_layer_name = name
+            break
+
     train_losses = []
     val_losses = []
     last_expansion_epoch = 0
@@ -344,7 +352,6 @@ def train_ssonn(
               f"Params: {non_zero_params}/{total_params}")
 
         if use_log_tool and experiment is not None:
-            # Metrics
             logs = {
                 "train loss": t_loss,
                 "val loss": v_loss,
@@ -355,20 +362,22 @@ def train_ssonn(
                 "params amount": non_zero_params,
                 "sparsity": 1.0 - (non_zero_params / total_params),
             }
-            experiment.log_metrics(logs, epoch=epoch)
+
+            if target_layer:
+                metric_main = ef.calculate_edge_metric_for_dataloader(
+                        model, target_layer, to_normalise=False, embed=False)
+                logs[f"{target_layer_name}_main_mean"] = float(metric_main.mean().item())
+                if len(target_layer.sub_linears) > 0:
+                    metric_sub = ef.calculate_edge_metric_for_dataloader(
+                        model, target_layer, to_normalise=False, embed=True)
+                    logs[f"{target_layer_name}_sub_mean"] = metric_sub.mean().item()
+
+            experiment.log_metrics(logs, step=epoch)
             
-            # Gradient Visualization (Snapshot of last batch gradients)
-            # Find the first ScaledNet to log (e.g. fc0)
-            target_layer = None
-            for name, mod in model.named_modules():
-                if isinstance(mod, ScaledNet):
-                    target_layer = mod
-                    break
-            
-            if target_layer and target_layer.weight.grad is not None:
-                log_gradient_values("main_layer_grads", target_layer.weight.grad, experiment, epoch)
-                log_gradient_histograms("main_layer_grads_hist", target_layer.weight.grad, experiment, epoch)
-                # log_gradient_image(target_layer, experiment, epoch)
+            # if target_layer and target_layer.weight.grad is not None:
+            #     log_gradient_values("main_layer_grads", target_layer.weight.grad, experiment, epoch)
+            #     log_gradient_histograms("main_layer_grads_hist", target_layer.weight.grad, experiment, epoch)
+            #     # log_gradient_image(target_layer, experiment, epoch)
 
 
 
