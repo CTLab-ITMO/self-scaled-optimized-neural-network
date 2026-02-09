@@ -348,7 +348,7 @@ def train_ssonn(
         # 5. Calculate Params stats, Logging (Comet ML)
         total_params, non_zero_params = get_param_counts(model)
         print(f"Epoch {epoch+1}/{hyperparams['num_epochs']} | "
-              f"T-Loss: {t_loss:.4f} | V-Loss: {v_loss:.4f} | Met: {v_metric:.4f} | "
+              f"T-Loss: {t_loss:.4f} | V-Loss: {v_loss:.4f} | Acc: {v_metric:.4f} | "
               f"Params: {non_zero_params}/{total_params}")
 
         if use_log_tool and experiment is not None:
