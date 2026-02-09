@@ -38,7 +38,7 @@ def train_one_epoch(
     optimizer: optim.Optimizer, 
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor], 
     device: str
-) -> float:
+) -> Tuple[float, float]:
     """
     Performs one epoch of training.
 
@@ -47,7 +47,10 @@ def train_one_epoch(
     """
     model.train()
     train_loss = 0.0
-    
+    all_targets = []
+    all_preds = []
+
+   
     pbar = tqdm(train_loader, desc="Train", leave=False)
     
     for inputs, targets in pbar:
@@ -57,14 +60,21 @@ def train_one_epoch(
         outputs = model(inputs)
         loss = criterion(outputs, targets)
         loss.backward()
-        
         optimizer.step()
         
         train_loss += loss.item()
+
+        preds = torch.argmax(outputs, dim=1)
+        all_targets.extend(targets.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
+
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     train_loss /= len(train_loader)
-    return train_loss
+
+    metric = accuracy_score(all_targets, all_preds)
+
+    return train_loss, metric
 
 
 def eval_one_epoch(
@@ -282,6 +292,14 @@ def train_ssonn(
     )
     scheduler = SSONNPlateauScheduler(hyperparams)
 
+    target_layer = None
+    target_layer_name = "unknown"
+    for name, mod in model.named_modules():
+        if isinstance(mod, ScaledNet):
+            target_layer = mod
+            target_layer_name = name
+            break
+
     train_losses = []
     val_losses = []
     last_expansion_epoch = 0
@@ -290,7 +308,7 @@ def train_ssonn(
     
     for epoch in range(hyperparams["num_epochs"]):
         # 1. Train Step
-        t_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        t_loss, t_metric = train_one_epoch(model, train_loader, optimizer, criterion, device)
         scheduler.update_metrics(t_loss)
         
         # 2. Eval Step
@@ -330,34 +348,36 @@ def train_ssonn(
         # 5. Calculate Params stats, Logging (Comet ML)
         total_params, non_zero_params = get_param_counts(model)
         print(f"Epoch {epoch+1}/{hyperparams['num_epochs']} | "
-              f"T-Loss: {t_loss:.4f} | V-Loss: {v_loss:.4f} | Met: {v_metric:.4f} | "
+              f"T-Loss: {t_loss:.4f} | V-Loss: {v_loss:.4f} | Acc: {v_metric:.4f} | "
               f"Params: {non_zero_params}/{total_params}")
 
         if use_log_tool and experiment is not None:
-            # Metrics
             logs = {
                 "train loss": t_loss,
                 "val loss": v_loss,
                 "val accuracy": v_metric,
+                "train accuracy": t_metric,
                 "lr": optimizer.param_groups[0]["lr"],
-                "total_params": total_params,
+                "total params": total_params,
                 "params amount": non_zero_params,
                 "sparsity": 1.0 - (non_zero_params / total_params),
             }
-            experiment.log_metrics(logs, epoch=epoch)
+
+            if target_layer:
+                metric_main = ef.calculate_edge_metric_for_dataloader(
+                        model, target_layer, to_normalise=False, embed=False)
+                logs[f"choose_metric/{target_layer_name}_main"] = float(metric_main.mean().item())
+                if len(target_layer.sub_linears) > 0:
+                    metric_sub = ef.calculate_edge_metric_for_dataloader(
+                        model, target_layer, to_normalise=False, embed=True)
+                    logs[f"choose_metric/{target_layer_name}_sub"] = metric_sub.mean().item()
+
+            experiment.log_metrics(logs, step=epoch)
             
-            # Gradient Visualization (Snapshot of last batch gradients)
-            # Find the first ScaledNet to log (e.g. fc0)
-            target_layer = None
-            for name, mod in model.named_modules():
-                if isinstance(mod, ScaledNet):
-                    target_layer = mod
-                    break
-            
-            if target_layer and target_layer.weight.grad is not None:
-                log_gradient_values("main_layer_grads", target_layer.weight.grad, experiment, epoch)
-                log_gradient_histograms("main_layer_grads_hist", target_layer.weight.grad, experiment, epoch)
-                # log_gradient_image(target_layer, experiment, epoch)
+            # if target_layer and target_layer.weight.grad is not None:
+            #     log_gradient_values("main_layer_grads", target_layer.weight.grad, experiment, epoch)
+            #     log_gradient_histograms("main_layer_grads_hist", target_layer.weight.grad, experiment, epoch)
+            #     # log_gradient_image(target_layer, experiment, epoch)
 
 
 
