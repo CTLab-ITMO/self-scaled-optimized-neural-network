@@ -358,7 +358,7 @@ def train_ssonn(
                 "val accuracy": v_metric,
                 "train accuracy": t_metric,
                 "lr": optimizer.param_groups[0]["lr"],
-                "total_params": total_params,
+                "total params": total_params,
                 "params amount": non_zero_params,
                 "sparsity": 1.0 - (non_zero_params / total_params),
             }
@@ -366,11 +366,11 @@ def train_ssonn(
             if target_layer:
                 metric_main = ef.calculate_edge_metric_for_dataloader(
                         model, target_layer, to_normalise=False, embed=False)
-                logs[f"{target_layer_name}_main_mean"] = float(metric_main.mean().item())
+                logs[f"choose_metric/{target_layer_name}_main"] = float(metric_main.mean().item())
                 if len(target_layer.sub_linears) > 0:
                     metric_sub = ef.calculate_edge_metric_for_dataloader(
                         model, target_layer, to_normalise=False, embed=True)
-                    logs[f"{target_layer_name}_sub_mean"] = metric_sub.mean().item()
+                    logs[f"choose_metric/{target_layer_name}_sub"] = metric_sub.mean().item()
 
             experiment.log_metrics(logs, step=epoch)
             
