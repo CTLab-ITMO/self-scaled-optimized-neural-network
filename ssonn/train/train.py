@@ -332,7 +332,8 @@ def train_ssonn(
             if expanded:
                 print(f"   -> Re-initializing optimizer and resetting LR.")
                 # Re-create optimizer (this resets LR to initial value defined in factory)
-                optimizer = optimizer_factory(model)
+                current_lr = optimizer.param_groups[0]['lr']
+                optimizer = optimizer_factory(model, current_backbone_lr=current_lr)
                 apply_sparsity_mask(model) # Re-apply hooks to new parameters
                 if use_log_tool and experiment:
                     experiment.log_metric("expansion event", num_new, epoch=epoch)
