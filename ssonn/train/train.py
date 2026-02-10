@@ -363,14 +363,14 @@ def train_ssonn(
                 "sparsity": 1.0 - (non_zero_params / total_params),
             }
 
-            if target_layer:
-                metric_main = ef.calculate_edge_metric_for_dataloader(
-                        model, target_layer, to_normalise=False, embed=False)
-                logs[f"choose_metric/{target_layer_name}_main"] = float(metric_main.mean().item())
-                if len(target_layer.sub_linears) > 0:
-                    metric_sub = ef.calculate_edge_metric_for_dataloader(
-                        model, target_layer, to_normalise=False, embed=True)
-                    logs[f"choose_metric/{target_layer_name}_sub"] = metric_sub.mean().item()
+            # if target_layer:
+            #     metric_main = ef.calculate_edge_metric_for_dataloader(
+            #             model, target_layer, to_normalise=False, embed=False)
+            #     logs[f"choose_metric/{target_layer_name}_main"] = float(metric_main.mean().item())
+            #     if len(target_layer.sub_linears) > 0:
+            #         metric_sub = ef.calculate_edge_metric_for_dataloader(
+            #             model, target_layer, to_normalise=False, embed=True)
+            #         logs[f"choose_metric/{target_layer_name}_sub"] = metric_sub.mean().item()
 
             experiment.log_metrics(logs, step=epoch)
             
