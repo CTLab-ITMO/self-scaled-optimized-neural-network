@@ -359,7 +359,7 @@ def train_ssonn(
                 "train accuracy": t_metric,
                 "lr": optimizer.param_groups[0]["lr"],
                 "total params": total_params,
-                "params amount": non_zero_params,
+                "zero params": total_params - non_zero_params,
                 "sparsity": 1.0 - (non_zero_params / total_params),
             }
 
