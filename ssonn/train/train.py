@@ -10,7 +10,7 @@ from sklearn.metrics import accuracy_score, mean_squared_error
 
 from ssonn.model.model import ScaledNet, SubLinear
 from ssonn.metrics.edge_finder import EdgeFinder
-from .scheduler import SSONNPlateauScheduler
+from .scheduler import SSONNPlateauScheduler, SSONNWarmupScheduler
 from .logging import *
 
 
@@ -244,6 +244,28 @@ def prune_model(
 
     return pruned_count
 
+def split_params_old_new(model: nn.Module) -> Tuple[List[nn.Parameter], List[nn.Parameter]]:
+    """
+    Separates parameters into 'old' and 'new'(last added layer).
+    """
+    new_params_ids = set()
+    new_params = []
+
+    # Ищем последний добавленный SubLinear слой
+    for module in model.modules():
+        if isinstance(module, ScaledNet) and len(module.sub_linears) > 0:
+            last_sub = module.sub_linears[-1]
+            for p in last_sub.parameters():
+                new_params.append(p)
+                new_params_ids.add(id(p))
+
+    # Все остальные параметры считаем старыми
+    old_params = []
+    for p in model.parameters():
+        if id(p) not in new_params_ids:
+            old_params.append(p)
+
+    return old_params, new_params
 
 def train_ssonn(
     model: nn.Module,
@@ -291,6 +313,7 @@ def train_ssonn(
         max_to_replace=hyperparams.get("max_new_edges_per_expansion", None),
     )
     scheduler = SSONNPlateauScheduler(hyperparams)
+    warmup_scheduler = None
 
     target_layer = None
     target_layer_name = "unknown"
@@ -310,7 +333,12 @@ def train_ssonn(
         # 1. Train Step
         t_loss, t_metric = train_one_epoch(model, train_loader, optimizer, criterion, device)
         scheduler.update_metrics(t_loss)
-        
+
+        if warmup_scheduler is not None:
+            warmup_scheduler.step()
+            if warmup_scheduler.current_epoch >= warmup_scheduler.warmup_epochs:
+                warmup_scheduler = None
+
         # 2. Eval Step
         v_loss, v_metric = eval_one_epoch(model, criterion, val_loader, hyperparams["task_type"], device)
         
@@ -321,19 +349,44 @@ def train_ssonn(
         action = scheduler.check_for_action(epoch)
 
         if action == 'lr':
-            print(f"   -> Action: Decreasing Learning Rate.")
-            for g in optimizer.param_groups:
-                g['lr'] /= 2
+            # print(f"   -> Action: Decreasing Learning Rate.")
+            # for g in optimizer.param_groups:
+            #     g['lr'] /= 2
+            # меняем только у самого последнего слоя, потому что иначе другие веса будут мега маленькие
+            target_group_idx = -1
+            optimizer.param_groups[target_group_idx]['lr'] /= 2
         
         elif action == 'expand':
+            # надо красиво научиться запоминать lr для каждого слоя
+            current_old_lr = optimizer.param_groups[0]['lr']
+
             print(f"   -> Action: Expanding Model.")
             expanded, num_new = expand_model(model, ef, hyperparams["expansion_thresholds"])
+
             
             if expanded:
                 print(f"   -> Re-initializing optimizer and resetting LR.")
                 # Re-create optimizer (this resets LR to initial value defined in factory)
+
+                old_params, new_params = split_params_old_new(model)
+                param_groups = [
+                    {'params': old_params, 'lr': current_old_lr}, # Старые хранят свой LR
+                    {'params': new_params, 'lr': 0.0} # Новые начинают с 0
+                ]
+
                 optimizer = optimizer_factory(model)
                 apply_sparsity_mask(model) # Re-apply hooks to new parameters
+
+                warmup_epochs = hyperparams.get("warmup_epochs", 5)
+                target_lr = hyperparams["learning_rate"]
+
+                warmup_scheduler = SSONNWarmupScheduler(
+                    optimizer,
+                    target_lr=target_lr,
+                    warmup_epochs=warmup_epochs,
+                    param_group_idx=-1
+                )
+
                 if use_log_tool and experiment:
                     experiment.log_metric("expansion event", num_new, epoch=epoch)
             else:
