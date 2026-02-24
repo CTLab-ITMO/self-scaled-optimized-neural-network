@@ -8,8 +8,12 @@ class SSONNWarmupScheduler:
         self.optimizer = optimizer
         self.target_lr = target_lr
         self.warmup_epochs = warmup_epochs
-        self.group_idx = param_group_idx
         self.current_epoch = 0
+
+        if param_group_idx < 0:
+            self.group_idx = len(optimizer.param_groups) + param_group_idx
+        else:
+            self.group_idx = param_group_idx
 
         # Сразу зануляем LR для новой группы
         if 0 <= self.group_idx < len(self.optimizer.param_groups):
