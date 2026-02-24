@@ -244,14 +244,18 @@ def prune_model(
 
     return pruned_count
 
-def split_params_old_new(model: nn.Module) -> Tuple[List[nn.Parameter], List[nn.Parameter]]:
+def build_preserved_param_groups(model: nn.Module, old_optimizer: optim.Optimizer) -> List[Dict[str, Any]]:
     """
-    Separates parameters into 'old' and 'new'(last added layer).
+    Создает группы параметров для нового оптимизатора.
+    Новый слой получает новую группу.
     """
+    id_to_group_idx = {}
+    for idx, group in enumerate(old_optimizer.param_groups):
+        for p in group['params']:
+            id_to_group_idx[id(p)] = idx
+
     new_params_ids = set()
     new_params = []
-
-    # Ищем последний добавленный SubLinear слой
     for module in model.modules():
         if isinstance(module, ScaledNet) and len(module.sub_linears) > 0:
             last_sub = module.sub_linears[-1]
@@ -259,13 +263,28 @@ def split_params_old_new(model: nn.Module) -> Tuple[List[nn.Parameter], List[nn.
                 new_params.append(p)
                 new_params_ids.add(id(p))
 
-    # Все остальные параметры считаем старыми
-    old_params = []
-    for p in model.parameters():
-        if id(p) not in new_params_ids:
-            old_params.append(p)
+    num_old_groups = len(old_optimizer.param_groups)
+    groups_params = [[] for _ in range(num_old_groups)]
 
-    return old_params, new_params
+    for p in model.parameters():
+        if id(p) in new_params_ids:
+            continue
+
+        if id(p) in id_to_group_idx:
+            g_idx = id_to_group_idx[id(p)]
+            groups_params[g_idx].append(p)
+        else:
+            groups_params[0].append(p)
+
+    param_groups_final = [] # список групп для отимизатора с torch.nn.Parameter
+    for i in range(num_old_groups):
+        old_lr = old_optimizer.param_groups[i]['lr']
+        if len(groups_params[i]) > 0:
+            param_groups_final.append({'params': groups_params[i], 'lr': old_lr})
+
+    param_groups_final.append({'params': new_params, 'lr': 0.0})
+
+    return param_groups_final
 
 def train_ssonn(
     model: nn.Module,
@@ -368,11 +387,7 @@ def train_ssonn(
                 print(f"   -> Re-initializing optimizer and resetting LR.")
                 # Re-create optimizer (this resets LR to initial value defined in factory)
 
-                old_params, new_params = split_params_old_new(model)
-                param_groups = [
-                    {'params': old_params, 'lr': current_old_lr}, # Старые хранят свой LR
-                    {'params': new_params, 'lr': 0.0} # Новые начинают с 0
-                ]
+                param_groups = build_preserved_param_groups(model, optimizer)
 
                 optimizer = optimizer_cls(param_groups)
                 apply_sparsity_mask(model) # Re-apply hooks to new parameters
@@ -429,6 +444,11 @@ def train_ssonn(
                 logs["lr_warmup_new"] = 0.0
 
             logs["warmup_active"] = 1 if warmup_scheduler is not None else 0
+            for i, group in enumerate(optimizer.param_groups):
+                # lr_group_0 - главные веса, lr_group_1 - 1-е расширение и т.д.
+                logs[f"lr_group_{i}"] = group['lr']
+                logs[f"params_count_group_{i}"] = sum(p.numel() for p in group['params'])
+
 
 
     # if target_layer:
