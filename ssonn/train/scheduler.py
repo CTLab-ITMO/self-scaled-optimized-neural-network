@@ -4,29 +4,20 @@ class SSONNWarmupScheduler:
     """
     Linearly warms up learning rate for a specific parameter group.
     """
-    def __init__(self, optimizer, target_lr, warmup_epochs, param_group_idx=-1):
+    def __init__(self, optimizer: Any, target_lr: float, warmup_epochs: int, param_group_idx: int =-1):
         self.optimizer = optimizer
         self.target_lr = target_lr
-        self.warmup_epochs = warmup_epochs
+        self.warmup_epochs = max(1, warmup_epochs)
         self.current_epoch = 0
-
-        if param_group_idx < 0:
-            self.group_idx = len(optimizer.param_groups) + param_group_idx
-        else:
-            self.group_idx = param_group_idx
-
-        # Сразу зануляем LR для новой группы
-        if 0 <= self.group_idx < len(self.optimizer.param_groups):
-            self.optimizer.param_groups[self.group_idx]['lr'] = 0.0
+        self.group_idx = param_group_idx
+        self.optimizer.param_groups[param_group_idx]['lr'] = 0.0
 
     def step(self):
         if self.current_epoch < self.warmup_epochs:
             self.current_epoch += 1
             ratio = self.current_epoch / self.warmup_epochs
             new_lr = self.target_lr * ratio
-
-            if 0 <= self.group_idx < len(self.optimizer.param_groups):
-                self.optimizer.param_groups[self.group_idx]['lr'] = new_lr
+            self.optimizer.param_groups[self.group_idx]['lr'] = new_lr
 
 class SSONNPlateauScheduler:
     """
