@@ -25,6 +25,7 @@ def apply_sparsity_mask(model: nn.Module) -> None:
                 def hook(grad: torch.Tensor) -> torch.Tensor:
                     mask = (param.data != 0).float()
                     return grad * mask
+
                 return hook
 
             # Register the hook if the weight parameter exists and requires gradients
@@ -33,11 +34,11 @@ def apply_sparsity_mask(model: nn.Module) -> None:
 
 
 def train_one_epoch(
-    model: nn.Module,
-    train_loader: DataLoader,
-    optimizer: optim.Optimizer,
-    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    device: str
+        model: nn.Module,
+        train_loader: DataLoader,
+        optimizer: optim.Optimizer,
+        criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        device: str
 ) -> Tuple[float, float]:
     """
     Performs one epoch of training.
@@ -49,7 +50,6 @@ def train_one_epoch(
     train_loss = 0.0
     all_targets = []
     all_preds = []
-
 
     pbar = tqdm(train_loader, desc="Train", leave=False)
 
@@ -78,11 +78,11 @@ def train_one_epoch(
 
 
 def eval_one_epoch(
-    model: nn.Module,
-    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    val_loader: DataLoader,
-    task_type: str,
-    device: str
+        model: nn.Module,
+        criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        val_loader: DataLoader,
+        task_type: str,
+        device: str
 ) -> Tuple[float, float]:
     """
     Evaluates the model on the validation set.
@@ -124,9 +124,9 @@ def eval_one_epoch(
 
 
 def expand_model(
-    model: nn.Module,
-    edge_finder: EdgeFinder,
-    thresholds: Dict[str, float]
+        model: nn.Module,
+        edge_finder: EdgeFinder,
+        thresholds: Dict[str, float]
 ) -> Tuple[bool, int]:
     """
     Checks if layers need expansion and applies the SSONN expansion operation.
@@ -159,11 +159,12 @@ def expand_model(
 
     return expansion_happened, total_new_edges
 
+
 def prune_model(
-    model: nn.Module,
-    optimizer: optim.Optimizer,
-    edge_finder: EdgeFinder,
-    thresholds: Dict[str, float]
+        model: nn.Module,
+        optimizer: optim.Optimizer,
+        edge_finder: EdgeFinder,
+        thresholds: Dict[str, float]
 ) -> int:
     """
     Zeros out weights AND clears optimizer state to prevent resurrection.
@@ -244,12 +245,13 @@ def prune_model(
 
     return pruned_count
 
+
 def build_preserved_param_groups(model: nn.Module, old_optimizer: optim.Optimizer) -> List[Dict[str, Any]]:
     """
     Создает группы параметров для нового оптимизатора.
     Новый слой получает новую группу.
     """
-    id_to_group_idx = {}
+    id_to_group_idx = {} # map из id параметра к индексу его группы в старом оптимизаторе
     for idx, group in enumerate(old_optimizer.param_groups):
         for p in group['params']:
             id_to_group_idx[id(p)] = idx
@@ -276,7 +278,7 @@ def build_preserved_param_groups(model: nn.Module, old_optimizer: optim.Optimize
         else:
             groups_params[0].append(p)
 
-    param_groups_final = [] # список групп для отимизатора с torch.nn.Parameter
+    param_groups_final = []  # список групп для отимизатора с torch.nn.Parameter - lr мапой
     for i in range(num_old_groups):
         old_lr = old_optimizer.param_groups[i]['lr']
         if len(groups_params[i]) > 0:
@@ -286,17 +288,18 @@ def build_preserved_param_groups(model: nn.Module, old_optimizer: optim.Optimize
 
     return param_groups_final
 
+
 def train_ssonn(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    finder_loader: DataLoader,
-    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    optimizer_cls: Any,
-    hyperparams: Dict[str, Any],
-    device: str,
-    experiment: Any = None,   # Added experiment
-    use_log_tool: bool = True # Added flag
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        finder_loader: DataLoader,
+        criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        optimizer_cls: Any,
+        hyperparams: Dict[str, Any],
+        device: str,
+        experiment: Any = None,  # Added experiment
+        use_log_tool: bool = True  # Added flag
 ) -> nn.Module:
     """
     Manupulate the SSONN training lifecycle with dynamic expansion and pruning.
@@ -371,22 +374,16 @@ def train_ssonn(
             # print(f"   -> Action: Decreasing Learning Rate.")
             # for g in optimizer.param_groups:
             #     g['lr'] /= 2
-            # меняем только у самого последнего слоя, потому что иначе другие веса будут мега маленькие
-            target_group_idx = -1
-            optimizer.param_groups[target_group_idx]['lr'] /= 2
+            # меняем только у самого последнего слоя
+            optimizer.param_groups[-1]['lr'] /= 2
 
         elif action == 'expand':
-            # надо красиво научиться запоминать lr для каждого слоя
-            current_old_lr = optimizer.param_groups[0]['lr']
-
             print(f"   -> Action: Expanding Model.")
             expanded, num_new = expand_model(model, ef, hyperparams["expansion_thresholds"])
-
 
             if expanded:
                 print(f"   -> Re-initializing optimizer and resetting LR.")
                 # Re-create optimizer (this resets LR to initial value defined in factory)
-
                 param_groups = build_preserved_param_groups(model, optimizer)
 
                 optimizer = optimizer_cls(param_groups)
@@ -408,10 +405,10 @@ def train_ssonn(
                 print(f"   -> Expansion attempted but no edges selected.")
 
         # 4. Pruning Logic
-            # if epoch > hyperparams.get("prune_after_epochs", 999999):
-            #     prune_model(model, optimizer, ef, hyperparams.get("pruning_thresholds", {}))
-                # if pruned > 0 and use_log_tool and experiment:
-                #      experiment.log_metric("pruned weights", pruned, epoch=epoch)
+        # if epoch > hyperparams.get("prune_after_epochs", 999999):
+        #     prune_model(model, optimizer, ef, hyperparams.get("pruning_thresholds", {}))
+        # if pruned > 0 and use_log_tool and experiment:
+        #      experiment.log_metric("pruned weights", pruned, epoch=epoch)
 
         # 5. Calculate Params stats, Logging (Comet ML)
         total_params, non_zero_params = get_param_counts(model)
@@ -419,7 +416,7 @@ def train_ssonn(
         lrs = [g['lr'] for g in optimizer.param_groups]
         lr_str = " | ".join([f"{lr:.1e}" for lr in lrs])
 
-        print(f"Epoch {epoch+1}/{hyperparams['num_epochs']} | "
+        print(f"Epoch {epoch + 1}/{hyperparams['num_epochs']} | "
               f"T-Loss: {t_loss:.4f} | V-Loss: {v_loss:.4f} | Acc: {v_metric:.4f} | "
               f"LRs: [{lr_str}] | Params: {non_zero_params}/{total_params}")
 
@@ -433,25 +430,14 @@ def train_ssonn(
                 "total params": total_params,
                 "params amount": non_zero_params,
                 "sparsity": 1.0 - (non_zero_params / total_params),
-                "lr_stable": optimizer.param_groups[0]['lr'],
-                "params_count_stable": sum(p.numel() for p in optimizer.param_groups[0]['params'])
             }
 
-            if len(optimizer.param_groups) > 1:
-                logs["lr_warmup_new"] = optimizer.param_groups[-1]['lr']
-                logs["params_count_new"] = sum(p.numel() for p in optimizer.param_groups[-1]['params'])
-            else:
-                logs["lr_warmup_new"] = 0.0
-
-            logs["warmup_active"] = 1 if warmup_scheduler is not None else 0
             for i, group in enumerate(optimizer.param_groups):
                 # lr_group_0 - главные веса, lr_group_1 - 1-е расширение и т.д.
                 logs[f"lr_group_{i}"] = group['lr']
-                logs[f"params_count_group_{i}"] = sum(p.numel() for p in group['params'])
+                # logs[f"params_count_group_{i}"] = sum(p.numel() for p in group['params'])
 
-
-
-    # if target_layer:
+            # if target_layer:
             #     metric_main = ef.calculate_edge_metric_for_dataloader(
             #             model, target_layer, to_normalise=False, embed=False)
             #     logs[f"choose_metric/{target_layer_name}_main"] = float(metric_main.mean().item())
@@ -467,16 +453,14 @@ def train_ssonn(
             #     log_gradient_histograms("main_layer_grads_hist", target_layer.weight.grad, experiment, epoch)
             #     # log_gradient_image(target_layer, experiment, epoch)
 
-
-
     print("--- Training Finished ---")
     return model
 
 
 def convert_to_scaled_net(
-    model: nn.Module,
-    layers_to_convert: List[ScaledNet],
-    device: str
+        model: nn.Module,
+        layers_to_convert: List[ScaledNet],
+        device: str
 ) -> nn.Module:
     """
     Replaces specified standard linear layers with SSONN `ScaledNet` layers.
