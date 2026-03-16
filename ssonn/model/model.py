@@ -24,6 +24,17 @@ class ScaledNet(nn.Module):
 
         self.sub_linears = nn.ModuleList()
 
+    def reinitialize_parameters(self):
+        with torch.no_grad():
+            nn.init.kaiming_uniform_(self.weight, mode='fan_in', nonlinearity='relu')
+            if self.bias is not None:
+                nn.init.zeros_(self.bias)
+            
+            for sub_layer in self.sub_linears:
+                nn.init.kaiming_uniform_(sub_layer.weight, mode='fan_in', nonlinearity='relu')
+                if sub_layer.bias is not None:
+                    nn.init.zeros_(sub_layer.bias)
+                    
     def put_sub_linear(self, parents: torch.Tensor, children: torch.Tensor):
         """
         Performs network expansion by inserting a new sub-layer and restructuring weights.
@@ -89,3 +100,6 @@ class SubLinear(nn.Module):
         out = F.linear(x, self.weight, self.bias)
         out = self.act(out)
         return torch.cat([x, out], dim=-1)
+
+
+

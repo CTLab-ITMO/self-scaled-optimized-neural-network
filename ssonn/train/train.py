@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, mean_squared_error
 
@@ -209,7 +210,7 @@ def prune_model(
                 if final_mask_emb.sum() > 0:
                     with torch.no_grad():
                         target_sub.weight.data[final_mask_emb] = 0.0
-                        # !!! IMPORTANT !!!
+
                         if target_sub.weight in optimizer.state:
                             state = optimizer.state[target_sub.weight]
                             if 'exp_avg' in state:
@@ -229,7 +230,7 @@ def prune_model(
             if final_mask_exp.sum() > 0:
                 with torch.no_grad():
                     layer.weight.data[final_mask_exp] = 0.0
-                    # !!! IMPORTANT !!!
+
                     if layer.weight in optimizer.state:
                         state = optimizer.state[layer.weight]
                         if 'exp_avg' in state:
@@ -254,8 +255,8 @@ def train_ssonn(
     optimizer_factory: Callable[[nn.Module], optim.Optimizer],
     hyperparams: Dict[str, Any],
     device: str,
-    experiment: Any = None,   # Added experiment
-    use_log_tool: bool = True # Added flag
+    experiment: Any = None,
+    use_log_tool: bool = True
 ) -> nn.Module:
     """
     Manupulate the SSONN training lifecycle with dynamic expansion and pruning.
@@ -291,6 +292,7 @@ def train_ssonn(
         max_to_replace=hyperparams.get("max_new_edges_per_expansion", None),
     )
     scheduler = SSONNPlateauScheduler(hyperparams)
+    sched = CosineAnnealingLR(optimizer, T_max=hyperparams["t_max"], eta_min=0, last_epoch=-1)
 
     target_layer = None
     target_layer_name = "unknown"
@@ -320,24 +322,46 @@ def train_ssonn(
         # 3. Scheduler Logic (LR / Expand)
         action = scheduler.check_for_action(epoch)
 
-        if action == 'lr':
-            print(f"   -> Action: Decreasing Learning Rate.")
-            for g in optimizer.param_groups:
-                g['lr'] /= 2
-        
-        elif action == 'expand':
+        # if action == 'lr':
+        #     print(f"   -> Action: Decreasing Learning Rate.")
+        #     for g in optimizer.param_groups:
+        #         g['lr'] /= 2
+        # 
+        # elif action == 'expand':
+
+        # SORRY FOR THE GOVNOCODE, I'LL REWRITE IT
+        # TODO: move to scheduler module
+        if ((epoch - hyperparams["t_max"]) % (2 * hyperparams["t_max"])) == 0 and epoch != 0:
             print(f"   -> Action: Expanding Model.")
             expanded, num_new = expand_model(model, ef, hyperparams["expansion_thresholds"])
-            
+          
             if expanded:
-                print(f"   -> Re-initializing optimizer and resetting LR.")
-                # Re-create optimizer (this resets LR to initial value defined in factory)
-                optimizer = optimizer_factory(model)
-                apply_sparsity_mask(model) # Re-apply hooks to new parameters
+                print(f"   -> Re-initializing ScaledNet weights.")
+                for module in model.modules():
+                    if isinstance(module, ScaledNet):
+                        module.reinitialize_parameters()
+
+                print(f"   -> Re-initializing optimizer.")
+                current_lr = optimizer.param_groups[0]['lr']
+              
+                optimizer = optimizer_factory(
+                    model, 
+                    current_lr=current_lr, 
+                    base_lr=hyperparams['learning_rate']
+                )
+              
+                sched = CosineAnnealingLR(
+                    optimizer, 
+                    T_max=hyperparams["t_max"], 
+                    eta_min=0, 
+                    last_epoch=epoch
+                )
+                apply_sparsity_mask(model)                
                 if use_log_tool and experiment:
                     experiment.log_metric("expansion event", num_new, epoch=epoch)
             else:
                 print(f"   -> Expansion attempted but no edges selected.")
+        sched.step()
         
         # 4. Pruning Logic
             # if epoch > hyperparams.get("prune_after_epochs", 999999):
@@ -359,18 +383,18 @@ def train_ssonn(
                 "train accuracy": t_metric,
                 "lr": optimizer.param_groups[0]["lr"],
                 "total params": total_params,
-                "zero params": total_params - non_zero_params,
+                "params amount": non_zero_params,
                 "sparsity": 1.0 - (non_zero_params / total_params),
             }
 
-            # if target_layer:
-            #     metric_main = ef.calculate_edge_metric_for_dataloader(
-            #             model, target_layer, to_normalise=False, embed=False)
-            #     logs[f"choose_metric/{target_layer_name}_main"] = float(metric_main.mean().item())
-            #     if len(target_layer.sub_linears) > 0:
-            #         metric_sub = ef.calculate_edge_metric_for_dataloader(
-            #             model, target_layer, to_normalise=False, embed=True)
-            #         logs[f"choose_metric/{target_layer_name}_sub"] = metric_sub.mean().item()
+            if target_layer:
+                metric_main = ef.calculate_edge_metric_for_dataloader(
+                        model, target_layer, to_normalise=False, embed=False)
+                logs[f"choose_metric/{target_layer_name}_main"] = float(metric_main.mean().item())
+                if len(target_layer.sub_linears) > 0:
+                    metric_sub = ef.calculate_edge_metric_for_dataloader(
+                        model, target_layer, to_normalise=False, embed=True)
+                    logs[f"choose_metric/{target_layer_name}_sub"] = metric_sub.mean().item()
 
             experiment.log_metrics(logs, step=epoch)
             
@@ -379,7 +403,10 @@ def train_ssonn(
             #     log_gradient_histograms("main_layer_grads_hist", target_layer.weight.grad, experiment, epoch)
             #     # log_gradient_image(target_layer, experiment, epoch)
 
-
+    
+        # TODO: add flag for model saving 
+        if epoch % 50 == 0:
+            torch.save(model, f"ssonn_{epoch}.pth")
 
     print("--- Training Finished ---")
     return model
