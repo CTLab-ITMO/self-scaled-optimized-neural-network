@@ -282,8 +282,6 @@ def train_ssonn(
     apply_sparsity_mask(model)
 
     # Initialize EdgeFinder for importance scoring
-    # TODO: add train_weight, train_architecture datasets splitting @shivan
-    # TODO: move EdgeFinder init from train_ssonn to experiments
     ef = EdgeFinder(
         metric=hyperparams["edge_importance_metric"],
         dataloader=finder_loader,
@@ -326,9 +324,7 @@ def train_ssonn(
           
             if expanded:
                 print(f"   -> Re-initializing ScaledNet weights.")
-                for module in model.modules():
-                    if isinstance(module, ScaledNet):
-                        module.reinitialize_parameters()
+                model.apply(weights_init)
 
                 print(f"   -> Re-initializing optimizer.")
                 current_lr = optimizer.param_groups[0]['lr']
@@ -350,6 +346,7 @@ def train_ssonn(
                     experiment.log_metric("expansion event", num_new, epoch=epoch)
             else:
                 print(f"   -> Expansion attempted but no edges selected.")
+
         sched.step()
         
         # 4. Pruning Logic
@@ -434,3 +431,16 @@ def convert_to_scaled_net(
             print(f"Warning: Layer {layer} not found in model children.")
             
     return new_model.to(device)
+
+
+def weights_init(m):
+    if isinstance(m, ScaledNet):
+        m.reinitialize_parameters()
+    
+    elif isinstance(m, (nn.Conv2d, nn.Linear)):
+        nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+            
+    elif isinstance(m, nn.BatchNorm2d):
+        m.reset_parameters()
