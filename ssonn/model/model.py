@@ -16,6 +16,7 @@ class ScaledNet(nn.Module):
         """
         super(ScaledNet, self).__init__()
         self.device = device
+        self.dropout = nn.Dropout(p=0.3)
 
         self.weight = nn.Parameter(weight.to(device))
         self.bias = nn.Parameter(bias.to(device))
@@ -69,7 +70,7 @@ class ScaledNet(nn.Module):
         Input 'x' grows in size as it passes through each SubLinear layer.
         """
         for sub_linear in self.sub_linears:
-            x = sub_linear(x)
+            x = self.dropout(sub_linear(x))
 
         return F.linear(x, self.weight, self.bias)
 
