@@ -304,7 +304,6 @@ def train_ssonn(
 
     train_losses = []
     val_losses = []
-    last_expansion_epoch = 0
 
     print("--- Starting SSONN Training ---")
     
@@ -319,17 +318,7 @@ def train_ssonn(
         train_losses.append(t_loss)
         val_losses.append(v_loss)
 
-        # 3. Scheduler Logic (LR / Expand)
-        action = scheduler.check_for_action(epoch)
-
-        # if action == 'lr':
-        #     print(f"   -> Action: Decreasing Learning Rate.")
-        #     for g in optimizer.param_groups:
-        #         g['lr'] /= 2
-        # 
-        # elif action == 'expand':
-
-        # SORRY FOR THE GOVNOCODE, I'LL REWRITE IT
+        # 3. Scale Step
         # TODO: move to scheduler module
         if ((epoch - hyperparams["t_max"]) % (2 * hyperparams["t_max"])) == 0 and epoch != 0:
             print(f"   -> Action: Expanding Model.")
