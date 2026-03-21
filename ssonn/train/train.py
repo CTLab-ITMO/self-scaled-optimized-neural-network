@@ -11,7 +11,7 @@ from sklearn.metrics import accuracy_score, mean_squared_error
 
 from ssonn.model.model import ScaledNet, SubLinear
 from ssonn.metrics.edge_finder import EdgeFinder
-from .scheduler import SSONNPlateauScheduler
+from .scheduler import SSONNPlateauScheduler, SSONNWarmupScheduler
 from .logging import *
 
 
@@ -26,6 +26,7 @@ def apply_sparsity_mask(model: nn.Module) -> None:
                 def hook(grad: torch.Tensor) -> torch.Tensor:
                     mask = (param.data != 0).float()
                     return grad * mask
+
                 return hook
 
             # Register the hook if the weight parameter exists and requires gradients
@@ -34,11 +35,11 @@ def apply_sparsity_mask(model: nn.Module) -> None:
 
 
 def train_one_epoch(
-    model: nn.Module, 
-    train_loader: DataLoader, 
-    optimizer: optim.Optimizer, 
-    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor], 
-    device: str
+        model: nn.Module,
+        train_loader: DataLoader,
+        optimizer: optim.Optimizer,
+        criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        device: str
 ) -> Tuple[float, float]:
     """
     Performs one epoch of training.
@@ -51,18 +52,17 @@ def train_one_epoch(
     all_targets = []
     all_preds = []
 
-   
     pbar = tqdm(train_loader, desc="Train", leave=False)
-    
+
     for inputs, targets in pbar:
         inputs, targets = inputs.to(device), targets.to(device)
-        
+
         optimizer.zero_grad()
         outputs = model(inputs)
         loss = criterion(outputs, targets)
         loss.backward()
         optimizer.step()
-        
+
         train_loss += loss.item()
 
         preds = torch.argmax(outputs, dim=1)
@@ -79,11 +79,11 @@ def train_one_epoch(
 
 
 def eval_one_epoch(
-    model: nn.Module, 
-    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor], 
-    val_loader: DataLoader, 
-    task_type: str, 
-    device: str
+        model: nn.Module,
+        criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        val_loader: DataLoader,
+        task_type: str,
+        device: str
 ) -> Tuple[float, float]:
     """
     Evaluates the model on the validation set.
@@ -125,9 +125,9 @@ def eval_one_epoch(
 
 
 def expand_model(
-    model: nn.Module, 
-    edge_finder: EdgeFinder, 
-    thresholds: Dict[str, float]
+        model: nn.Module,
+        edge_finder: EdgeFinder,
+        thresholds: Dict[str, float]
 ) -> Tuple[bool, int]:
     """
     Checks if layers need expansion and applies the SSONN expansion operation.
@@ -150,27 +150,28 @@ def expand_model(
             parents, children = edge_finder.choose_edges_threshold(
                 model, layer, threshold, embed=False
             )
-            
+
             if len(parents) > 0:
                 print(f"[Expansion] Layer '{layer_name}': Adding sub-layer for {len(parents)} edges.")
                 # Apply structural expansion
                 layer.put_sub_linear(parents, children)
                 expansion_happened = True
                 total_new_edges += len(parents)
-    
+
     return expansion_happened, total_new_edges
 
+
 def prune_model(
-    model: nn.Module, 
-    optimizer: optim.Optimizer,
-    edge_finder: EdgeFinder, 
-    thresholds: Dict[str, float]
+        model: nn.Module,
+        optimizer: optim.Optimizer,
+        edge_finder: EdgeFinder,
+        thresholds: Dict[str, float]
 ) -> int:
     """
     Zeros out weights AND clears optimizer state to prevent resurrection.
     """
     pruned_count = 0
-    
+
     for layer_name, threshold in thresholds.items():
         if hasattr(model, layer_name):
             layer = getattr(model, layer_name)
@@ -182,31 +183,31 @@ def prune_model(
             metric_exp = edge_finder.calculate_edge_metric_for_dataloader(
                 model=model, layer=layer, to_normalise=False, embed=False
             )
-            
-            # 2. Compute metrics (SubLinear), if exists 
+
+            # 2. Compute metrics (SubLinear), if exists
             has_sub_layers = len(layer.sub_linears) > 0
             if has_sub_layers:
                 metric_emb = edge_finder.calculate_edge_metric_for_dataloader(
                     model=model, layer=layer, to_normalise=False, embed=True
                 )
-                
+
                 flat_exp = metric_exp.flatten()
                 flat_emb = metric_emb.flatten()
                 combined = torch.cat([flat_emb, flat_exp])
                 min_v, max_v = combined.min(), combined.max()
                 norm = (combined - min_v) / (max_v - min_v + 1e-8)
-                
+
                 global_mask = norm < threshold
-                
+
                 num_emb = flat_emb.numel()
                 mask_emb = global_mask[:num_emb].view_as(metric_emb)
                 mask_exp = global_mask[num_emb:].view_as(metric_exp)
-                
+
                 target_sub = layer.sub_linears[-1]
                 # Only non-zero params
                 nonzero_emb = target_sub.weight.data.abs() > 1e-9
                 final_mask_emb = mask_emb & nonzero_emb
-                
+
                 if final_mask_emb.sum() > 0:
                     with torch.no_grad():
                         target_sub.weight.data[final_mask_emb] = 0.0
@@ -226,7 +227,7 @@ def prune_model(
 
             nonzero_exp = layer.weight.data.abs() > 1e-9
             final_mask_exp = mask_exp & nonzero_exp
-            
+
             if final_mask_exp.sum() > 0:
                 with torch.no_grad():
                     layer.weight.data[final_mask_exp] = 0.0
@@ -237,13 +238,56 @@ def prune_model(
                             state['exp_avg'][final_mask_exp] = 0.0
                         if 'exp_avg_sq' in state:
                             state['exp_avg_sq'][final_mask_exp] = 0.0
-                            
+
                 pruned_count += final_mask_exp.sum().item()
 
     if pruned_count > 0:
         print(f"[Pruning] Total weights zeroed out: {pruned_count}")
 
     return pruned_count
+
+
+def build_preserved_param_groups(model: nn.Module, old_optimizer: optim.Optimizer) -> List[Dict[str, Any]]:
+    """
+    Создает группы параметров для нового оптимизатора.
+    Новый слой получает новую группу.
+    """
+    id_to_group_idx = {} # map из id параметра к индексу его группы в старом оптимизаторе
+    for idx, group in enumerate(old_optimizer.param_groups):
+        for p in group['params']:
+            id_to_group_idx[id(p)] = idx
+
+    new_params_ids = set()
+    new_params = []
+    for module in model.modules():
+        if isinstance(module, ScaledNet) and len(module.sub_linears) > 0:
+            last_sub = module.sub_linears[-1]
+            for p in last_sub.parameters():
+                new_params.append(p)
+                new_params_ids.add(id(p))
+
+    num_old_groups = len(old_optimizer.param_groups)
+    groups_params = [[] for _ in range(num_old_groups)]
+
+    for p in model.parameters():
+        if id(p) in new_params_ids:
+            continue
+
+        if id(p) in id_to_group_idx:
+            g_idx = id_to_group_idx[id(p)]
+            groups_params[g_idx].append(p)
+        else:
+            groups_params[0].append(p)
+
+    param_groups_final = []  # список групп для отимизатора с torch.nn.Parameter - lr мапой
+    for i in range(num_old_groups):
+        old_lr = old_optimizer.param_groups[i]['lr']
+        if len(groups_params[i]) > 0:
+            param_groups_final.append({'params': groups_params[i], 'lr': old_lr})
+
+    param_groups_final.append({'params': new_params, 'lr': 0.0})
+
+    return param_groups_final
 
 
 def train_ssonn(
@@ -270,14 +314,14 @@ def train_ssonn(
     Args:
         model: The initial neural network.
         optimizer_factory: A function that returns a new optimizer instance for a given model.
-                           This is crucial because `ScaledNet` creates new parameter tensors 
+                           This is crucial because `ScaledNet` creates new parameter tensors
                            during expansion, invalidating the old optimizer state.
         hyperparams: Configuration dictionary.
     """
     model = model.to(device)
     # Initialize optimizer using the factory
-    optimizer = optimizer_factory(model)
-    
+    optimizer = optimizer_cls(model.parameters())
+
     # Register hooks to keep zeroed weights at zero
     apply_sparsity_mask(model)
 
@@ -291,6 +335,7 @@ def train_ssonn(
     )
     scheduler = SSONNPlateauScheduler(hyperparams)
     sched = CosineAnnealingLR(optimizer, T_max=hyperparams["t_max"], eta_min=0, last_epoch=-1)
+    warmup_scheduler = None
 
     target_layer = None
     target_layer_name = "unknown"
@@ -304,15 +349,20 @@ def train_ssonn(
     val_losses = []
 
     print("--- Starting SSONN Training ---")
-    
+
     for epoch in range(hyperparams["num_epochs"]):
         # 1. Train Step
         t_loss, t_metric = train_one_epoch(model, train_loader, optimizer, criterion, device)
         scheduler.update_metrics(t_loss)
-        
+
+        if warmup_scheduler is not None:
+            warmup_scheduler.step()
+            if warmup_scheduler.current_epoch >= warmup_scheduler.warmup_epochs:
+                warmup_scheduler = None
+
         # 2. Eval Step
         v_loss, v_metric = eval_one_epoch(model, criterion, val_loader, hyperparams["task_type"], device)
-        
+
         train_losses.append(t_loss)
         val_losses.append(v_loss)
 
@@ -350,16 +400,20 @@ def train_ssonn(
         sched.step()
         
         # 4. Pruning Logic
-            # if epoch > hyperparams.get("prune_after_epochs", 999999):
-            #     prune_model(model, optimizer, ef, hyperparams.get("pruning_thresholds", {}))
-                # if pruned > 0 and use_log_tool and experiment:
-                #      experiment.log_metric("pruned weights", pruned, epoch=epoch)
+        # if epoch > hyperparams.get("prune_after_epochs", 999999):
+        #     prune_model(model, optimizer, ef, hyperparams.get("pruning_thresholds", {}))
+        # if pruned > 0 and use_log_tool and experiment:
+        #      experiment.log_metric("pruned weights", pruned, epoch=epoch)
 
         # 5. Calculate Params stats, Logging (Comet ML)
         total_params, non_zero_params = get_param_counts(model)
-        print(f"Epoch {epoch+1}/{hyperparams['num_epochs']} | "
+
+        lrs = [g['lr'] for g in optimizer.param_groups]
+        lr_str = " | ".join([f"{lr:.1e}" for lr in lrs])
+
+        print(f"Epoch {epoch + 1}/{hyperparams['num_epochs']} | "
               f"T-Loss: {t_loss:.4f} | V-Loss: {v_loss:.4f} | Acc: {v_metric:.4f} | "
-              f"Params: {non_zero_params}/{total_params}")
+              f"LRs: [{lr_str}] | Params: {non_zero_params}/{total_params}")
 
         if use_log_tool and experiment is not None:
             logs = {
@@ -383,7 +437,7 @@ def train_ssonn(
                     logs[f"choose_metric/{target_layer_name}_sub"] = metric_sub.mean().item()
 
             experiment.log_metrics(logs, step=epoch)
-            
+
             # if target_layer and target_layer.weight.grad is not None:
             #     log_gradient_values("main_layer_grads", target_layer.weight.grad, experiment, epoch)
             #     log_gradient_histograms("main_layer_grads_hist", target_layer.weight.grad, experiment, epoch)
@@ -399,37 +453,37 @@ def train_ssonn(
 
 
 def convert_to_scaled_net(
-    model: nn.Module, 
-    layers_to_convert: List[ScaledNet], 
-    device: str
+        model: nn.Module,
+        layers_to_convert: List[ScaledNet],
+        device: str
 ) -> nn.Module:
     """
     Replaces specified standard linear layers with SSONN `ScaledNet` layers.
-    
+
     Useful for starting SSONN training from a pre-trained standard model.
     """
     new_model = copy.deepcopy(model)
-    
+
     # Create a mapping from layer object to its name in the module
     layer_map = {}
     for name, module in model.named_children():
         layer_map[module] = name
-        
+
     for layer in layers_to_convert:
         if layer in layer_map:
             name = layer_map[layer]
             print(f"Converting layer '{name}' to ScaledNet...")
-            
+
             # Initialize ScaledNet with the weights of the original layer
             scaled_layer = ScaledNet(
-                layer.weight.data, 
+                layer.weight.data,
                 layer.bias.data if layer.bias is not None else torch.zeros(layer.out_features),
                 device=device
             )
             setattr(new_model, name, scaled_layer)
         else:
             print(f"Warning: Layer {layer} not found in model children.")
-            
+
     return new_model.to(device)
 
 

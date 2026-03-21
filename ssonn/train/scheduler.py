@@ -1,5 +1,23 @@
 from typing import Dict, Any, Optional, List
 
+class SSONNWarmupScheduler:
+    """
+    Linearly warms up learning rate for a specific parameter group.
+    """
+    def __init__(self, optimizer: Any, target_lr: float, warmup_epochs: int, param_group_idx: int =-1):
+        self.optimizer = optimizer
+        self.target_lr = target_lr
+        self.warmup_epochs = max(1, warmup_epochs)
+        self.current_epoch = 0
+        self.group_idx = param_group_idx
+        self.optimizer.param_groups[param_group_idx]['lr'] = 0.0
+
+    def step(self):
+        if self.current_epoch < self.warmup_epochs:
+            self.current_epoch += 1
+            ratio = self.current_epoch / self.warmup_epochs
+            new_lr = self.target_lr * ratio
+            self.optimizer.param_groups[self.group_idx]['lr'] = new_lr
 
 class SSONNPlateauScheduler:
     """
