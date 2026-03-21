@@ -320,7 +320,7 @@ def train_ssonn(
     """
     model = model.to(device)
     # Initialize optimizer using the factory
-    optimizer = optimizer_cls(model.parameters())
+    optimizer = optimizer_factory(model)
 
     # Register hooks to keep zeroed weights at zero
     apply_sparsity_mask(model)
