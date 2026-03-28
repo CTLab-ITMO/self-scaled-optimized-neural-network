@@ -146,3 +146,51 @@ class EdgeFinder:
             parents = parents[top_k_indices]
 
         return parents, children
+
+
+class RandomEdgeFinder:
+    def __init__(
+        self,
+        max_to_replace: int,
+        device: Union[torch.device, str] = torch.device("cpu"),
+    ):
+        self.max_to_replace = max_to_replace
+        self.device = device
+
+    def choose_edges_threshold(
+        self, 
+        model: Optional[nn.Module] = None, 
+        layer: Optional[ScaledNet] = None, 
+        threshold: Optional[float] = None, 
+        embed: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if layer is None:
+            raise ValueError("Layer must be provided to determine dimensions.")
+
+        if embed and hasattr(layer, 'embed'):
+            target_weight = layer.embed.weight
+        elif hasattr(layer, 'weight'):
+            target_weight = layer.weight
+        else:
+            raise AttributeError("Could not locate the weight matrix in the provided layer.")
+
+        out_features, in_features = target_weight.shape
+        total_edges = out_features * in_features
+
+        num_to_select = min(self.max_to_replace, total_edges)
+
+        random_indices = torch.randperm(total_edges, device=self.device)[:num_to_select]
+
+        children = random_indices // in_features
+        parents = random_indices % in_features
+
+        return parents, children
+
+    def calculate_edge_metric_for_dataloader(
+        self, 
+        model: nn.Module, 
+        layer: ScaledNet, 
+        to_normalise: bool = True, 
+        embed: bool = False
+    ) -> torch.Tensor:
+        return torch.zeros_like(layer.weight) 

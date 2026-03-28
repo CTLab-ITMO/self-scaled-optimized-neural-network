@@ -10,7 +10,7 @@ from tqdm import tqdm
 from sklearn.metrics import accuracy_score, mean_squared_error
 
 from ssonn.model.model import ScaledNet, SubLinear
-from ssonn.metrics.edge_finder import EdgeFinder
+from ssonn.metrics.edge_finder import EdgeFinder, RandomEdgeFinder
 from .scheduler import SSONNPlateauScheduler, SSONNWarmupScheduler
 from .logging import *
 
@@ -326,13 +326,14 @@ def train_ssonn(
     apply_sparsity_mask(model)
 
     # Initialize EdgeFinder for importance scoring
-    ef = EdgeFinder(
-        metric=hyperparams["edge_importance_metric"],
-        dataloader=finder_loader,
-        device=device,
-        aggregation_mode=hyperparams.get("edge_score_aggregation", "mean"),
-        max_to_replace=hyperparams.get("max_new_edges_per_expansion", None),
-    )
+    # ef = EdgeFinder(
+    #     metric=hyperparams["edge_importance_metric"],
+    #     dataloader=finder_loader,
+    #     device=device,
+    #     aggregation_mode=hyperparams.get("edge_score_aggregation", "mean"),
+    #     max_to_replace=hyperparams.get("max_new_edges_per_expansion", None),
+    # )
+    ef = RandomEdgeFinder(max_to_replace=1000)
     scheduler = SSONNPlateauScheduler(hyperparams)
     sched = CosineAnnealingLR(optimizer, T_max=hyperparams["t_max"], eta_min=0, last_epoch=-1)
     warmup_scheduler = None
