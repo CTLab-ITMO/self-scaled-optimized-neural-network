@@ -38,13 +38,14 @@ def train_one_epoch(
         train_loader: DataLoader,
         optimizer: optim.Optimizer,
         criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-        device: str
+        device: str,
+        max_norm: float = 1.0  # Добавляем параметр для порога клиппинга
 ) -> Tuple[float, float]:
     """
-    Performs one epoch of training.
+    Performs one epoch of training with gradient clipping.
 
     Returns:
-        Tuple[float, float]: Average training loss and the time taken for the epoch.
+        Tuple[float, float]: Average training loss and accuracy.
     """
     model.train()
     train_loss = 0.0
@@ -60,6 +61,12 @@ def train_one_epoch(
         outputs = model(inputs)
         loss = criterion(outputs, targets)
         loss.backward()
+
+        # --- Gradient Clipping ---
+        # Важно делать это ПОСЛЕ loss.backward(), но ДО optimizer.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        # -------------------------
+
         optimizer.step()
 
         train_loss += loss.item()
@@ -71,11 +78,10 @@ def train_one_epoch(
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     train_loss /= len(train_loader)
-
     metric = accuracy_score(all_targets, all_preds)
 
     return train_loss, metric
-
+    
 
 def eval_one_epoch(
         model: nn.Module,

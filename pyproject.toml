@@ -16,8 +16,9 @@ dependencies = [
     "numpy>=2.4.4",
     "pandas>=3.0.2",
     "scikit-learn>=1.8.0",
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
+    "torch",
+    "torchtoolbox>=0.1.8.2",
+    "torchvision",
     "tqdm>=4.67.3",
 ]
 
@@ -33,3 +34,7 @@ torch = [
 torchvision = [
     { index = "pytorch-cu124", marker = "sys_platform == 'linux'" }
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ssonn*"]
