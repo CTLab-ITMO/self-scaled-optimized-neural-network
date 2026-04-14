@@ -16,22 +16,16 @@ from .logging import *
 
 
 def apply_sparsity_mask(model: nn.Module) -> None:
-    """
-    Registers backward hooks to enforce sparsity on dense tensors.
-    """
+    
     for module in model.modules():
-        if isinstance(module, (ScaledNet, SubLinear)):
-
-            def get_mask_hook(param: nn.Parameter) -> Callable[[torch.Tensor], torch.Tensor]:
-                def hook(grad: torch.Tensor) -> torch.Tensor:
-                    mask = (param.data != 0).float()
-                    return grad * mask
-
+        if hasattr(module, 'sparsity_mask') and hasattr(module, 'weight') and module.weight.requires_grad:
+            
+            def get_hook(fixed_mask):
+                def hook(grad):
+                    return grad * fixed_mask
                 return hook
 
-            # Register the hook if the weight parameter exists and requires gradients
-            if hasattr(module, 'weight') and module.weight.requires_grad:
-                module.weight.register_hook(get_mask_hook(module.weight))
+            module.weight.register_hook(get_hook(module.sparsity_mask))
 
 
 def train_one_epoch(
