@@ -25,7 +25,7 @@ class ScaledNet(nn.Module):
 
             nn.init.kaiming_uniform_(self.weight, mode='fan_in', nonlinearity='leaky_relu', a=0.01)
             if self.bias is not None:
-                nn.init.constant_(self.bias, 0.01)
+                nn.init.zeros_(self.bias)
                 
             self.weight.data.mul_(self.sparsity_mask)
             
@@ -35,7 +35,7 @@ class ScaledNet(nn.Module):
                 
                 nn.init.kaiming_uniform_(sub_layer.weight, mode='fan_in', nonlinearity='leaky_relu', a=0.01)
                 if sub_layer.bias is not None:
-                    nn.init.constant_(sub_layer.bias, 0.01)
+                    nn.init.zeros_(sub_layer.bias)
                 
                 sub_layer.weight.data.mul_(sub_layer.sparsity_mask)
                     
@@ -83,7 +83,7 @@ class SubLinear(nn.Module):
         
         self.weight = nn.Parameter(weight_data)
         
-        self.bias = nn.Parameter(torch.full((output_dim,), 0.01, device=device))
+        self.bias = nn.Parameter(torch.zeros((output_dim,), device=device))
 
         self.act = nn.LeakyReLU(negative_slope=0.01)
 

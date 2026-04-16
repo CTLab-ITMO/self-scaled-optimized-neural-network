@@ -57,10 +57,7 @@ def train_one_epoch(
         loss = criterion(outputs, targets)
         loss.backward()
 
-        # --- Gradient Clipping ---
-        # Важно делать это ПОСЛЕ loss.backward(), но ДО optimizer.step()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-        # -------------------------
 
         optimizer.step()
 
