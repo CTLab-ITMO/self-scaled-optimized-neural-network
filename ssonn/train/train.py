@@ -9,9 +9,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, mean_squared_error
 
-from ssonn.model.model import ScaledNet, SubLinear
+from ssonn.model.model import ScaledNet
 from ssonn.metrics.edge_finder import EdgeFinder
-from .scheduler import SSONNPlateauScheduler, SSONNWarmupScheduler
+from .scheduler import SSONNPlateauScheduler
 from .logging import *
 
 
@@ -34,7 +34,7 @@ def train_one_epoch(
         optimizer: optim.Optimizer,
         criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         device: str,
-        max_norm: float = 1.0  # Добавляем параметр для порога клиппинга
+        max_norm: float = 1.0
 ) -> Tuple[float, float]:
     """
     Performs one epoch of training with gradient clipping.
@@ -245,11 +245,7 @@ def prune_model(
 
 
 def build_preserved_param_groups(model: nn.Module, old_optimizer: optim.Optimizer) -> List[Dict[str, Any]]:
-    """
-    Создает группы параметров для нового оптимизатора.
-    Новый слой получает новую группу.
-    """
-    id_to_group_idx = {} # map из id параметра к индексу его группы в старом оптимизаторе
+    id_to_group_idx = {} 
     for idx, group in enumerate(old_optimizer.param_groups):
         for p in group['params']:
             id_to_group_idx[id(p)] = idx
@@ -276,7 +272,7 @@ def build_preserved_param_groups(model: nn.Module, old_optimizer: optim.Optimize
         else:
             groups_params[0].append(p)
 
-    param_groups_final = []  # список групп для отимизатора с torch.nn.Parameter - lr мапой
+    param_groups_final = []
     for i in range(num_old_groups):
         old_lr = old_optimizer.param_groups[i]['lr']
         if len(groups_params[i]) > 0:
@@ -342,9 +338,6 @@ def train_ssonn(
             target_layer_name = name
             break
 
-    train_losses = []
-    val_losses = []
-
     print("--- Starting SSONN Training ---")
 
     for epoch in range(hyperparams["num_epochs"]):
@@ -360,20 +353,17 @@ def train_ssonn(
         # 2. Eval Step
         v_loss, v_metric = eval_one_epoch(model, criterion, val_loader, hyperparams["task_type"], device)
 
-        train_losses.append(t_loss)
-        val_losses.append(v_loss)
-
         # 3. Scale Step
         # TODO: move to scheduler module
         if ((epoch - hyperparams["t_max"]) % (2 * hyperparams["t_max"])) == 0 and epoch != 0:
-            print(f"   -> Action: Expanding Model.")
+            print("   -> Action: Expanding Model.")
             expanded, num_new = expand_model(model, ef, hyperparams["expansion_thresholds"])
           
             if expanded:
-                print(f"   -> Re-initializing ScaledNet weights.")
+                print("   -> Re-initializing ScaledNet weights.")
                 model.apply(weights_init)
 
-                print(f"   -> Re-initializing optimizer.")
+                print("   -> Re-initializing optimizer.")
                 current_lr = optimizer.param_groups[0]['lr']
               
                 optimizer = optimizer_factory(
@@ -392,16 +382,10 @@ def train_ssonn(
                 if use_log_tool and experiment:
                     experiment.log_metric("expansion event", num_new, epoch=epoch)
             else:
-                print(f"   -> Expansion attempted but no edges selected.")
+                print("   -> Expansion attempted but no edges selected.")
 
         sched.step()
         
-        # 4. Pruning Logic
-        # if epoch > hyperparams.get("prune_after_epochs", 999999):
-        #     prune_model(model, optimizer, ef, hyperparams.get("pruning_thresholds", {}))
-        # if pruned > 0 and use_log_tool and experiment:
-        #      experiment.log_metric("pruned weights", pruned, epoch=epoch)
-
         # 5. Calculate Params stats, Logging (Comet ML)
         total_params, non_zero_params = get_param_counts(model)
 
@@ -434,15 +418,9 @@ def train_ssonn(
                     logs[f"choose_metric/{target_layer_name}_sub"] = metric_sub.mean().item()
 
             experiment.log_metrics(logs, step=epoch)
-
-            # if target_layer and target_layer.weight.grad is not None:
-            #     log_gradient_values("main_layer_grads", target_layer.weight.grad, experiment, epoch)
-            #     log_gradient_histograms("main_layer_grads_hist", target_layer.weight.grad, experiment, epoch)
-            #     # log_gradient_image(target_layer, experiment, epoch)
-
     
         # TODO: add flag for model saving 
-        if epoch % 50 == 0:
+        if epoch % 100 == 0:
             torch.save(model, f"ssonn_{epoch}.pth")
 
     print("--- Training Finished ---")
