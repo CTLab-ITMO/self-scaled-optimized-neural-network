@@ -1,16 +1,40 @@
 [build-system]
-requires = ['setuptools >= 61.0.0', 'wheel']
-build-backend = 'setuptools.build_meta'
+requires = ["setuptools >= 61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
-name = 'ssonn'
-version = '1.0.0'
-authors = []
-description = 'Self-Scaled Optimized Neural Network'
-readme = 'README.md'
-requires-python = '>= 3.9'
+name = "self-scaled-optimized-neural-network"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
 dependencies = [
-    'torch', 'torchvision', 'pandas', 'scikit-learn', 'tqdm', 'wandb']
+    "comet-ml>=3.57.3",
+    "ipywidgets>=8.1.8",
+    "jupyterlab>=4.5.6",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.4",
+    "pandas>=3.0.2",
+    "scikit-learn>=1.8.0",
+    "torch==2.6.0",
+    "torchtoolbox>=0.1.8.2",
+    "torchvision==0.21.0",
+    "tqdm>=4.67.3",
+]
 
-[tool.setuptools.packages]
-find = { }
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" }
+]
+torchvision = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" }
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ssonn*"]

@@ -10,3 +10,4 @@ wandb
 sen-venv/
 *.txt
 *.pt
+*.pth
