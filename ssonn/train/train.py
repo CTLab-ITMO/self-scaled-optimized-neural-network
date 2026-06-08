@@ -124,7 +124,10 @@ def eval_one_epoch(
 def expand_model(
         model: nn.Module,
         edge_finder: EdgeFinder,
-        thresholds: Dict[str, float]
+        thresholds: Dict[str, float],
+        expansion_strategy: str = "edgewise",
+        adapter_rank: Any = None,
+        adapter_activation: bool = False
 ) -> Tuple[bool, int]:
     """
     Checks if layers need expansion and applies the SSONN expansion operation.
@@ -149,11 +152,30 @@ def expand_model(
             )
 
             if len(parents) > 0:
-                print(f"[Expansion] Layer '{layer_name}': Adding sub-layer for {len(parents)} edges.")
-                # Apply structural expansion
-                layer.put_sub_linear(parents, children)
+                if expansion_strategy == "edgewise":
+                    print(f"[Expansion] Layer '{layer_name}': Adding sub-layer for {len(parents)} edges.")
+                    layer.put_sub_linear(parents, children)
+                    total_new_edges += len(parents)
+                elif expansion_strategy in {"low_rank_adapter", "lora_adapter"}:
+                    if isinstance(adapter_rank, dict):
+                        layer_rank = adapter_rank.get(layer_name)
+                    else:
+                        layer_rank = adapter_rank
+                    added_rank = layer.put_low_rank_adapter(
+                        parents,
+                        children,
+                        rank=layer_rank,
+                        activation=adapter_activation
+                    )
+                    print(
+                        f"[Expansion] Layer '{layer_name}': Adding low-rank adapter "
+                        f"with rank {added_rank} for {len(parents)} selected edges."
+                    )
+                    total_new_edges += added_rank
+                else:
+                    raise ValueError(f"Unsupported expansion strategy: {expansion_strategy}")
+
                 expansion_happened = True
-                total_new_edges += len(parents)
 
     return expansion_happened, total_new_edges
 
@@ -357,7 +379,14 @@ def train_ssonn(
         # TODO: move to scheduler module
         if ((epoch - hyperparams["t_max"]) % (2 * hyperparams["t_max"])) == 0 and epoch != 0:
             print("   -> Action: Expanding Model.")
-            expanded, num_new = expand_model(model, ef, hyperparams["expansion_thresholds"])
+            expanded, num_new = expand_model(
+                model,
+                ef,
+                hyperparams["expansion_thresholds"],
+                expansion_strategy=hyperparams.get("expansion_strategy", "edgewise"),
+                adapter_rank=hyperparams.get("adapter_rank", None),
+                adapter_activation=hyperparams.get("adapter_activation", False),
+            )
           
             if expanded:
                 print("   -> Re-initializing ScaledNet weights.")

@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from typing import Optional
 
 class ScaledNet(nn.Module):
     """
@@ -55,6 +56,71 @@ class ScaledNet(nn.Module):
 
         self.weight = nn.Parameter(new_weight_data)
         self.in_features += chosen_dim
+        if hasattr(self, 'sparsity_mask'):
+            delattr(self, 'sparsity_mask')
+
+    def put_low_rank_adapter(
+            self,
+            parents: torch.Tensor,
+            children: torch.Tensor,
+            rank: Optional[int] = None,
+            activation: bool = False,
+            init_scale: float = 1e-8
+    ) -> int:
+        """
+        Adds a LoRA-like bottleneck adapter for selected edges.
+
+        The original projection is kept intact. The adapter adds a small
+        parent -> bottleneck -> child path initialized with tiny non-zero
+        weights, so the architecture grows while the initial function changes
+        only negligibly.
+        """
+        parents = parents.to(self.device).long()
+        children = children.to(self.device).long()
+        if parents.numel() == 0:
+            return 0
+
+        unique_parents = torch.unique(parents)
+        unique_children = torch.unique(children)
+        max_rank = min(unique_parents.numel(), unique_children.numel())
+        if max_rank == 0:
+            return 0
+
+        adapter_rank = max_rank if rank is None else min(rank, max_rank)
+        adapter_rank = int(max(1, adapter_rank))
+
+        old_weight_data = self.weight.data
+        adapter_weight = torch.zeros(
+            (adapter_rank, self.in_features),
+            device=self.device,
+            dtype=old_weight_data.dtype
+        )
+        adapter_weight[:, unique_parents] = torch.empty(
+            (adapter_rank, unique_parents.numel()),
+            device=self.device,
+            dtype=old_weight_data.dtype
+        ).uniform_(-init_scale, init_scale)
+
+        output_weight = torch.zeros(
+            (self.out_features, adapter_rank),
+            device=self.device,
+            dtype=old_weight_data.dtype
+        )
+        output_weight[unique_children, :] = torch.empty(
+            (unique_children.numel(), adapter_rank),
+            device=self.device,
+            dtype=old_weight_data.dtype
+        ).uniform_(-init_scale, init_scale)
+
+        self.sub_linears.append(
+            LowRankAdapter(adapter_weight, self.device, activation=activation)
+        )
+        self.weight = nn.Parameter(torch.cat([old_weight_data, output_weight], dim=1))
+        self.in_features += adapter_rank
+        if hasattr(self, 'sparsity_mask'):
+            delattr(self, 'sparsity_mask')
+
+        return adapter_rank
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for sub_linear in self.sub_linears:
@@ -90,6 +156,25 @@ class SubLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         effective_weight = self.weight * self.sparsity_mask if hasattr(self, 'sparsity_mask') else self.weight
         
+        out = F.linear(x, effective_weight, self.bias)
+        out = self.act(out)
+        return torch.cat([x, out], dim=-1)
+
+
+class LowRankAdapter(nn.Module):
+    """
+    Bottleneck expansion layer used for LoRA-like structural growth.
+    """
+    def __init__(self, weight: torch.Tensor, device: str, activation: bool = False):
+        super(LowRankAdapter, self).__init__()
+        self.device = device
+        self.weight = nn.Parameter(weight.to(device))
+        self.bias = nn.Parameter(torch.zeros((weight.shape[0],), device=device))
+        self.act = nn.LeakyReLU(negative_slope=0.01) if activation else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        effective_weight = self.weight * self.sparsity_mask if hasattr(self, 'sparsity_mask') else self.weight
+
         out = F.linear(x, effective_weight, self.bias)
         out = self.act(out)
         return torch.cat([x, out], dim=-1)

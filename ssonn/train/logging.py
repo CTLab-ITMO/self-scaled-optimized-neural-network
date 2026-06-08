@@ -5,7 +5,7 @@ import numpy as np
 from torch import nn
 import torch
 
-from ..model.model import ScaledNet, SubLinear
+from ..model.model import LowRankAdapter, ScaledNet, SubLinear
 
 
 def log_gradient_image(model: nn.Module, experiment: Any, epoch: int):
@@ -187,7 +187,7 @@ def log_gradient_flow_bar(model: nn.Module, experiment: Any, epoch: int):
 def log_sparsity_stability(model: nn.Module, experiment: Any, epoch: int):
     logs = {}
     for name, module in model.named_modules():
-        if isinstance(module, (ScaledNet, SubLinear)):
+        if isinstance(module, (ScaledNet, SubLinear, LowRankAdapter)):
             total = module.weight.numel()
             zeros = (module.weight.data == 0).sum().item()
             
@@ -205,9 +205,8 @@ def get_param_counts(model: nn.Module) -> Tuple[int, int]:
     total = 0
     non_zero = 0
     for module in model.modules():
-        if isinstance(module, (ScaledNet, SubLinear, nn.Linear)):
+        if isinstance(module, (ScaledNet, SubLinear, LowRankAdapter, nn.Linear)):
             for param in module.parameters(recurse=False):
                 total += param.numel()
                 non_zero += (param.data != 0).sum().item()
     return total, non_zero
-
