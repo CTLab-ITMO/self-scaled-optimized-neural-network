@@ -76,9 +76,7 @@ class SSONNPlateauScheduler:
             self.last_action_epoch = epoch
             return 'lr'
         
-        # If loss hasn't improved much despite previous actions -> Expand capacity
         else:
             self.last_action = 'expand'
             self.last_action_epoch = epoch
-            # Note: We do NOT update last_plateau_loss here, typically we want to see if expansion breaks it
             return 'expand'
