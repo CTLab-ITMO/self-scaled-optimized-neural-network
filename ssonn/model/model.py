@@ -54,6 +54,13 @@ class ScaledNet(nn.Module):
         new_weight_data = torch.cat([old_weight_data, weight_cat], dim=1)
 
         self.weight = nn.Parameter(new_weight_data)
+        if hasattr(self, 'sparsity_mask'):
+            # Keep the persistent mask aligned with the expanded projection.
+            # Without these columns a second expansion fails in forward().
+            new_mask_columns = (weight_cat != 0).to(self.sparsity_mask.dtype)
+            self.sparsity_mask = torch.cat(
+                [self.sparsity_mask, new_mask_columns], dim=1
+            )
         self.in_features += chosen_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
