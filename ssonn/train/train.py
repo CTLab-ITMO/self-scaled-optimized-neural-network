@@ -339,6 +339,7 @@ def train_ssonn(
             break
 
     print("--- Starting SSONN Training ---")
+    best_val_accuracy = float("-inf")
 
     for epoch in range(hyperparams["num_epochs"]):
         # 1. Train Step
@@ -353,6 +354,9 @@ def train_ssonn(
         # 2. Eval Step
         v_loss, v_metric = eval_one_epoch(model, criterion, val_loader, hyperparams["task_type"], device)
 
+        if hyperparams["task_type"] == "classification":
+            best_val_accuracy = max(best_val_accuracy, v_metric)
+
         # 3. Scale Step
         # TODO: move to scheduler module
         if ((epoch - hyperparams["t_max"]) % (2 * hyperparams["t_max"])) == 0 and epoch != 0:
@@ -365,19 +369,22 @@ def train_ssonn(
 
                 print("   -> Re-initializing optimizer.")
                 current_lr = optimizer.param_groups[0]['lr']
-              
+
                 optimizer = optimizer_factory(
-                    model, 
-                    current_lr=current_lr, 
+                    model,
+                    current_lr=current_lr,
                     base_lr=hyperparams['learning_rate']
                 )
-              
-                sched = CosineAnnealingLR(
-                    optimizer, 
-                    T_max=hyperparams["t_max"], 
-                    eta_min=0, 
-                    last_epoch=epoch
-                )
+
+                # Keep the scheduler's epoch/phase, but point it at the fresh optimizer.
+                sched.optimizer = optimizer
+                if len(sched.base_lrs) != len(optimizer.param_groups):
+                    sched.base_lrs = [
+                        group.get('initial_lr', group['lr'])
+                        for group in optimizer.param_groups
+                    ]
+                sched._last_lr = [group['lr'] for group in optimizer.param_groups]
+
                 apply_sparsity_mask(model)                
                 if use_log_tool and experiment:
                     experiment.log_metric("expansion event", num_new, epoch=epoch)
@@ -393,7 +400,8 @@ def train_ssonn(
         lr_str = " | ".join([f"{lr:.1e}" for lr in lrs])
 
         print(f"Epoch {epoch + 1}/{hyperparams['num_epochs']} | "
-              f"T-Loss: {t_loss:.4f} | V-Loss: {v_loss:.4f} | Acc: {v_metric:.4f} | "
+              f"T-Loss: {t_loss:.4f} | V-Loss: {v_loss:.4f} | "
+              f"Acc: {v_metric:.4f} | Best Acc: {best_val_accuracy:.4f} | "
               f"LRs: [{lr_str}] | Params: {non_zero_params}/{total_params}")
 
         if use_log_tool and experiment is not None:
