@@ -11,6 +11,7 @@ from sklearn.metrics import accuracy_score, mean_squared_error
 
 from ssonn.model.model import ScaledNet
 from ssonn.metrics.edge_finder import EdgeFinder
+from ssonn.metrics.factored_edge_finder import FactoredEdgeFinder
 from .scheduler import SSONNPlateauScheduler
 from .logging import *
 
@@ -123,37 +124,46 @@ def eval_one_epoch(
 
 def expand_model(
         model: nn.Module,
-        edge_finder: EdgeFinder,
+        edge_finder: Any,
         thresholds: Dict[str, float]
 ) -> Tuple[bool, int]:
     """
     Checks if layers need expansion and applies the SSONN expansion operation.
 
+    Selection runs for ALL layers on the frozen model first, expansions are
+    applied afterwards (two-phase). With a FactoredEdgeFinder (anything
+    exposing .select) all layers share a single finder pass; the stock
+    EdgeFinder path keeps one pass per layer.
+
     Returns:
         Tuple[bool, int]: (True if architecture changed, Number of new edges added).
     """
+    layer_map = {
+        name: getattr(model, name) for name in thresholds
+        if hasattr(model, name) and isinstance(getattr(model, name), ScaledNet)
+    }
+
+    # Phase 1: select on the frozen model
+    if hasattr(edge_finder, "select"):
+        results = edge_finder.select(model, layer_map, thresholds)
+        chosen = {name: (p, c) for name, (p, c, _info) in results.items()}
+    else:
+        chosen = {}
+        for name, layer in layer_map.items():
+            parents, children = edge_finder.choose_edges_threshold(
+                model, layer, thresholds[name], embed=False
+            )
+            chosen[name] = (parents, children)
+
+    # Phase 2: apply expansions
     expansion_happened = False
     total_new_edges = 0
-
-    for layer_name, threshold in thresholds.items():
-        if hasattr(model, layer_name):
-            layer = getattr(model, layer_name)
-        else:
-            continue
-
-        if isinstance(layer, ScaledNet):
-            # Identify high-importance edges to expand
-            # embed=False targets the main projection matrix
-            parents, children = edge_finder.choose_edges_threshold(
-                model, layer, threshold, embed=False
-            )
-
-            if len(parents) > 0:
-                print(f"[Expansion] Layer '{layer_name}': Adding sub-layer for {len(parents)} edges.")
-                # Apply structural expansion
-                layer.put_sub_linear(parents, children)
-                expansion_happened = True
-                total_new_edges += len(parents)
+    for name, (parents, children) in chosen.items():
+        if len(parents) > 0:
+            print(f"[Expansion] Layer '{name}': Adding sub-layer for {len(parents)} edges.")
+            layer_map[name].put_sub_linear(parents, children)
+            expansion_happened = True
+            total_new_edges += len(parents)
 
     return expansion_happened, total_new_edges
 
@@ -318,14 +328,26 @@ def train_ssonn(
     # Register hooks to keep zeroed weights at zero
     apply_sparsity_mask(model)
 
-    # Initialize EdgeFinder for importance scoring
-    ef = EdgeFinder(
-        metric=hyperparams["edge_importance_metric"],
-        dataloader=finder_loader,
-        device=device,
-        aggregation_mode=hyperparams.get("edge_score_aggregation", "mean"),
-        max_to_replace=hyperparams.get("max_new_edges_per_expansion", None),
-    )
+    # Initialize the edge finder for importance scoring.
+    # hyperparams["edge_finder"]: "stock" (default, exact original pipeline)
+    # or "factored" — same selections (verified equivalent), one finder pass
+    # for all layers, O(n*(n_out+n_in)) memory instead of O(n_out*n_in).
+    if hyperparams.get("edge_finder", "stock") == "factored":
+        ef = FactoredEdgeFinder(
+            loss_fn=hyperparams["edge_importance_metric"].loss_fn,
+            dataloader=finder_loader,
+            device=device,
+            metric=hyperparams.get("edge_score_aggregation", "mean"),
+            max_to_replace=hyperparams.get("max_new_edges_per_expansion", None),
+        )
+    else:
+        ef = EdgeFinder(
+            metric=hyperparams["edge_importance_metric"],
+            dataloader=finder_loader,
+            device=device,
+            aggregation_mode=hyperparams.get("edge_score_aggregation", "mean"),
+            max_to_replace=hyperparams.get("max_new_edges_per_expansion", None),
+        )
     scheduler = SSONNPlateauScheduler(hyperparams)
     sched = CosineAnnealingLR(optimizer, T_max=hyperparams["t_max"], eta_min=0, last_epoch=-1)
     warmup_scheduler = None
@@ -408,7 +430,9 @@ def train_ssonn(
                 "sparsity": 1.0 - (non_zero_params / total_params),
             }
 
-            if target_layer:
+            # dense per-epoch metric logging is a stock-EdgeFinder feature;
+            # the factored finder does not materialize full metric fields
+            if target_layer and hasattr(ef, "calculate_edge_metric_for_dataloader"):
                 metric_main = ef.calculate_edge_metric_for_dataloader(
                         model, target_layer, to_normalise=False, embed=False)
                 logs[f"choose_metric/{target_layer_name}_main"] = float(metric_main.mean().item())
