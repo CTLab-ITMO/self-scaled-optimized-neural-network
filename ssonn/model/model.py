@@ -63,6 +63,16 @@ class ScaledNet(nn.Module):
             )
         self.in_features += chosen_dim
 
+        # keep the sparsity mask consistent with the new weight shape:
+        # a stale (out, old_in) buffer would crash the first forward pass
+        # between expansion and reinitialize_parameters (e.g. when a later
+        # layer's edge metric is computed in the same expansion round)
+        if hasattr(self, 'sparsity_mask'):
+            mask_cat = (weight_cat != 0).float()
+            new_mask = torch.cat([self.sparsity_mask, mask_cat], dim=1)
+            new_mask[children, parents] = 0.
+            self.sparsity_mask = new_mask
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for sub_linear in self.sub_linears:
             x = self.dropout(sub_linear(x))
