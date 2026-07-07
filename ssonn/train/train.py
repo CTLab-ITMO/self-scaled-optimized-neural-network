@@ -13,6 +13,10 @@ from ssonn.model.model import ScaledNet
 from ssonn.metrics.edge_finder import EdgeFinder
 from .scheduler import SSONNPlateauScheduler
 from .logging import *
+from ssonn.metrics.correlation_metrics import (
+    log_correlation_metrics_at_expansion,
+    log_correlation_metrics_epoch,
+)
 
 
 def apply_sparsity_mask(model: nn.Module) -> None:
@@ -293,7 +297,8 @@ def train_ssonn(
     hyperparams: Dict[str, Any],
     device: str,
     experiment: Any = None,
-    use_log_tool: bool = True
+    use_log_tool: bool = True,
+    log_correlations: bool = False
 ) -> nn.Module:
     """
     Manupulate the SSONN training lifecycle with dynamic expansion and pruning.
@@ -355,7 +360,27 @@ def train_ssonn(
 
         # 3. Scale Step
         # TODO: move to scheduler module
-        if ((epoch - hyperparams["t_max"]) % (2 * hyperparams["t_max"])) == 0 and epoch != 0:
+        is_expansion_epoch = ((epoch - hyperparams["t_max"]) % (2 * hyperparams["t_max"])) == 0 and epoch != 0
+
+        # Log correlation metrics before expansion (selected/unselected edges analysis)
+        if log_correlations and use_log_tool and experiment is not None and target_layer is not None:
+            if is_expansion_epoch:
+                for layer_name, threshold in hyperparams["expansion_thresholds"].items():
+                    layer = getattr(model, layer_name, None)
+                    if layer is not None and isinstance(layer, ScaledNet):
+                        sel_parents, sel_children = ef.choose_edges_threshold(
+                            model, layer, threshold, embed=False
+                        )
+                        log_correlation_metrics_at_expansion(
+                            model, layer, finder_loader, device,
+                            sel_parents, sel_children, experiment, epoch
+                        )
+            else:
+                log_correlation_metrics_epoch(
+                    model, target_layer, finder_loader, device, experiment, epoch
+                )
+
+        if is_expansion_epoch:
             print("   -> Action: Expanding Model.")
             expanded, num_new = expand_model(model, ef, hyperparams["expansion_thresholds"])
           
