@@ -1,0 +1,940 @@
+<title>Какой граф нужен GNN</title>
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&display=swap">
+<style>
+:root{
+  --ground:#F5F7FA; --surface:#FFFFFF; --raised:#EEF1F6;
+  --ink:#12161D; --ink-2:#525C6B; --ink-3:#7C8697;
+  --rule:#D9DEE7; --rule-soft:#E7EBF1;
+  --align:#2547C8; --align-soft:#E7ECFC;
+  --rand:#7E8899; --rand-soft:#ECEEF2;
+  --mix:#7A5AA8; --mix-soft:#F0EBF7;
+  --alert:#A8461A; --alert-soft:#FBEDE5;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0E1218; --surface:#151A22; --raised:#1B212B;
+    --ink:#E9EDF3; --ink-2:#9BA5B4; --ink-3:#78828F;
+    --rule:#242C38; --rule-soft:#1E252F;
+    --align:#8AA3FF; --align-soft:#1A2340;
+    --rand:#828C9C; --rand-soft:#1D222B;
+    --mix:#B292E0; --mix-soft:#241D33;
+    --alert:#E59267; --alert-soft:#2E1E14;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0E1218; --surface:#151A22; --raised:#1B212B;
+  --ink:#E9EDF3; --ink-2:#9BA5B4; --ink-3:#78828F;
+  --rule:#242C38; --rule-soft:#1E252F;
+  --align:#8AA3FF; --align-soft:#1A2340;
+  --rand:#828C9C; --rand-soft:#1D222B;
+  --mix:#B292E0; --mix-soft:#241D33;
+  --alert:#E59267; --alert-soft:#2E1E14;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:"IBM Plex Serif",Georgia,serif; font-size:17px; line-height:1.65;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px;margin:0 auto;padding:clamp(28px,5vw,72px) clamp(18px,4vw,40px) 96px;}
+.col{max-width:64ch;}
+h1,h2,h3,.label,.tag,th,.meta{font-family:"IBM Plex Sans",system-ui,sans-serif;}
+h1{font-size:clamp(30px,4.6vw,46px);line-height:1.1;font-weight:600;letter-spacing:-.02em;
+   text-wrap:balance;margin:0 0 14px;}
+h2{font-size:clamp(21px,2.6vw,27px);line-height:1.2;font-weight:600;letter-spacing:-.01em;
+   text-wrap:balance;margin:0;}
+h3{font-size:17px;font-weight:600;margin:0 0 6px;letter-spacing:-.005em;}
+p{margin:0;}
+.col > * + *{margin-top:1.05em;}
+section{margin-top:clamp(44px,6vw,72px);}
+section > * + *{margin-top:22px;}
+.label{font-size:11.5px;letter-spacing:.13em;text-transform:uppercase;
+       color:var(--ink-3);font-weight:600;}
+.lede{font-size:19.5px;line-height:1.55;color:var(--ink-2);}
+.meta{font-size:13.5px;color:var(--ink-3);display:flex;flex-wrap:wrap;gap:6px 22px;
+      padding-top:16px;border-top:1px solid var(--rule);margin-top:22px;}
+.meta b{color:var(--ink-2);font-weight:600;}
+code,.mono,.num{font-family:"IBM Plex Mono",ui-monospace,monospace;
+                font-variant-numeric:tabular-nums;}
+code{font-size:.87em;background:var(--raised);padding:1px 5px;border-radius:3px;}
+em{font-style:italic;}
+strong{font-weight:600;}
+.scroll{overflow-x:auto;margin-inline:calc(-1 * clamp(18px,4vw,40px));
+        padding-inline:clamp(18px,4vw,40px);}
+table{border-collapse:collapse;width:100%;min-width:640px;font-size:14.5px;}
+th{font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);
+   font-weight:600;text-align:left;padding:0 14px 9px 0;border-bottom:1px solid var(--rule);
+   white-space:nowrap;}
+td{padding:8px 14px 8px 0;border-bottom:1px solid var(--rule-soft);vertical-align:baseline;}
+th.r,td.r{text-align:right;padding-right:0;}
+tr.hi td{background:var(--align-soft);}
+.gname{font-family:"IBM Plex Mono",monospace;font-size:13.5px;font-weight:500;white-space:nowrap;}
+.what{color:var(--ink-2);font-size:14px;}
+.num{font-size:14px;}
+.sd{color:var(--ink-3);font-size:12.5px;}
+.tag{display:inline-block;font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;
+     font-weight:600;padding:2px 7px;border-radius:3px;white-space:nowrap;}
+.t-align{background:var(--align-soft);color:var(--align);}
+.t-rand{background:var(--rand-soft);color:var(--rand);}
+.t-mix{background:var(--mix-soft);color:var(--mix);}
+.t-ref{background:var(--raised);color:var(--ink-3);}
+.bar{height:7px;border-radius:2px;min-width:2px;}
+.b-align{background:var(--align);} .b-rand{background:var(--rand);}
+.b-mix{background:var(--mix);} .b-ref{background:var(--ink-3);}
+.finding{border-left:3px solid var(--align);padding:2px 0 2px 20px;}
+.finding h3{color:var(--align);}
+.caveat{background:var(--alert-soft);border-radius:5px;padding:20px 24px;}
+.caveat h3{color:var(--alert);}
+.duo{display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
+     align-items:stretch;}
+.stat{background:var(--surface);border:1px solid var(--rule);border-radius:5px;padding:18px 20px;}
+.stat .k{font-family:"IBM Plex Mono",monospace;font-size:27px;font-weight:500;
+         letter-spacing:-.02em;line-height:1.1;font-variant-numeric:tabular-nums;}
+.stat .n{font-family:"IBM Plex Mono",monospace;font-size:13px;color:var(--ink-2);margin-top:7px;}
+.stat .d{font-size:13.5px;color:var(--ink-3);margin-top:3px;line-height:1.4;}
+figure{margin:0;}
+figure img{width:100%;height:auto;display:block;border:1px solid var(--rule);
+           border-radius:5px;background:#fff;}
+figcaption{font-family:"IBM Plex Sans",sans-serif;font-size:13.5px;color:var(--ink-3);
+           margin-top:10px;line-height:1.5;}
+ol,ul{margin:0;padding-left:1.3em;}
+li + li{margin-top:.5em;}
+hr{border:0;border-top:1px solid var(--rule);margin:0;}
+a{color:var(--align);}
+:focus-visible{outline:2px solid var(--align);outline-offset:2px;}
+@media print{
+  body{background:#fff;} .scroll{overflow:visible;}
+  /* Секции стали длинными - запрет на разрыв гонит их целиком на новую
+     страницу и оставляет пустые половины. Разрешаем рвать секцию, но
+     защищаем то, что рвать нельзя: врезки и заголовки. */
+  section{break-inside:auto;}
+  .caveat,.finding,.stat,.duo{break-inside:avoid;}
+  h1,h2,h3{break-after:avoid;}
+  li{break-inside:avoid;}
+  p{orphans:2;widows:2;}
+  /* На A4 таблица ужимается сильнее, чем на экране: заголовки колонок
+     слипаются, а полоски налезают на числа. Разводим явно. */
+  table{min-width:0;font-size:12.5px;}
+  th.r,td.r{padding-right:16px;}
+  th:last-child,td:last-child{padding-left:10px;}
+  .what{font-size:12px;}
+  .gname{font-size:12px;}
+  tr{break-inside:avoid;}
+  thead{display:table-header-group;}
+}
+</style>
+
+<div class="wrap">
+<div class="col">
+  <div class="label">Лабораторная работа · MNIST · графовые нейросети</div>
+  <h1 style="margin-top:12px">Какой граф нужен GNN</h1>
+  <p class="lede">Зафиксировали всё, кроме графа, перебрали 22 варианта связей
+  между пикселями и посмотрели, что будет с точностью.</p>
+  <div class="meta">
+    <span><b>22</b> варианта графа</span>
+    <span><b>5</b> запусков каждого</span>
+    <span><b>110</b> обучений</span>
+  </div>
+</div>
+
+<section>
+  <div class="col">
+    <div class="label">Что делали</div>
+    <h2>Меняли только связи между пикселями</h2>
+    <p>Каждый из 784 пикселей картинки — вершина графа. Ребро означает, что два
+    пикселя обмениваются информацией. Модель, число слоёв, скорость обучения,
+    разбиение данных — всё одинаковое во всех 110 запусках. Отличается только то,
+    <em>какие пиксели соединены</em>.</p>
+    <p>Пиксели заранее перемешаны, одинаково для всей выборки. Это нужно, чтобы
+    граф нельзя было построить по координатам: модель не знает, где какая вершина
+    на картинке.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="label">Если не знаком с GNN</div>
+    <h2>Свёртка, у которой соседей задаёшь ты</h2>
+    <p>Свёрточный слой в CNN смешивает пиксель с восемью соседями по сетке.
+    Кто чей сосед — вшито в архитектуру и поменять нельзя: сетка есть сетка.</p>
+    <p>Графовый слой делает ровно то же смешивание, но список соседей
+    приходит извне, отдельной таблицей: <em>матрицей смежности</em>. Строка
+    таблицы — вершина, единица на пересечении — «эти двое обмениваются
+    значениями».</p>
+
+    <h3 style="margin-top:26px">Что происходит внутри слоя, по шагам</h3>
+    <p>Возьмём один пиксель. Пусть его значение 0.7, а у четырёх его соседей по
+    решётке — 0.2, 0.9, 0.1 и 0.6.</p>
+    <ol style="margin-top:14px">
+      <li><strong>Усреднение с соседями.</strong> Складываем значение самой
+      вершины и её соседей, делим на их число:
+      <span class="mono">(0.7+0.2+0.9+0.1+0.6)/5 = 0.5</span>. Своё значение
+      входит в сумму — иначе вершина забывала бы саму себя. Это единственное
+      место, где вообще используется граф: он говорит, кого складывать.</li>
+
+      <li><strong>Умножение на обучаемые веса.</strong> Полученное число 0.5
+      умножается на вектор весов длины 64 — получается 64 числа вместо одного.
+      Это те самые параметры, которые учит градиентный спуск. На следующих
+      слоях у вершины уже 64 числа, и веса становятся матрицей 64×64.</li>
+
+      <li><strong>ReLU.</strong> Отрицательные значения обнуляются, как в
+      обычной сети.</li>
+    </ol>
+    <p style="margin-top:16px">После этого у каждой из 784 вершин лежит вектор
+    из 64 чисел. Слой закончен.</p>
+
+    <h3 style="margin-top:26px">Почему «три раунда обмена»</h3>
+    <p>После первого слоя вершина знает про себя и своих непосредственных
+    соседей. Но её соседи на том же слое узнали про <em>своих</em> соседей.
+    Поэтому на втором слое, усредняясь с ними, вершина получает информацию с
+    расстояния два. На третьем — с расстояния три.</p>
+    <p><strong>Число слоёв — это дальность, на которую информация расходится по
+    графу.</strong> Три слоя = три шага, дальше вершина не видит ничего.
+    Запомни это место: в конце отчёта оно окажется важнее, чем выглядит
+    сейчас.</p>
+    <p style="margin-top:16px">В самом конце все 784 вектора усредняются в один,
+    он идёт в обычный линейный слой на 10 классов. Это усреднение называется
+    readout, и из-за него порядок вершин не имеет значения — важный момент для
+    следующего раздела.</p>
+    <p>То есть матрица смежности играет в GNN ту же роль, что сетка в CNN.
+    Только её можно подменить. Вот мы и подменяли — 22 раза.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="label">Важно понять до таблицы</div>
+    <h2>Почему у лучшего графа 0.53, а не 0.98</h2>
+    <p>Первое, обо что спотыкаются: MNIST — это же решённая задача, откуда 53%?
+    Ответ в том, что <strong>модель не видит картинку</strong>. Она видит 784
+    вершины, у каждой ровно одно число, и никаких координат, номеров или
+    порядка.</p>
+    <p>Про «одно число» — MNIST чёрно-белый. Не фотография, а рукописная цифра:
+    28×28 точек, в каждой одно значение от 0 до 255. Ноль — чёрный фон, 255 —
+    белые чернила, между ними серое. Мы делим на 255, получается от 0 до 1:
+    <em>насколько эта точка закрашена</em>. У цветной картинки было бы три
+    числа на пиксель (R, G, B), и у вершины был бы вектор из трёх — но у нас
+    именно одно. Для масштаба: 81% всех пикселей MNIST — ровно ноль, пустой
+    фон.</p>
+    <p>Сравни с обычным MLP. У него на каждый пиксель своя строчка весов, то
+    есть он знает, что «пиксель №451» — это конкретный пиксель, всегда один и
+    тот же. Отсюда его 0.98.</p>
+    <p>У графовой сети такого нет по построению: слой перестановочно
+    эквивариантен, а в конце все вершины усредняются. Перенумеруй вершины
+    вместе с графом — ответ не изменится ни на бит. Значит отличить вершину от
+    вершины модель может <strong>только по тому, как та связана с остальными</strong>.</p>
+    <div class="finding" style="margin-top:22px">
+      <h3>Отсюда и весь смысл работы</h3>
+      <p>Граф — единственный источник различий между вершинами. Плохой граф не
+      просто «чуть хуже»: он оставляет модель без информации о том, кто есть
+      кто. Поэтому шкала и получается такой широкой, от 0.23 до 0.53.</p>
+    </div>
+    <h3 style="margin-top:26px">Две границы шкалы предсказаны заранее — и сошлись</h3>
+    <p>Прежде чем что-то запускать, две точки шкалы считаются на бумаге.</p>
+    <p><strong>Граф без рёбер.</strong> Вершины ни с кем не общаются, усреднять
+    не с кем. Модель получает 784 числа без всякой привязки к тому, где какое
+    находится. Всё, что из них извлекается, — <em>сколько точек какой яркости
+    встретилось</em>: столько-то чёрных, столько-то серых, столько-то белых.
+    Гистограмма значений, без позиций.</p>
+    <p><strong>Полный граф.</strong> Каждая вершина усредняется со всеми 783
+    остальными, то есть все получают одно и то же число — среднее по картинке.
+    После первого же слоя вершины неразличимы, и модель может опираться только
+    на <em>среднюю закрашенность</em>: сколько всего чернил ушло на цифру.</p>
+    <p>Это правда немного разделяет классы. Единица — самая «худая» цифра, у неё
+    закрашено в среднем 7.6% площади; ноль самый «жирный», 17.3%. Но спутать по
+    такому признаку можно почти всё.</p>
+
+    <div class="finding" style="margin-top:22px">
+      <h3>Проверка, не зависящая от нашего кода</h3>
+      <p>Оба предсказания проверяются в обход графовой сети целиком: обучить
+      обычную логистическую регрессию ровно на тех признаках, к которым, по
+      нашей теории, сводится модель.</p>
+      <div class="scroll">
+      <table style="min-width:0;margin-top:14px;font-size:14px">
+        <thead><tr><th>что подали на вход</th><th class="r">регрессия</th><th class="r">наш GNN</th></tr></thead>
+        <tbody>
+          <tr><td>только средняя закрашенность, 1 число</td>
+              <td class="r"><span class="num">0.2135</span></td>
+              <td class="r"><span class="num">0.2299</span> <span class="sd">complete</span></td></tr>
+          <tr><td>только гистограмма яркостей, 16 корзин</td>
+              <td class="r"><span class="num">0.3162</span></td>
+              <td class="r"><span class="num">0.3081</span> <span class="sd">empty</span></td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p style="margin-top:14px">Совпадение в пределах пункта, причём считалось
+      совсем другим кодом. Это и был первый тест всей работы: не сойдись
+      границы шкалы там, где предсказано, дальше идти было бы нельзя — значит
+      где-то ошибка, и все 110 запусков мерили бы её.</p>
+    </div>
+
+    <div class="col caveat" style="margin-top:24px">
+      <h3>Если ты видел ChebNet и удивился цифре</h3>
+      <p>В классической статье Defferrard 2016 пиксели MNIST тоже вершины
+      графа, и точность там около 99%. Разница не в удаче: там модели
+      <em>возвращают</em> знание о том, где какая вершина. Фильтры богаче,
+      есть огрубление графа, а в конце полносвязная голова, работающая с
+      вершинами по их номерам.</p>
+      <p>Мы это выключили намеренно. Как только у модели появляется способ
+      узнать вершину в обход графа, эксперимент теряет смысл: непонятно, что
+      даёт граф, а что — номера. Поэтому здесь нет ни позиционных кодировок,
+      ни номеров вершин, а readout — простое среднее. <strong>Низкая точность
+      тут не недостаток, а условие задачи.</strong></p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="label">Откуда 22 варианта</div>
+    <h2>Каждая группа отвечает на свой вопрос</h2>
+    <p>Графы не набирались наугад. Они разбиты на группы, и каждая закрывает
+    отдельное возражение к выводам.</p>
+
+    <h3 style="margin-top:26px">Оракулы — знают правильный ответ</h3>
+    <p><code>grid4</code>: пиксель соединён с четырьмя соседями — сверху, снизу,
+    слева, справа. Настоящая решётка 28×28. Строится по координатам, которые
+    модели неизвестны, поэтому это не метод, а <em>верхняя отметка по
+    структуре</em>: столько даёт знание правильного ответа.</p>
+    <p><code>grid8</code>: то же плюс четыре диагонали. Вдвое больше рёбер, и
+    появляются треугольники — у решётки из четырёх соседей их нет вообще.</p>
+
+    <h3 style="margin-top:26px">Честные — строятся только по данным</h3>
+    <p><code>knn_corr_k8</code>: для каждого пикселя считаем корреляцию его
+    яркости с яркостью каждого другого пикселя по 55 000 обучающих картинок.
+    Берём восемь самых скоррелированных и проводим рёбра. Координат метод не
+    знает вовсе — только то, какие пиксели зажигаются вместе.</p>
+    <p>Получается похоже на решётку, но не решётка: соседние пиксели правда
+    коррелируют (чернила непрерывны), зато метод дополнительно связывает
+    далёкие места, которые срабатывают одновременно. Степени выходят неровные —
+    от 0 до 16 при средней 8.8.</p>
+    <p><code>thr_corr</code>: тот же принцип, но вместо «по восемь на каждого»
+    берём глобальный порог на корреляцию, подобранный так, чтобы рёбер вышло
+    ровно столько же, сколько у <code>grid4</code>. Честное сравнение по числу
+    связей, но структура совсем другая: у кого-то 12 соседей, у кого-то ни
+    одного.</p>
+    <div class="col caveat" style="margin-top:18px">
+      <h3>Мёртвые пиксели</h3>
+      <p>69 пикселей по краям картинки чёрные <em>на всех</em> обучающих
+      примерах. У постоянной величины корреляция не определена — делить на
+      нулевой разброс нельзя. Такие пиксели остаются одинокими вершинами без
+      единого ребра, и потому у всех honest-графов не одна связная компонента,
+      а 70. У <code>thr_corr</code> и вовсе 152 одиночки. Это не баг, это
+      свойство данных, и оно честно попадает в таблицу.</p>
+    </div>
+
+    <h3 style="margin-top:26px">Контроли — те же рёбра, но случайные</h3>
+    <p>Без них любое «граф X помогает» ничего не значит: может, дело просто в
+    количестве связей. Правило было жёстким — ни одно утверждение не
+    принимается без контроля, согласованного по плотности.</p>
+    <p><code>er_grid4</code>: берём ровно 1512 случайных пар вершин, как у
+    решётки. Никакой структуры.</p>
+    <p><code>regular4</code>: случайный граф, но у <em>каждой</em> вершины ровно
+    по 4 соседа. Отвечает на возражение «может, дело в том, что у решётки
+    степени ровные».</p>
+    <p><code>config_knn8</code>: берём распределение степеней от
+    <code>knn_corr_k8</code> — кто сколько имел соседей — и перетасовываем рёбра
+    случайно, сохраняя эти числа. Отвечает на «может, дело в том, что у части
+    пикселей связей много, а у части мало».</p>
+    <p><code>grid4_misaligned</code> — <strong>главный контроль всей работы</strong>.
+    Берём решётку и переклеиваем её к вершинам по случайной перестановке.
+    Рёбра те же, узор тот же, поменялось только то, какой пиксель сидит в какой
+    вершине.</p>
+
+    <h3 style="margin-top:26px">Кривая деградации — плавный переход</h3>
+    <p><code>ws_p005</code> … <code>ws_p1</code>: берём решётку и переставляем
+    долю рёбер — 5%, 10%, 25%, 50%, 100%. Перестановка двойная, парами, поэтому
+    число соседей у каждой вершины сохраняется <em>точно</em>: было 4, осталось
+    4. Меняется ровно одно — насколько связи локальны.</p>
+    <p>Это не точка, а кривая, и она самая наглядная во всей таблице: 0.43 →
+    0.41 → 0.37 → 0.32 → 0.30 по мере разрушения локальности.</p>
+
+    <h3 style="margin-top:26px">Патологии — задают нижнюю часть шкалы</h3>
+    <p><code>star</code>: одна центральная вершина соединена со всеми
+    остальными 783, больше рёбер нет. <code>path</code>: все 784 вершины в одну
+    длинную цепочку. <code>blocks</code>: кластеризуем пиксели по корреляции,
+    внутри каждого кластера соединяем всех со всеми, между кластерами — пусто.
+    Нужны, чтобы шкалу задавали и снизу, и чтобы не было соблазна выкинуть
+    неудобного кандидата.</p>
+
+    <h3 style="margin-top:30px">Как они выглядят в числах</h3>
+    <div class="scroll">
+    <table style="margin-top:12px">
+      <thead><tr>
+        <th>граф</th><th class="r">рёбер</th><th class="r">соседей<br>в среднем</th>
+        <th class="r">разброс<br>степеней</th><th class="r">одиноких<br>вершин</th>
+        <th class="r">треуголь-<br>ников</th><th class="r">диаметр</th>
+      </tr></thead>
+      <tbody>
+        <tr class="hi"><td><span class="gname">grid4</span></td><td class="r"><span class="num">1512</span></td><td class="r"><span class="num">3.9</span></td><td class="r"><span class="num">0.36</span></td><td class="r"><span class="num">0</span></td><td class="r"><span class="num">0.000</span></td><td class="r"><span class="num">54</span></td></tr>
+        <tr class="hi"><td><span class="gname">grid4_misaligned</span></td><td class="r"><span class="num">1512</span></td><td class="r"><span class="num">3.9</span></td><td class="r"><span class="num">0.36</span></td><td class="r"><span class="num">0</span></td><td class="r"><span class="num">0.000</span></td><td class="r"><span class="num">54</span></td></tr>
+        <tr><td><span class="gname">er_grid4</span></td><td class="r"><span class="num">1512</span></td><td class="r"><span class="num">3.9</span></td><td class="r"><span class="num">1.93</span></td><td class="r"><span class="num">17</span></td><td class="r"><span class="num">0.003</span></td><td class="r"><span class="num">10</span></td></tr>
+        <tr><td><span class="gname">grid8</span></td><td class="r"><span class="num">2970</span></td><td class="r"><span class="num">7.6</span></td><td class="r"><span class="num">1.07</span></td><td class="r"><span class="num">0</span></td><td class="r"><span class="num">0.454</span></td><td class="r"><span class="num">27</span></td></tr>
+        <tr><td><span class="gname">knn_corr_k8</span></td><td class="r"><span class="num">3456</span></td><td class="r"><span class="num">8.8</span></td><td class="r"><span class="num">3.16</span></td><td class="r"><span class="num">69</span></td><td class="r"><span class="num">0.440</span></td><td class="r"><span class="num">13</span></td></tr>
+        <tr><td><span class="gname">thr_corr</span></td><td class="r"><span class="num">1512</span></td><td class="r"><span class="num">3.9</span></td><td class="r"><span class="num">3.00</span></td><td class="r"><span class="num">152</span></td><td class="r"><span class="num">0.204</span></td><td class="r"><span class="num">34</span></td></tr>
+        <tr><td><span class="gname">regular4</span></td><td class="r"><span class="num">1568</span></td><td class="r"><span class="num">4.0</span></td><td class="r"><span class="num">0.00</span></td><td class="r"><span class="num">0</span></td><td class="r"><span class="num">0.006</span></td><td class="r"><span class="num">8</span></td></tr>
+        <tr><td><span class="gname">star</span></td><td class="r"><span class="num">783</span></td><td class="r"><span class="num">2.0</span></td><td class="r"><span class="num">27.9</span></td><td class="r"><span class="num">0</span></td><td class="r"><span class="num">0.000</span></td><td class="r"><span class="num">2</span></td></tr>
+        <tr><td><span class="gname">path</span></td><td class="r"><span class="num">783</span></td><td class="r"><span class="num">2.0</span></td><td class="r"><span class="num">0.05</span></td><td class="r"><span class="num">0</span></td><td class="r"><span class="num">0.000</span></td><td class="r"><span class="num">783</span></td></tr>
+        <tr><td><span class="gname">blocks</span></td><td class="r"><span class="num">51762</span></td><td class="r"><span class="num">132.0</span></td><td class="r"><span class="num">125.0</span></td><td class="r"><span class="num">0</span></td><td class="r"><span class="num">1.000</span></td><td class="r"><span class="num">1</span></td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p style="margin-top:14px" class="what">«Разброс степеней» — насколько
+    неровно распределены соседи: 0 значит у всех поровну. «Треугольников» —
+    доля замкнутых троек, у решётки их нет вообще, у клик единица. «Диаметр» —
+    сколько шагов между двумя самыми далёкими вершинами.</p>
+
+    <div class="finding" style="margin-top:24px">
+      <h3>Две вещи, которые видно прямо из таблицы</h3>
+      <p><strong>Первые две строки совпадают полностью.</strong>
+      <code>grid4</code> и <code>grid4_misaligned</code> — по всем шести
+      колонкам одно и то же, включая диаметр 54 и полное отсутствие
+      треугольников. Это не совпадение, а следствие того, что второй получен из
+      первого перенумерацией. А точность у них 0.49 и 0.30.</p>
+      <p><strong>А вот <code>er_grid4</code> — другой граф.</strong> Рёбер
+      столько же, но диаметр 10 вместо 54, степени разбросаны впятеро сильнее,
+      появились одинокие вершины. Поэтому одного случайного контроля мало: он
+      отличается от решётки и по структуре тоже, и непонятно, что именно
+      сработало. Изоморфная пара такой лазейки не оставляет.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="label">Результаты</div>
+    <h2>Все 22 варианта, по убыванию точности</h2>
+    <p><span style="color:var(--align)">Синие</span> полоски — графы, соединяющие
+    похожие пиксели, <span style="color:var(--rand)">серые</span> — случайные,
+    <span style="color:var(--mix)">фиолетовые</span> — промежуточные.
+    Верхняя строка <code>mlp</code> — обычная нейросеть без графа, она стоит здесь
+    как верхняя отметка шкалы.</p>
+  </div>
+  <div class="scroll">
+    <table>
+      <thead><tr>
+        <th>граф</th><th>что это</th><th class="r">accuracy</th>
+        <th class="r">macro-F1</th><th></th>
+      </tr></thead>
+      <tbody><tr>
+<td><span class="gname">mlp</span></td>
+<td class="what">обычная нейросеть без графа</td>
+<td class="r"><span class="num">0.9840</span>
+    <span class="sd">±0.0009</span></td>
+<td class="r"><span class="num">0.9838</span></td>
+<td style="width:200px"><div class="bar b-ref" style="width:187px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">grid8</span></td>
+<td class="what">решётка: пиксель и 8 соседей</td>
+<td class="r"><span class="num">0.5303</span>
+    <span class="sd">±0.0161</span></td>
+<td class="r"><span class="num">0.4987</span></td>
+<td style="width:200px"><div class="bar b-align" style="width:101px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">knn_corr_k16</span></td>
+<td class="what">16 самых похожих пикселей</td>
+<td class="r"><span class="num">0.5243</span>
+    <span class="sd">±0.0155</span></td>
+<td class="r"><span class="num">0.5064</span></td>
+<td style="width:200px"><div class="bar b-align" style="width:100px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">knn_corr_k8</span></td>
+<td class="what">8 самых похожих пикселей</td>
+<td class="r"><span class="num">0.5202</span>
+    <span class="sd">±0.0065</span></td>
+<td class="r"><span class="num">0.4962</span></td>
+<td style="width:200px"><div class="bar b-align" style="width:99px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">thr_corr</span></td>
+<td class="what">самые похожие пары пикселей</td>
+<td class="r"><span class="num">0.5051</span>
+    <span class="sd">±0.0142</span></td>
+<td class="r"><span class="num">0.4778</span></td>
+<td style="width:200px"><div class="bar b-align" style="width:96px"></div></td>
+</tr>
+<tr class="hi">
+<td><span class="gname">grid4</span></td>
+<td class="what">решётка: пиксель и 4 соседа</td>
+<td class="r"><span class="num">0.4942</span>
+    <span class="sd">±0.0102</span></td>
+<td class="r"><span class="num">0.4583</span></td>
+<td style="width:200px"><div class="bar b-align" style="width:94px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">knn_corr_k4</span></td>
+<td class="what">4 самых похожих пикселя</td>
+<td class="r"><span class="num">0.4855</span>
+    <span class="sd">±0.0158</span></td>
+<td class="r"><span class="num">0.4584</span></td>
+<td style="width:200px"><div class="bar b-align" style="width:92px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">ws_p005</span></td>
+<td class="what">решётка, 5% рёбер переставлено</td>
+<td class="r"><span class="num">0.4259</span>
+    <span class="sd">±0.0149</span></td>
+<td class="r"><span class="num">0.3968</span></td>
+<td style="width:200px"><div class="bar b-mix" style="width:81px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">ws_p01</span></td>
+<td class="what">решётка, 10% рёбер переставлено</td>
+<td class="r"><span class="num">0.4147</span>
+    <span class="sd">±0.0114</span></td>
+<td class="r"><span class="num">0.3780</span></td>
+<td style="width:200px"><div class="bar b-mix" style="width:79px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">blocks</span></td>
+<td class="what">кластеры похожих пикселей</td>
+<td class="r"><span class="num">0.3842</span>
+    <span class="sd">±0.0018</span></td>
+<td class="r"><span class="num">0.3689</span></td>
+<td style="width:200px"><div class="bar b-mix" style="width:73px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">ws_p025</span></td>
+<td class="what">решётка, 25% рёбер переставлено</td>
+<td class="r"><span class="num">0.3712</span>
+    <span class="sd">±0.0058</span></td>
+<td class="r"><span class="num">0.3372</span></td>
+<td style="width:200px"><div class="bar b-mix" style="width:71px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">er_grid4</span></td>
+<td class="what">случайный граф, рёбер как у решётки</td>
+<td class="r"><span class="num">0.3314</span>
+    <span class="sd">±0.0207</span></td>
+<td class="r"><span class="num">0.2846</span></td>
+<td style="width:200px"><div class="bar b-rand" style="width:63px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">path</span></td>
+<td class="what">вершины в одну цепочку</td>
+<td class="r"><span class="num">0.3199</span>
+    <span class="sd">±0.0066</span></td>
+<td class="r"><span class="num">0.2795</span></td>
+<td style="width:200px"><div class="bar b-rand" style="width:61px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">ws_p05</span></td>
+<td class="what">решётка, 50% рёбер переставлено</td>
+<td class="r"><span class="num">0.3193</span>
+    <span class="sd">±0.0139</span></td>
+<td class="r"><span class="num">0.2842</span></td>
+<td style="width:200px"><div class="bar b-mix" style="width:61px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">star</span></td>
+<td class="what">все вершины к одной центральной</td>
+<td class="r"><span class="num">0.3128</span>
+    <span class="sd">±0.0201</span></td>
+<td class="r"><span class="num">0.2609</span></td>
+<td style="width:200px"><div class="bar b-rand" style="width:59px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">empty</span></td>
+<td class="what">граф без рёбер</td>
+<td class="r"><span class="num">0.3081</span>
+    <span class="sd">±0.0029</span></td>
+<td class="r"><span class="num">0.2639</span></td>
+<td style="width:200px"><div class="bar b-ref" style="width:59px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">ws_p1</span></td>
+<td class="what">решётка, 100% рёбер переставлено</td>
+<td class="r"><span class="num">0.3047</span>
+    <span class="sd">±0.0141</span></td>
+<td class="r"><span class="num">0.2604</span></td>
+<td style="width:200px"><div class="bar b-mix" style="width:58px"></div></td>
+</tr>
+<tr class="hi">
+<td><span class="gname">grid4_misaligned</span></td>
+<td class="what">решётка, приклеенная к случайным пикселям</td>
+<td class="r"><span class="num">0.2988</span>
+    <span class="sd">±0.0095</span></td>
+<td class="r"><span class="num">0.2487</span></td>
+<td style="width:200px"><div class="bar b-rand" style="width:57px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">regular4</span></td>
+<td class="what">случайный граф, у всех по 4 соседа</td>
+<td class="r"><span class="num">0.2927</span>
+    <span class="sd">±0.0085</span></td>
+<td class="r"><span class="num">0.2503</span></td>
+<td style="width:200px"><div class="bar b-rand" style="width:56px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">config_knn8</span></td>
+<td class="what">случайный граф с теми же степенями</td>
+<td class="r"><span class="num">0.2815</span>
+    <span class="sd">±0.0044</span></td>
+<td class="r"><span class="num">0.2272</span></td>
+<td style="width:200px"><div class="bar b-rand" style="width:53px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">er_knn8</span></td>
+<td class="what">случайный граф, рёбер как у knn_corr_k8</td>
+<td class="r"><span class="num">0.2756</span>
+    <span class="sd">±0.0038</span></td>
+<td class="r"><span class="num">0.2238</span></td>
+<td style="width:200px"><div class="bar b-rand" style="width:52px"></div></td>
+</tr>
+<tr>
+<td><span class="gname">complete</span></td>
+<td class="what">все вершины соединены со всеми</td>
+<td class="r"><span class="num">0.2299</span>
+    <span class="sd">±0.0017</span></td>
+<td class="r"><span class="num">0.1594</span></td>
+<td style="width:200px"><div class="bar b-ref" style="width:44px"></div></td>
+</tr></tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="label">Что получилось</div>
+    <h2>Три вывода</h2>
+  </div>
+  <div class="col" style="display:flex;flex-direction:column;gap:24px">
+    <div class="finding">
+      <h3>1. Граф решает очень много</h3>
+      <p>От <span class="mono">0.23</span> до <span class="mono">0.53</span> при
+      полностью одинаковой модели.</p>
+    </div>
+    <div class="finding">
+      <h3>2. Важно не количество рёбер, а какие они</h3>
+      <p>Случайный граф с тем же числом рёбер, что у решётки, даёт
+      <span class="mono">0.33</span> — не лучше, чем вообще без графа
+      (<span class="mono">0.31</span>).</p>
+    </div>
+    <div class="finding">
+      <h3>3. Слишком много связей хуже, чем ничего</h3>
+      <p>Полный граф — <span class="mono">0.23</span>, худший результат. Когда каждая
+      вершина слушает всех, они усредняются и становятся неразличимы: остаётся
+      только средняя яркость картинки.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="label">Самое наглядное</div>
+    <h2>Один и тот же граф, разница в 20 пунктов</h2>
+  </div>
+  <div class="duo">
+    <div class="stat">
+      <div class="k" style="color:var(--align)">0.4942</div>
+      <div class="n">grid4</div>
+      <div class="d">Решётка, подключённая правильно: соседи по графу — соседи
+      по картинке.</div>
+    </div>
+    <div class="stat">
+      <div class="k" style="color:var(--rand)">0.2988</div>
+      <div class="n">grid4_misaligned</div>
+      <div class="d">Та же решётка, подключённая к пикселям в случайном порядке.</div>
+    </div>
+  </div>
+  <div class="col">
+    <p>Второй граф получен из первого одной операцией: вершины переставили
+    случайным образом, а рёбра оставили те же. Как если бы схему рассадки в
+    классе не трогали, но студентов рассадили в другом порядке. Схема та же —
+    класс работает иначе.</p>
+    <p>Совпадает у них <strong>всё, что можно посчитать по одной матрице
+    смежности</strong>: 1512 рёбер, у каждой вершины ровно столько же соседей,
+    та же связность, тот же диаметр, тот же спектр, тот же коэффициент
+    кластеризации. Не «примерно те же» — побитово те же, и это гарантировано
+    самой конструкцией, а не совпадением.</p>
+    <p>А точность отличается на 19.5 пункта. Разрыв огромный по меркам
+    статистики: t-тест даёт p = 1.2·10⁻⁹ при пяти запусках, размер эффекта
+    почти двадцать сигм. Это не шум.</p>
+
+    <div class="finding" style="margin-top:24px">
+      <h3>Почему это важнее, чем кажется</h3>
+      <p>Хочется найти формулу «хорошести» графа: посчитать что-нибудь по
+      матрице смежности и заранее узнать, сработает ли этот граф. Желание
+      понятное — иначе приходится обучать по модели на каждый вариант, а это
+      часы. Кандидатов в такую формулу много: спектральная щель, доля
+      треугольников, разброс степеней, диаметр.</p>
+
+      <p><strong>Шаг первый.</strong> Любая такая формула по определению
+      берёт на вход <em>только матрицу смежности</em>. Больше ей ничего не
+      дано — ни картинок, ни того, какой пиксель где.</p>
+
+      <p><strong>Шаг второй.</strong> Перенумеровать вершины — значит записать
+      тот же самый граф по-другому. Как переставить строки и столбцы в
+      таблице: содержимое не изменилось, изменилась запись. Поэтому любая
+      формула, считающая «свойство графа», обязана давать на обеих записях
+      <em>одно и то же число</em>. Иначе она мерила бы не граф, а порядок
+      строк.</p>
+
+      <p><strong>Шаг третий.</strong> У нас есть ровно такая пара:
+      <code>grid4</code> и <code>grid4_misaligned</code> — один граф в двух
+      записях. Значит любая формула выдаёт на них одинаковое значение. Мы это и
+      видим в таблице выше: все шесть колонок совпадают до последнего знака.</p>
+
+      <p><strong>Шаг четвёртый.</strong> А качество разное: 0.49 и 0.30.</p>
+
+      <p style="margin-top:16px">Получается, что на одном и том же входе нужны
+      два разных выхода. Функция так не умеет — это противоречие, а не
+      сложность. Следовательно <strong>формулы, предсказывающей качество по
+      одному только графу, не существует</strong>. Не «мы её пока не нашли» —
+      её не может быть, и это доказано одним примером, как контрпример
+      опровергает теорему.</p>
+
+      <p style="margin-top:16px">Что делать вместо этого. Смотреть надо не на
+      граф, а на <em>пару «граф и данные»</em>. Вопрос «соединяет ли это ребро
+      похожие пиксели?» по одной матрице смежности не решается — нужны ещё сами
+      картинки. Такая величина уже не свойство графа, а свойство их
+      совместимости, и на неё запрет не распространяется.</p>
+
+      <p style="margin-top:16px">Мы такую величину и попробовали — гладкость
+      сигнала на графе. Как критерий выбора она не сработала, об этом ниже. Но
+      искать надо именно там: направление «померить один только граф» закрыто
+      окончательно.</p>
+</div>
+
+    <p style="margin-top:24px">Есть и побочное наблюдение, которое стоит
+    отдельного внимания. <code>knn_corr_k8</code> — граф, построенный на одних
+    корреляциях по обучающей выборке, ничего не знающий про геометрию
+    картинки — дал <span class="mono">0.52</span> против <span class="mono">0.49</span>
+    у настоящей решётки. Честный метод обошёл оракула.</p>
+    <p>То есть решётка не оптимальна для графовой сети даже тогда, когда
+    геометрия известна точно. <strong>Почему — мы не знаем.</strong> Одно
+    объяснение проверили и отвергли, о нём ниже.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2>Что проверяли и отвергли</h2>
+    <p style="margin-top:8px">Два объяснения выглядели убедительно и не пережили
+    проверку. Обоим место здесь, а не в столе: они очерчивают границу того, что
+    работа утверждает.</p>
+
+    <h3 style="margin-top:18px">Гладкость сигнала как критерий выбора графа — нет</h3>
+    <p>Ожидалось, что качество предсказывается энергией Дирихле: свёртка работает как
+    фильтр низких частот, значит хорош граф, на котором соседи держат похожие значения.
+    По всем 22 кандидатам корреляция сильная, &minus;0.795. Но держится она целиком на
+    вырожденных графах: стоит оставить шесть осмысленных, и знак
+    <strong>переворачивается на +0.543</strong>. То есть величина отличает граф от
+    мусора, но выбрать лучший из двух нормальных графов ею нельзя — а нужно именно это.</p>
+
+    <h3 style="margin-top:18px">Симметрия решётки как причина ошибок — нет</h3>
+    <p>У решётки 28&times;28 восемь симметрий, и GNN на ней математически обязан давать
+    одинаковый ответ на цифру и на неё же, повёрнутую на 180&deg;. Теорема верна и
+    проверена точно: ответ совпадает побитово. Казалось, отсюда и путаница 6 с 9,
+    которой у решётки в 64 раза больше, чем у обычного MLP.</p>
+    <p>Проверка прямым контролем это отвергла. Модель, <em>насильно</em> сделанная
+    точно инвариантной к этим восьми симметриям, даёт путаницу 1.39 — вдвое меньше, чем
+    3.21 у решётки. И ошибается она на других парах: 2 с 5, а не 6 с 9. Механизм даёт
+    меньше половины эффекта и бьёт не туда. Цена самой инвариантности при этом
+    измерена и невелика: 2.07 пункта на MNIST.</p>
+
+    <p style="margin-top:14px"><strong>Общее у обоих провалов:</strong> гипотезу
+    придумывали, уже глядя в таблицу. Отсюда правило на дальнейшее — формулировка и
+    критерий подтверждения фиксируются письменно до того, как посмотришь в данные.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col caveat">
+    <h3>Что стоит оговорить</h3>
+    <p style="margin-top:8px">Обучали 150 эпох, и у 15 кандидатов из 22 лучший
+    результат пришёлся на эпохи 136–146 — впритык к концу. При более долгом обучении
+    их числа были бы выше, так что это нижние оценки. На сравнение не влияет: бюджет
+    одинаковый у всех.</p>
+    <p style="margin-top:10px">Все числа получены при <strong>трёх слоях</strong>, и
+    это не нейтральный выбор. За три шага решётка видит 23 пикселя из 784, а плотный
+    случайный граф — 462. Разным графам нужна разная глубина, чтобы охватить картинку:
+    решётке 31 слой, случайному 4. Так что таблица сравнивает графы в режиме, который
+    одним подходит, а другим нет. Это следующее, что проверяется.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="label">Связь с работой лаборатории</div>
+    <h2>Тот же вопрос, что в статье про SSONN</h2>
+    <p>В статье лаборатории про SSONN сеть наращивается локально: по градиентам
+    выбираются отдельные рёбра вычислительного графа, и в эти места вставляются
+    новые нейроны. Главный вопрос там — <em>правда ли критерий выбирает нужные
+    рёбра</em>, или сгодились бы любые.</p>
+    <p>Наша лабораторная проверяет ровно это, только в чистом виде: архитектура
+    зафиксирована, меняется только набор рёбер. Ответ однозначный — выбор рёбер
+    решает почти всё. Случайный набор того же размера даёт
+    <span class="mono">0.33</span>, то есть не лучше, чем вообще без рёбер
+    (<span class="mono">0.31</span>).</p>
+    <p>Графы при этом разные по смыслу: у нас — над пикселями, в статье — над
+    вычислениями сети. Числа между работами не переносятся, совпадает только
+    способ проверки.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="label">Продолжение</div>
+    <h2>Проверка на данных, где правильный ответ известен</h2>
+    <p>У всего выше есть общая слабость: на MNIST истинного графа не
+    существует. Решётка — разумное предположение, но не факт, и граф по
+    корреляциям её обходит. Значит фразу «метод нашёл структуру» там можно
+    сказать только приблизительно.</p>
+    <p>Поэтому был сделан генератор, где граф задаём мы сами. Класс объекта —
+    <em>число связных пятен</em> активных вершин. Хитрость в том, что в каждом
+    объекте ровно 24 активные вершины со значением 1, независимо от класса:
+    <strong>гистограмма значений одинакова по построению</strong>, и различить
+    классы можно исключительно по расположению на графе.</p>
+
+    <div class="duo" style="margin-top:20px">
+      <div class="stat">
+        <div class="k" style="color:var(--align)">0.669</div>
+        <div class="n">истинный граф</div>
+      </div>
+      <div class="stat">
+        <div class="k" style="color:var(--rand)">0.243</div>
+        <div class="n">случайный и пустой</div>
+        <div class="d">случайное угадывание на четырёх классах — 0.250</div>
+      </div>
+    </div>
+    <p style="margin-top:20px">Без графа — ровно угадывание, как и предсказано
+    конструкцией. Это чище, чем MNIST, где даже пустой граф даёт 0.31 за счёт
+    гистограммы яркостей.</p>
+
+    <h3 style="margin-top:26px">Сколько рёбер настоящего графа находят разные методы</h3>
+    <p>Здесь это измеримо точно, и без всякого обучения сети.</p>
+    <div class="scroll">
+    <table style="margin-top:12px">
+      <thead><tr><th>способ</th><th class="r">точность</th>
+        <th class="r">полнота</th><th class="r">F1</th>
+        <th class="r">устойчивость</th></tr></thead>
+      <tbody>
+        <tr class="hi"><td><span class="gname">knn_corr_k4</span></td>
+          <td class="r"><span class="num">0.849</span></td>
+          <td class="r"><span class="num">1.000</span></td>
+          <td class="r"><span class="num">0.918</span></td>
+          <td class="r"><span class="num">0.915</span></td></tr>
+        <tr><td><span class="gname">thr_corr</span></td>
+          <td class="r"><span class="num">0.875</span></td>
+          <td class="r"><span class="num">0.875</span></td>
+          <td class="r"><span class="num">0.875</span></td>
+          <td class="r"><span class="num">0.754</span></td></tr>
+        <tr><td><span class="gname">emb_learned_k4</span></td>
+          <td class="r"><span class="num">0.672</span></td>
+          <td class="r"><span class="num">0.909</span></td>
+          <td class="r"><span class="num">0.773</span></td>
+          <td class="r"><span class="num">0.689</span></td></tr>
+        <tr><td><span class="gname">grad_sim_k4</span></td>
+          <td class="r"><span class="num">0.244</span></td>
+          <td class="r"><span class="num">0.394</span></td>
+          <td class="r"><span class="num">0.301</span></td>
+          <td class="r"><span class="num">0.116</span></td></tr>
+        <tr><td><span class="gname">случайный граф</span></td>
+          <td class="r"><span class="num">0.026</span></td>
+          <td class="r"><span class="num">0.061</span></td>
+          <td class="r"><span class="num">0.036</span></td>
+          <td class="r"><span class="sd">—</span></td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p style="margin-top:14px" class="what">«Устойчивость» — насколько совпадают
+    графы, построенные по двум непересекающимся половинам выборки.</p>
+
+    <div class="finding" style="margin-top:24px">
+      <h3>Простая корреляция выигрывает у всего остального</h3>
+      <p>Обычный kNN по корреляциям находит <strong>все</strong> настоящие
+      рёбра при точности 0.85 — почти решает задачу восстановления структуры.
+      Два более изощрённых метода ему проиграли.</p>
+      <p><strong>Обучаемые эмбеддинги признаков</strong> дали 0.773 против
+      0.918. Ожидание было обратным: низкий ранг должен был давить ложные
+      корреляции редких признаков.</p>
+      <p><strong>Граф по градиентам модели</strong> провалился глубоко: полнота
+      0.394, то есть он не находит и половины настоящих связей. Причину видно по
+      устойчивости 0.116 — на двух половинах данных метод даёт почти
+      непересекающиеся графы, то есть ловит шум обучения, а не структуру.</p>
+    </div>
+
+    <h3 style="margin-top:26px">Наращивать число соседей вредно</h3>
+    <p>Полнота упирается в единицу уже при четырёх соседях — все настоящие
+    рёбра найдены. Дальше растёт исключительно число ложных:</p>
+    <p class="mono" style="margin-top:10px">k=4 → F1 0.918 &nbsp;·&nbsp; k=8 → 0.601 &nbsp;·&nbsp; k=16 → 0.345</p>
+    <p style="margin-top:10px">Одинаково у всех методов. Значит число соседей
+    надо выбирать по точности, а не наращивать. Оговорка: истинный граф здесь —
+    решётка со средней степенью 3.7, поэтому четвёрка попадает в неё почти
+    точно; на графах с другой степенью надо перепроверять.</p>
+
+    <div class="col caveat" style="margin-top:24px">
+      <h3>Метрика устойчивости оказалась с подвохом</h3>
+      <p>Первый прогон выдал случайным графам устойчивость 0.997 и 1.000 —
+      почти идеальную. Причина очевидна задним числом: они вообще не смотрят на
+      данные, строятся от фиксированного числа, и от смены половины выборки не
+      меняются.</p>
+      <p>То есть метрика в наивном виде <strong>награждает за игнорирование
+      данных</strong>. Читать её можно только вместе с восстановлением: высокая
+      устойчивость при низком F1 значит, что метод стабильно находит не то.
+      Именно в этой паре она и разоблачила граф по градиентам.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="label">Что дальше</div>
+    <h2>Три вопроса, которые остались открытыми</h2>
+    <p>Всё выше — про фиксированную сеть в три слоя. Это был осознанный выбор:
+    что-то надо было закрепить, чтобы менять только граф. Но теперь видно, что
+    сам этот выбор не нейтрален.</p>
+
+    <div class="col" style="display:flex;flex-direction:column;gap:18px;margin-top:18px">
+      <div>
+        <h3>Три слоя — почему именно три?</h3>
+        <p class="what">За три раунда обмена информация проходит по графу три
+        шага. У решётки это 23 пикселя из 784 — три процента картинки. У
+        плотного случайного графа за те же три шага — 462, больше половины.
+        Чтобы охватить всю картинку, решётке нужен 31 слой, а плотному графу
+        четыре. Разница почти в десять раз.</p>
+        <p class="what">Значит любое сравнение при фиксированной глубине
+        сравнивает не графы, а их совместимость с этой конкретной глубиной.
+        <em>Наша собственная таблица под ту же претензию и попадает.</em></p>
+      </div>
+      <div>
+        <h3>Всё меряно на одной архитектуре</h3>
+        <p class="what">Графовая свёртка усредняет соседей — она работает как
+        фильтр низких частот, ей нужен граф, на котором соседи похожи. У других
+        архитектур логика другая: GAT сам взвешивает рёбра вниманием, GIN
+        суммирует вместо усреднения. Вполне может оказаться, что «хороший
+        граф» — понятие относительное и зависит от того, что за сеть сверху.</p>
+      </div>
+      <div>
+        <h3>Почему честный граф обошёл решётку</h3>
+        <p class="what">Самая интересная незакрытая аномалия. Одно объяснение —
+        через симметрии решётки — проверили прямым контролем и отвергли: оно
+        даёт меньше половины наблюдаемого эффекта и бьёт по другим парам цифр.
+        Настоящей причины пока нет.</p>
+      </div>
+    </div>
+
+    <p style="margin-top:22px">Под каждый вопрос уже написан код и заранее
+    зафиксированы критерии — что именно будет считаться подтверждением, и на
+    каком подмножестве графов. Заранее, до запусков: два красивых объяснения в
+    этой работе уже развалились именно потому, что придумывались после того,
+    как посмотрели в таблицу.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <hr>
+    <p class="what" style="font-size:13.5px;margin-top:20px">MNIST, 55 000 обучающих
+    объектов, 10 000 тестовых. Во всех запусках одна модель: трёхслойная графовая
+    свёрточная сеть, 64 скрытых канала, усреднение по вершинам, Adam с шагом 0.001.
+    Каждый вариант графа обучен пять раз с разной инициализацией; в таблице среднее
+    и разброс. Графы, строящиеся по данным, считались только на обучающей выборке.</p>
+  </div>
+</section>
+</div>
