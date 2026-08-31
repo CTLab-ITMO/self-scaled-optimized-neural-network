@@ -15,27 +15,47 @@
 
 set -u
 cd "$(dirname "$0")" || exit 1
-PY=${PY:-python}
+# Интерпретатор: сам берём тот, что в .venv, если он есть. Иначе скрипт звал
+# бы системный python, где нет torch, и падал бы с невнятной ошибкой.
+if [ -n "${PY:-}" ]; then
+  :                                   # задан снаружи - уважаем
+elif [ -x .venv/bin/python ]; then
+  PY=.venv/bin/python
+elif command -v python3 >/dev/null 2>&1; then
+  PY=python3
+else
+  PY=python
+fi
+
+if ! $PY -c "import torch" >/dev/null 2>&1; then
+  echo "В окружении нет torch. Сначала создай его:"
+  echo "    ./setup_env.sh"
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 #  Что перебираем
 # ---------------------------------------------------------------------------
 
-# Порядок правил не случаен: сначала контроли, потом базовое правило на данных,
-# потом те, что используют обученную сеть. Если corr_greedy не обгоняет
-# контроли, остальное можно не запускать - сигнала нет вообще.
-RULES="keep random_rewire corr_greedy grad_greedy grad_corr"
+# Порядок правил не случаен: сначала два контроля, затем corr_static - граф по
+# корреляциям без всякой петли, - и только потом итеративные правила. Планка
+# стоит на corr_static: не обогнал его, значит итеративность не нужна.
+RULES="keep random_rewire corr_static corr_greedy grad_greedy grad_corr"
 
 # Четыре типа истинного графа: вывод не должен оказаться свойством решётки.
 GRAPHS="grid community geometric ring"
 
 SEEDS="0 1 2"
-START=${START:-random}     # с какого графа стартуем: empty | random | knn_corr_k8
+START=${START:-random}     # с какого графа стартуем: random | knn_corr_k8
 ROUNDS=${ROUNDS:-6}
 EPOCHS=${EPOCHS:-20}
 BUDGET=${BUDGET:-60}
 SIDE=${SIDE:-12}
 N=${N:-6000}
+# Задаются явно и передаются в refine.py: ключ состояния собирается здесь из
+# них же, и молчаливое расхождение с умолчаниями refine.py стало бы невидимым.
+CLASSES=${CLASSES:-4}
+M=${M:-24}
 
 # Флаги разбираются в цикле: раньше оба проверялись как $1, и
 # "--quick --status" молча запускал полный прогон вместо показа статуса.
@@ -51,7 +71,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$QUICK" = 1 ]; then
-  GRAPHS="grid"; SEEDS="0"; ROUNDS=4; EPOCHS=10; SIDE=10; N=3000
+  GRAPHS="grid"; SEEDS="0"; ROUNDS=4; EPOCHS=10; SIDE=10; N=3000; M=12
   [ "$STATUS" = 0 ] && echo "быстрый режим: только решётка, один сид"
 fi
 
@@ -75,7 +95,7 @@ EOF
 total=0; done_n=0
 for r in $RULES; do for g in $GRAPHS; do for s in $SEEDS; do
   total=$((total + 1))
-  is_done "${r}__${g}__${START}__s${s}__d$((SIDE*SIDE))_n${N}_c4_m24" && done_n=$((done_n + 1))
+  is_done "${r}__${g}__${START}__s${s}__d$((SIDE*SIDE))_n${N}_c${CLASSES}_m${M}" && done_n=$((done_n + 1))
 done; done; done
 
 if [ "$STATUS" = 1 ]; then
@@ -89,7 +109,7 @@ if [ "$STATUS" = 1 ]; then
     printf "  %-16s" "$r"
     for g in $GRAPHS; do
       k=0
-      for s in $SEEDS; do is_done "${r}__${g}__${START}__s${s}__d$((SIDE*SIDE))_n${N}_c4_m24" && k=$((k + 1)); done
+      for s in $SEEDS; do is_done "${r}__${g}__${START}__s${s}__d$((SIDE*SIDE))_n${N}_c${CLASSES}_m${M}" && k=$((k + 1)); done
       printf "%-13s" "$k/$(echo $SEEDS | wc -w)"
     done
     echo
@@ -100,36 +120,50 @@ if [ "$STATUS" = 1 ]; then
   exit 0
 fi
 
+RUNLOG=$(mktemp)
+trap 'rm -f "$RUNLOG"' EXIT
 trap 'echo ""; echo "${C_WARN}Прервано. Потерян максимум один раунд.${C_OFF}";
       echo "Продолжить: ./run_refine.sh"; exit 130' INT TERM
 
-if $PY -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
-  echo "${C_OK}CUDA доступна - будет быстро.${C_OFF}"
-else
-  echo "${C_WARN}CUDA нет, считаем на процессоре. Это нормально: задача мелкая,"
-  echo "но заложи несколько часов на полный перебор.${C_OFF}"
-fi
+# Печатаем то, что реально вернул torch, а не только да/нет: иначе при
+# расхождении невозможно понять, врёт баннер или расчёт правда на процессоре.
+CUDA_INFO=$($PY -c "import torch;print(torch.cuda.is_available(), torch.cuda.device_count())" 2>&1)
+case "$CUDA_INFO" in
+  "True "*) echo "${C_OK}CUDA доступна ($CUDA_INFO) - будет быстро.${C_OFF}" ;;
+  *)        echo "${C_WARN}CUDA нет: torch вернул [$CUDA_INFO]${C_OFF}"
+            echo "${C_WARN}Считаем на процессоре.${C_OFF}" ;;
+esac
 echo "  всего прогонов: $total, уже готово: $done_n"
 echo ""
 
-i=0
+i=0; failed=0
 for r in $RULES; do
   for g in $GRAPHS; do
     for s in $SEEDS; do
       i=$((i + 1))
-      key="${r}__${g}__${START}__s${s}__d$((SIDE*SIDE))_n${N}_c4_m24"
+      key="${r}__${g}__${START}__s${s}__d$((SIDE*SIDE))_n${N}_c${CLASSES}_m${M}"
       if is_done "$key"; then
         echo "${C_OK}[$i/$total сделан]${C_OFF} $r / $g / сид $s"
         continue
       fi
       echo ""
       echo "${C_RUN}[$i/$total] правило $r, граф $g, сид $s${C_OFF}"
+      # tee + PIPESTATUS обязательны. Раньше статус брался у grep: прогон,
+      # успевший напечатать хоть строку и упавший следом, считался успешным, а
+      # трассировка уходила в grep и терялась - таблица молча оказывалась
+      # неполной.
       $PY src/refine.py --rule "$r" --graph "$g" --seed "$s" \
           --start "$START" --rounds "$ROUNDS" --epochs "$EPOCHS" \
-          --budget "$BUDGET" --side "$SIDE" --n "$N" 2>&1 \
-          | grep -E "раунд|продолжаю|уже посчитано" || {
-            echo "${C_WARN}  прогон упал - см. вывод выше. Состояние сохранено,"
-            echo "  повторный запуск продолжит с последнего раунда.${C_OFF}"; }
+          --budget "$BUDGET" --side "$SIDE" --n "$N" \
+          --classes "$CLASSES" --m "$M" 2>&1 \
+          | tee "$RUNLOG" | grep -E "устройство|раунд|продолжаю|уже посчитано"
+      rc=${PIPESTATUS[0]}
+      if [ "$rc" != 0 ]; then
+        failed=$((failed + 1))
+        echo "${C_WARN}  ПРОГОН УПАЛ, код $rc. Последние строки:${C_OFF}"
+        tail -n 15 "$RUNLOG" | sed 's/^/    /'
+        echo "${C_WARN}  Состояние сохранено, повторный запуск продолжит.${C_OFF}"
+      fi
     done
   done
 done
@@ -139,11 +173,16 @@ echo "${C_OK}================================================================${C
 echo "${C_OK}  ГОТОВО${C_OFF}"
 echo "${C_OK}================================================================${C_OFF}"
 echo ""
+if [ "$failed" != 0 ]; then
+  echo "${C_WARN}УПАЛО ПРОГОНОВ: $failed из $total - таблица НЕПОЛНАЯ.${C_OFF}"
+  echo "${C_WARN}Что именно упало, видно выше. Запусти скрипт ещё раз.${C_OFF}"
+  echo ""
+fi
 echo "Результаты: results/refine.csv"
 echo ""
-echo "Главный вопрос к таблице: обгоняет ли хоть одно правило corr_greedy."
-echo "corr_greedy обновляет граф ТОЛЬКО по корреляциям, без обученной сети."
-echo "Если умные правила его не бьют - статистики модели ничего не добавляют,"
+echo "Главный вопрос к таблице: обгоняет ли хоть одно правило corr_static."
+echo "corr_static строит граф по корреляциям сразу, без петли и без сети."
+echo "Если итеративные правила его не бьют - петля ничего не добавляет,"
 echo "и это законченный отрицательный результат, а не неудача."
 echo ""
 echo "Свести таблицу:  python src/refine.py --summary"

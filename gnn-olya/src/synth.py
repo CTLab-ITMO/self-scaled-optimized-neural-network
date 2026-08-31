@@ -57,12 +57,16 @@ def ring_graph(d: int, k: int = 2) -> np.ndarray:
     return A
 
 
-def community_graph(d: int, n_comm: int = 8, p_in: float = 0.35,
+def community_graph(d: int, n_comm: int = 4, p_in: float = 0.11,
                     seed: int = 0) -> np.ndarray:
     """Блочный граф: сообщества, рёбра только внутри них.
 
     Нужен ради другого распределения степеней: выводы, полученные на решётке,
     могут оказаться её свойством.
+
+    Сообщество обязано быть БОЛЬШЕ пятна (d/n_comm > m) и связным, иначе пятно
+    не дорастает до m вершин и класс «1 пятно» пропадает из выборки целиком.
+    При n_comm=8 так и было. p_in подобрано под прежнюю среднюю степень.
     """
     rng = np.random.default_rng(seed)
     lab = np.repeat(np.arange(n_comm), int(np.ceil(d / n_comm)))[:d]
@@ -71,6 +75,12 @@ def community_graph(d: int, n_comm: int = 8, p_in: float = 0.35,
     draw = rng.random((d, d)) < p_in
     draw = np.triu(draw & same, 1)
     A[draw] = 1
+    # Случайный путь внутри сообщества. Без него одни только броски p_in
+    # оставляют вершины-одиночки: на 200 сидах это четверть случаев.
+    for c in range(n_comm):
+        v = np.flatnonzero(lab == c)
+        rng.shuffle(v)
+        A[v[:-1], v[1:]] = 1
     A = np.maximum(A, A.T)
     np.fill_diagonal(A, 0)
     return A
@@ -169,6 +179,16 @@ def make_clusters(side: int = 16, n: int = 12000, n_classes: int = 4,
         raise ValueError(f"неизвестный тип графа {graph!r}; есть: "
                          "grid, community, geometric, ring")
     nb = [np.flatnonzero(A[v]) for v in range(d)]
+
+    # Пятно растёт по рёбрам, поэтому в компоненту меньше m вершин не влезает.
+    # Зерно ставится равномерно по всем вершинам, так что проверять надо
+    # НАИМЕНЬШУЮ компоненту: одна вершина-одиночка уже ломает класс «1 пятно».
+    comp = np.bincount(connected_components(csr_matrix(A), directed=False)[1])
+    if comp.min() < m:
+        raise ValueError(
+            f"граф {graph!r}: наименьшая компонента {comp.min()} вершин < m={m} "
+            f"(всего компонент {len(comp)}). Пятно туда не поместится, и класс "
+            f"«1 пятно» станет недостижим. Уменьши m или укрупни компоненты.")
 
     # Расстояние между вершинами - чтобы зёрна пятен ставились подальше друг
     # от друга. У решётки это координаты на плоскости; у остальных графов

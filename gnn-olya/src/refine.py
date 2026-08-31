@@ -70,7 +70,6 @@ class Stats:
     val_acc: float
     test_acc: float
     edge_grad: np.ndarray      # [d, d], < 0 = ребро выгодно усилить
-    node_emb: np.ndarray       # [d, hidden]
     n_edges: int
 
 
@@ -117,14 +116,10 @@ def train_round(A: np.ndarray, ctx: Context, epochs: int, hidden: int,
     grad = ((grad + grad.t()) / 2)             # граф неориентированный
     grad.fill_diagonal_(0.0)
 
-    # Только train: статистики влияют на граф, с теста была бы утечка.
-    with torch.no_grad():
-        emb = net.node_embeddings(ctx.x_train[:512], A_hat).mean(0)
-
+    # Градиент снимается только с train: он правит граф, с теста была бы утечка.
     return Stats(val_acc=acc(ctx.x_val, ctx.y_val),
                  test_acc=acc(ctx.x_test, ctx.y_test),
                  edge_grad=grad.detach().cpu().numpy(),
-                 node_emb=emb.cpu().numpy(),
                  n_edges=int(A.sum() // 2))
 
 
@@ -157,7 +152,11 @@ def _keep(A: np.ndarray, st: Stats, ctx: Context, **kw) -> np.ndarray:
 @rule("random_rewire")
 def _random_rewire(A: np.ndarray, st: Stats, ctx: Context,
                    budget: int = 200, **kw) -> np.ndarray:
-    """КОНТРОЛЬ: переставить `budget` рёбер случайно. Пол шкалы."""
+    """КОНТРОЛЬ: переставить `budget` рёбер случайно. Пол шкалы.
+
+    Единственное правило, невоспроизводимое после обрыва: берёт ctx.rng, а тот
+    при возобновлении стартует заново. Для контроля это неважно.
+    """
     A = A.copy()
     iu = np.triu_indices(ctx.d, 1)
     present = np.flatnonzero(A[iu])
@@ -191,8 +190,15 @@ def _corr_greedy(A: np.ndarray, st: Stats, ctx: Context,
                  budget: int = 200, **kw) -> np.ndarray:
     """БАЗОВОЕ ПРАВИЛО: менять рёбра по корреляции, не глядя на модель.
 
-    Главный ориентир: `knn_corr_k4` даёт f1 = 0.918 сразу, без итеративности.
+    Главный ориентир: `corr_static` - тот же сигнал, но одним махом.
     Правило, не дотянувшее до него, делает петлю ненужной.
+
+    Бюджет тратится каждый раунд целиком, даже когда менять уже нечего: на
+    плато правило выкидывает хорошие рёбра и возвращает их обратно, зависая
+    в коротком цикле чуть НИЖЕ `corr_static` (замерено: 0.861 против 0.979 на
+    кольце). Это свойство наивной жадности, а не сбой; чинится условием
+    «менять только если корреляция реально выше», но тогда правило сойдётся
+    ровно в `corr_static` и перестанет быть отдельной точкой сравнения.
     """
     S = _corr_matrix(ctx)
     iu = np.triu_indices(ctx.d, 1)
@@ -206,6 +212,26 @@ def _corr_greedy(A: np.ndarray, st: Stats, ctx: Context,
     add = cand_add[np.argsort(-v[cand_add])[:k]]     # самая сильная связь
     drop = cand_del[np.argsort(v[cand_del])[:k]]     # самая слабая
     return _apply(A, iu, drop, add)
+
+
+@rule("corr_static")
+def _corr_static(A: np.ndarray, st: Stats, ctx: Context, **kw) -> np.ndarray:
+    """ОРИЕНТИР БЕЗ ПЕТЛИ: сразу взять |E| пар с наибольшей |корреляцией|.
+
+    Это предел corr_greedy при бесконечном бюджете: одна строка numpy, ни сети,
+    ни раундов. Правило, не обогнавшее его, не оправдывает саму итеративность.
+    Побочная польза: граф после первого раунда не меняется, поэтому разброс
+    точности по раундам даёт оценку шума обучения на ХОРОШЕМ графе.
+    """
+    # То же, что graphs.top_m_edges, но без отсева нулевой корреляции: здесь
+    # число рёбер обязано совпасть с исходным, иначе сравнение поедет по
+    # плотности и петля упадёт на проверке.
+    S = _corr_matrix(ctx)
+    iu = np.triu_indices(ctx.d, 1)
+    top = np.argsort(-S[iu])[:int(A.sum() // 2)]
+    out = np.zeros_like(A)
+    out[iu[0][top], iu[1][top]] = 1
+    return np.maximum(out, out.T)
 
 
 @rule("grad_corr")
@@ -306,6 +332,7 @@ def refine(A0: np.ndarray, rule_name: str, ctx: Context, rounds: int = 5,
                 print("  уже посчитано целиком", flush=True)
             return A, hist
 
+    A_trained = A
     for r in range(start_round, rounds):
         t = time.time()
         st = train_round(A, ctx, epochs, hidden, layers, lr, batch, seed + r)
@@ -322,25 +349,29 @@ def refine(A0: np.ndarray, rule_name: str, ctx: Context, rounds: int = 5,
             print(f"  раунд {r}: рёбер {st.n_edges:>5}  "
                   f"val {st.val_acc:.4f}  test {st.test_acc:.4f}{extra}"
                   f"   [{row['sec']:.0f} c]", flush=True)
-        if state is not None:
-            # После раунда, но до правила: обрыв продолжится с этого графа.
-            np.savez(state, A=A, hist=np.array(hist, dtype=object), round=r)
+        # Правило применяется и после последнего раунда: сохранённый граф
+        # обязан быть готовым к раунду r+1. Иначе увеличение --rounds на уже
+        # посчитанном прогоне доучивало бы на старом графе, теряя одну правку.
+        A_trained = A
+        before = int(A.sum() // 2)
+        A = fn(A, st, ctx, budget=budget)
+        assert A.shape == (ctx.d, ctx.d), "правило сломало форму матрицы"
+        assert np.array_equal(A, A.T), "правило вернуло несимметричный граф"
+        assert not np.any(np.diag(A)), "правило добавило петли"
+        # Число рёбер обязано сохраняться, иначе сравнение поедет по плотности.
+        # Симметричность такую ошибку не ловит.
+        after = int(A.sum() // 2)
+        if after != before:
+            raise AssertionError(
+                f"правило {rule_name} изменило число рёбер {before} -> {after}; "
+                f"сравнение с контролями станет нечестным по плотности. "
+                f"Все правила обязаны сохранять число рёбер.")
 
-        if r < rounds - 1:
-            before = int(A.sum() // 2)
-            A = fn(A, st, ctx, budget=budget)
-            assert A.shape == (ctx.d, ctx.d), "правило сломало форму матрицы"
-            assert np.array_equal(A, A.T), "правило вернуло несимметричный граф"
-            assert not np.any(np.diag(A)), "правило добавило петли"
-            # Число рёбер обязано сохраняться, иначе сравнение поедет по
-            # плотности. Симметричность такую ошибку не ловит.
-            after = int(A.sum() // 2)
-            if after != before:
-                raise AssertionError(
-                    f"правило {rule_name} изменило число рёбер {before} -> "
-                    f"{after}; сравнение с контролями станет нечестным по "
-                    f"плотности. Все правила обязаны сохранять число рёбер.")
-    return A, hist
+        if state is not None:
+            # Пишем ПОСЛЕ правила: при записи до него правка раунда r терялась
+            # при возобновлении, и следующий раунд считался на старом графе.
+            np.savez(state, A=A, hist=np.array(hist, dtype=object), round=r)
+    return A_trained, hist
 
 
 def synth_context(side: int, n: int, n_classes: int, m: int, seed: int,
@@ -377,15 +408,28 @@ def summarize() -> int:
             continue
         t = last.pivot_table(index="rule", columns="graph", values=col,
                              aggfunc="mean")
-        order = [r for r in ("keep", "random_rewire", "corr_greedy",
-                             "grad_greedy", "grad_corr") if r in t.index]
+        order = [r for r in ("keep", "random_rewire", "corr_static",
+                             "corr_greedy", "grad_greedy", "grad_corr")
+                 if r in t.index]
         print(f"\n{title}\n" + "-" * 60)
         print(t.loc[order].round(4).to_string())
 
+    # У `keep` и `corr_static` граф между раундами не меняется, поэтому разброс
+    # их точности по раундам - чистый шум переобучения. Без этой строки разницу
+    # в третьем знаке принимают за результат.
+    flat = df[df.rule.isin(["keep", "corr_static"]) & (df["round"] >= 1)]
+    if len(flat):
+        sp = flat.groupby(["rule", "graph", "seed"])["test_acc"].agg(
+            lambda v: v.max() - v.min())
+        print(f"\nШУМ обучения (граф не менялся): худший разброс по раундам "
+              f"{sp.max():.3f}, средний {sp.mean():.3f}")
+        print("Разница в точности меньше худшего разброса ничего не значит.")
+
     print("\nЧитать так: сначала смотрим на восстановление, потом на точность.")
     print("Правило обязано обгонять И `keep`, И `random_rewire`, иначе оно")
-    print("ничего не делает. И обязано обгонять `corr_greedy`, иначе не нужна")
-    print("сама итеративность - хватило бы однократного графа по корреляциям.")
+    print("ничего не делает. И обязано обгонять `corr_static` - граф по")
+    print("корреляциям, построенный сразу и без петли; иначе итеративность")
+    print("не нужна, а `corr_greedy` - лишь медленный путь к тому же графу.")
     return 0
 
 
@@ -400,8 +444,11 @@ def main() -> int:
     ap.add_argument("--graph", default="grid",
                     choices=["grid", "community", "geometric", "ring"],
                     help="тип ИСТИННОГО графа в синтетике")
-    ap.add_argument("--start", default="empty",
-                    choices=["empty", "random", "knn_corr_k8"],
+    # `empty` убран намеренно: все правила меняют рёбра ПАРАМИ (одно убрать,
+    # одно добавить), чтобы плотность не поехала. На пустом графе убирать
+    # нечего, k=0, и любое правило молча возвращает пустой граф навсегда.
+    ap.add_argument("--start", default="random",
+                    choices=["random", "knn_corr_k8"],
                     help="с какого графа начинать")
     # Пока только синтетика: на MNIST истинного графа нет, мерить нечем.
     ap.add_argument("--side", type=int, default=12)
@@ -421,9 +468,7 @@ def main() -> int:
                         dev, graph=args.graph)
 
     d = ctx.d
-    if args.start == "empty":
-        A0 = np.zeros((d, d), dtype=np.uint8)
-    elif args.start == "random":
+    if args.start == "random":
         A0 = np.zeros((d, d), dtype=np.uint8)
         iu = np.triu_indices(d, 1)
         pick = ctx.rng.choice(len(iu[0]), int(ctx.A_true.sum() // 2),
