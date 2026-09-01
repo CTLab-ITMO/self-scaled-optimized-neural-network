@@ -32,6 +32,7 @@ class EdgeFinder:
         self.device = device
         self.aggregation_mode = aggregation_mode
         self.max_to_replace = max_to_replace
+        self.last_selection_stats: dict[int, dict[str, float | int]] = {}
 
     def calculate_edge_metric_for_dataloader(
         self, 
@@ -135,6 +136,7 @@ class EdgeFinder:
         # 3. Extract indices
         # Weights are (Out, In), so dim0=child (output), dim1=parent (input)
         children, parents = mask.nonzero(as_tuple=True)
+        candidate_count = int(children.numel())
 
         # 4. Limit the number of selected edges (if max_to_replace is set)
         if self.max_to_replace is not None and len(children) > self.max_to_replace:
@@ -144,5 +146,14 @@ class EdgeFinder:
             
             children = children[top_k_indices]
             parents = parents[top_k_indices]
+
+        selected_metrics = avg_metric[children, parents]
+        self.last_selection_stats[id(layer)] = {
+            "candidate_count": candidate_count,
+            "selected_count": int(children.numel()),
+            "selection_saturated": int(candidate_count > int(children.numel())),
+            "selected_metric_min": float(selected_metrics.min().item()) if selected_metrics.numel() else 0.0,
+            "selected_metric_max": float(selected_metrics.max().item()) if selected_metrics.numel() else 0.0,
+        }
 
         return parents, children

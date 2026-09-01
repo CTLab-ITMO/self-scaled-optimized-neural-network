@@ -1,14 +1,13 @@
 """Single-GPU FineWeb-Edu NanoGPT/SSONN runner.
 
 Examples:
-    uv run python experiments/nanogpt_speedrun_ssonn.py --gpu 6 --mode ssonn --data-dir data/finewebedu10B
+    uv run python experiments/nanogpt_speedrun_ssonn.py --gpu 6 --mode ssonn --data-dir data/finewebedu10B --ssonn-learning-rate 3e-5
     nohup uv run python experiments/nanogpt_speedrun_ssonn.py --gpu 6 --mode mlp > mlp_h200.log 2>&1 &
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import math
 import os
@@ -30,21 +29,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=REPO_ROOT / "data" / "finewebedu10B")
     parser.add_argument("--checkpoint-dir", type=Path, default=REPO_ROOT / "checkpoints")
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--num-updates", type=int, default=100_000)
+    parser.add_argument("--num-updates", type=int, default=None, help="Total optimizer updates. SSONN defaults to --ssonn-cycles full-data cycles; other modes default to 100000.")
     parser.add_argument("--micro-batch-size", type=int, default=16)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--cooldown-updates", type=int, default=640)
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--eval-batches", type=int, default=16)
-    parser.add_argument("--checkpoint-interval", type=int, default=250)
+    parser.add_argument("--checkpoint-interval", type=int, default=5_000)
     parser.add_argument("--amp-dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--download-pretokenized", action="store_true")
-    parser.add_argument("--pretokenized-train-shards", type=int, default=10)
+    parser.add_argument("--pretokenized-train-shards", type=int, default=99)
     parser.add_argument("--ssonn-eval-batches", type=int, default=None)
     parser.add_argument("--finder-batches", type=int, default=32)
     parser.add_argument("--ssonn-learning-rate", type=float, default=1e-6)
-    parser.add_argument("--ssonn-cycle-steps", type=int, default=50_000)
+    parser.add_argument("--ssonn-cycle-steps", type=int, default=0, help="Updates per SSONN cycle. Zero derives one full pass from the discovered train shards.")
+    parser.add_argument("--ssonn-cycles", type=int, default=2, help="Number of full SSONN cycles when --num-updates is omitted.")
     parser.add_argument("--ssonn-expansion-threshold", type=float, default=0.1)
     parser.add_argument("--ssonn-max-new-edges", type=int, default=1024)
     parser.add_argument("--smoke-test", action="store_true", help="Run CPU model/schedule smoke checks and exit.")
@@ -72,6 +72,9 @@ CHECKPOINT_DIR = ARGS.checkpoint_dir.resolve()
 RUN_MODE = ARGS.mode
 SEED = ARGS.seed
 USE_COMPILE = ARGS.compile
+TRAIN_STREAM_SEED = SEED
+EVAL_STREAM_SEED = SEED + 1
+FINDER_STREAM_SEED = SEED + 2
 
 RUN_MODE_TO_MLP_KIND = {
     "pretrain": "none",
@@ -84,10 +87,12 @@ INIT_MODE = "scratch"
 FIXED_CYCLE_TOKENS = RUN_MODE == "ssonn"
 FULL_REINIT_AFTER_EXPANSION = RUN_MODE == "ssonn"
 
-TRAIN_GLOB = str(DATA_DIR / "*train_*.bin")
-VAL_GLOB = str(DATA_DIR / "*val_*.bin")
 DOWNLOAD_PRETOKENIZED_DATA = ARGS.download_pretokenized
 PRETOKENIZED_TRAIN_SHARDS = ARGS.pretokenized_train_shards
+TRAIN_FILES: list[str] = []
+VAL_FILES: list[str] = []
+TRAIN_TOKEN_COUNT = 0
+SSONN_CYCLE_TOKEN_COUNT = 0
 
 
 @dataclass(frozen=True)
@@ -100,7 +105,7 @@ class GPTConfig:
 
 
 MODEL_CONFIG = GPTConfig()
-NUM_UPDATES = ARGS.num_updates
+NUM_UPDATES = ARGS.num_updates or 100_000
 MICRO_BATCH_SIZE = ARGS.micro_batch_size
 GRAD_ACCUM_STEPS = ARGS.grad_accum_steps
 WINDOW_START = 256
@@ -115,6 +120,7 @@ SSONN_EVAL_BATCHES = ARGS.ssonn_eval_batches or EVAL_BATCHES
 FINDER_BATCHES = ARGS.finder_batches
 SSONN_LEARNING_RATE = ARGS.ssonn_learning_rate
 SSONN_CYCLE_STEPS = ARGS.ssonn_cycle_steps
+SSONN_CYCLES = ARGS.ssonn_cycles
 SSONN_EXPANSION_THRESHOLD = ARGS.ssonn_expansion_threshold
 SSONN_MAX_NEW_EDGES = ARGS.ssonn_max_new_edges
 REINIT_MODE = "full"
@@ -127,6 +133,7 @@ assert MODEL_CONFIG.n_embd % MODEL_CONFIG.n_head == 0
 assert WINDOW_START <= WINDOW_END <= MODEL_CONFIG.max_seq_len
 assert MICRO_BATCH_SIZE >= 1
 assert GRAD_ACCUM_STEPS >= 1
+assert SSONN_CYCLES >= 1
 
 
 def amp_dtype() -> torch.dtype | None:
@@ -178,6 +185,19 @@ def download_pretokenized_fineweb_edu(train_shards: int) -> None:
         hf_hub_download(repo_id=repo_id, repo_type="dataset", filename=filename, local_dir=DATA_DIR)
 
 
+def find_shards(data_dir: Path) -> tuple[list[str], list[str]]:
+    train = sorted({str(path) for path in data_dir.rglob("*fineweb*edu*train_*.bin")})
+    val = sorted({str(path) for path in data_dir.rglob("*fineweb*edu*val_*.bin")})
+    return train, val
+
+
+def shard_token_count(path: str) -> int:
+    header = np.memmap(path, dtype=np.int32, mode="r", shape=(256,))
+    if int(header[0]) != 20240520:
+        raise ValueError(f"Unexpected FineWeb-Edu shard header in {path}")
+    return int(header[2])
+
+
 def read_shard(path: str) -> np.ndarray:
     raw = np.memmap(path, dtype=np.uint16, mode="r")
     header = np.memmap(path, dtype=np.int32, mode="r", shape=(256,))
@@ -188,10 +208,10 @@ def read_shard(path: str) -> np.ndarray:
 
 
 class TokenShardStream:
-    def __init__(self, pattern: str, seed: int = 0):
-        self.files = sorted(glob.glob(pattern))
+    def __init__(self, files: Iterable[str], seed: int = 0):
+        self.files = sorted(files)
         if not self.files:
-            raise FileNotFoundError(f"No shards found for {pattern}.")
+            raise FileNotFoundError("TokenShardStream received no shard files.")
         self.rng = random.Random(seed)
         self.shard_index = 0
         self.position = 0
@@ -221,8 +241,8 @@ class TokenShardStream:
 
 
 class FixedFinderLoader:
-    def __init__(self, pattern: str, batches: int, seq_len: int, seed: int):
-        self.pattern = pattern
+    def __init__(self, files: Iterable[str], batches: int, seq_len: int, seed: int):
+        self.files = list(files)
         self.batches = batches
         self.seq_len = seq_len
         self.seed = seed
@@ -231,7 +251,7 @@ class FixedFinderLoader:
         return self.batches
 
     def __iter__(self):
-        stream = TokenShardStream(self.pattern, self.seed)
+        stream = TokenShardStream(self.files, self.seed)
         for _ in range(self.batches):
             yield stream.next_batch(self.seq_len, MICRO_BATCH_SIZE)
 
@@ -442,6 +462,10 @@ def checkpoint_payload(model: nn.Module, optimizer_state: dict | None, update: i
             "micro_batch_size": MICRO_BATCH_SIZE,
             "grad_accum_steps": GRAD_ACCUM_STEPS,
             "effective_sequences_per_update": MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS,
+            "train_shards": len(TRAIN_FILES),
+            "train_tokens": TRAIN_TOKEN_COUNT,
+            "ssonn_cycle_steps": SSONN_CYCLE_STEPS,
+            "ssonn_cycle_tokens": SSONN_CYCLE_TOKEN_COUNT,
         },
         "rng": {
             "torch": torch.get_rng_state(),
@@ -473,6 +497,10 @@ def evaluate(model: nn.Module, stream: TokenShardStream, seq_len: int, batches: 
         assert_finite_tensor(loss, "Evaluation loss")
         losses.append(loss.item())
     return float(np.mean(losses))
+
+
+def evaluate_fixed(model: nn.Module, seq_len: int, batches: int) -> float:
+    return evaluate(model, TokenShardStream(VAL_FILES, EVAL_STREAM_SEED), seq_len, batches)
 
 
 class Muon(torch.optim.Optimizer):
@@ -579,11 +607,39 @@ def ssonn_cosine_lr(cycle_step: int) -> float:
     return 0.5 * SSONN_LEARNING_RATE * (1.0 - math.cos(2.0 * math.pi * position / denominator))
 
 
-def cycle_window(cycle_step: int) -> int:
-    denominator = max(SSONN_CYCLE_STEPS - 1, 1)
+def cycle_window_for_steps(cycle_step: int, cycle_steps: int) -> int:
+    denominator = max(cycle_steps - 1, 1)
     fraction = min(max(cycle_step, 0), denominator) / denominator
     raw = WINDOW_START + fraction * (WINDOW_END - WINDOW_START)
     return min(WINDOW_END, max(WINDOW_START, int(raw // 256) * 256))
+
+
+def cycle_window(cycle_step: int) -> int:
+    return cycle_window_for_steps(cycle_step, SSONN_CYCLE_STEPS)
+
+
+def cycle_token_budget(cycle_steps: int) -> int:
+    sequences_per_update = MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS
+    return sequences_per_update * sum(cycle_window_for_steps(step, cycle_steps) for step in range(cycle_steps))
+
+
+def infer_full_pass_cycle_steps(train_tokens: int) -> int:
+    if train_tokens <= 0:
+        raise ValueError("Cannot infer SSONN cycle length from an empty dataset.")
+    sequences_per_update = MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS
+    low = 1
+    high = max(2, math.ceil(train_tokens / (sequences_per_update * WINDOW_START)))
+    while low < high:
+        middle = (low + high) // 2
+        if cycle_token_budget(middle) >= train_tokens:
+            high = middle
+        else:
+            low = middle + 1
+    return low
+
+
+def has_training_after_step(step: int, total_updates: int) -> bool:
+    return step + 1 < total_updates
 
 
 def lm_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -613,7 +669,7 @@ def layer_input_widths(model: AttentionOnlyGPT) -> dict[str, int]:
 def make_edge_finder(seq_len: int) -> EdgeFinder:
     return EdgeFinder(
         metric=AbsGradientEdgeMetric(lm_cross_entropy),
-        dataloader=FixedFinderLoader(TRAIN_GLOB, FINDER_BATCHES, seq_len, SEED + 2),
+        dataloader=FixedFinderLoader(TRAIN_FILES, FINDER_BATCHES, seq_len, FINDER_STREAM_SEED),
         device=device,
         aggregation_mode="mean",
         max_to_replace=SSONN_MAX_NEW_EDGES,
@@ -683,6 +739,11 @@ def create_comet_experiment():
         "visible_cuda_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         "ssonn_learning_rate": SSONN_LEARNING_RATE,
         "ssonn_cycle_steps": SSONN_CYCLE_STEPS,
+        "ssonn_cycles": SSONN_CYCLES,
+        "ssonn_cycle_tokens": SSONN_CYCLE_TOKEN_COUNT,
+        "train_shards": len(TRAIN_FILES),
+        "train_tokens": TRAIN_TOKEN_COUNT,
+        "validation_protocol": "fixed_restart_per_eval",
         "ssonn_expansion_threshold": SSONN_EXPANSION_THRESHOLD,
         "ssonn_max_new_edges": SSONN_MAX_NEW_EDGES,
         "finder_batches": FINDER_BATCHES,
@@ -730,8 +791,7 @@ def train_autocast_stage(model: AttentionOnlyGPT, mode: str, experiment) -> Atte
     muon, adam = make_pretrain_optimizers(model)
     scaler = torch.amp.GradScaler("cuda", enabled=USE_SCALER)
     scaler_or_none = scaler if USE_SCALER else None
-    train_stream = TokenShardStream(TRAIN_GLOB, seed=SEED if mode == "pretrain" else SEED + 3)
-    val_stream = TokenShardStream(VAL_GLOB, seed=SEED + 1 if mode == "pretrain" else SEED + 4)
+    train_stream = TokenShardStream(TRAIN_FILES, seed=TRAIN_STREAM_SEED)
     checkpoint_path = BASE_CHECKPOINT if mode == "pretrain" else MLP_CHECKPOINT
     latest_path = checkpoint_path.with_name(checkpoint_path.stem.replace("_best", "") + "_latest.pt")
     started = time.perf_counter()
@@ -772,7 +832,7 @@ def train_autocast_stage(model: AttentionOnlyGPT, mode: str, experiment) -> Atte
         assert_finite_model(model, f"{mode} model after update {step + 1}")
 
         if (step + 1) % EVAL_INTERVAL == 0 or step == 0 or step + 1 == NUM_UPDATES:
-            val_loss = evaluate(model, val_stream, seq_len, EVAL_BATCHES)
+            val_loss = evaluate_fixed(model, seq_len, EVAL_BATCHES)
             elapsed = time.perf_counter() - started
             tokens_per_second = tokens_seen / max(elapsed, 1.0)
             print(
@@ -817,9 +877,8 @@ def train_ssonn_stage(model: AttentionOnlyGPT, experiment) -> AttentionOnlyGPT:
     muon, backbone_adam, ssonn_adam = make_ssonn_stage_optimizers(model)
     ssonn_train.apply_sparsity_mask(model)
     thresholds = {name: SSONN_EXPANSION_THRESHOLD for name in model.ssonn_layer_names}
-    train_stream = TokenShardStream(TRAIN_GLOB, seed=SEED + 3)
-    val_stream = TokenShardStream(VAL_GLOB, seed=SEED + 4)
-    initial_loss = evaluate(model, TokenShardStream(VAL_GLOB, SEED + 4), WINDOW_START, SSONN_EVAL_BATCHES)
+    train_stream = TokenShardStream(TRAIN_FILES, seed=TRAIN_STREAM_SEED)
+    initial_loss = evaluate_fixed(model, WINDOW_START, SSONN_EVAL_BATCHES)
     print(f"from-scratch residual SSONN initial val loss: {initial_loss:.4f}")
 
     best_val = float("inf")
@@ -870,45 +929,67 @@ def train_ssonn_stage(model: AttentionOnlyGPT, experiment) -> AttentionOnlyGPT:
         post_reinit_val_loss = float("nan")
         cycle_last_pre_expansion_val_loss = float("nan")
         new_edges_by_layer = {name: 0 for name in model.ssonn_layer_names}
+        selection_stats_by_layer: dict[str, dict[str, float | int]] = {}
         log_cycle_index = cycle_index
         log_cycle_step = cycle_step
         log_cycle_tokens_seen = cycle_tokens_seen
         eval_val_loss: float | None = None
+        start_next_cycle = False
 
         cycle_finished = cycle_step + 1 >= SSONN_CYCLE_STEPS
         if cycle_finished:
-            pre_expansion_val_loss = evaluate(model, TokenShardStream(VAL_GLOB, SEED + 4), seq_len, SSONN_EVAL_BATCHES)
+            pre_expansion_val_loss = evaluate_fixed(model, seq_len, SSONN_EVAL_BATCHES)
             cycle_last_pre_expansion_val_loss = pre_expansion_val_loss
             eval_val_loss = pre_expansion_val_loss
+            cycle_best_val = min(cycle_best_val, pre_expansion_val_loss)
+            optimizer_state = {
+                "muon": muon.state_dict(),
+                "backbone_adam": backbone_adam.state_dict(),
+                "ssonn_adam": ssonn_adam.state_dict(),
+            }
+            save_checkpoint(
+                CHECKPOINT_DIR / f"finewebedu_ssonn_cycle_{cycle_index:02d}_trained.pt",
+                model,
+                optimizer_state,
+                step + 1,
+            )
             if pre_expansion_val_loss < best_val:
                 best_val = pre_expansion_val_loss
                 save_checkpoint(
                     SSONN_CHECKPOINT,
                     model,
-                    {"muon": muon.state_dict(), "backbone_adam": backbone_adam.state_dict(), "ssonn_adam": ssonn_adam.state_dict()},
+                    optimizer_state,
                     step + 1,
                 )
-            before_widths = layer_input_widths(model)
-            expanded, new_edges = ssonn_train.expand_model(model, make_edge_finder(seq_len), thresholds)
-            after_widths = layer_input_widths(model)
-            new_edges_by_layer = {name: after_widths[name] - before_widths[name] for name in model.ssonn_layer_names}
-            if expanded:
-                full_model_reinit(model)
-                full_reinit = True
-                muon, backbone_adam, ssonn_adam = make_ssonn_stage_optimizers(model)
-                ssonn_train.apply_sparsity_mask(model)
-                train_stream = TokenShardStream(TRAIN_GLOB, seed=SEED + 3)
-                post_reinit_val_loss = evaluate(model, TokenShardStream(VAL_GLOB, SEED + 4), WINDOW_START, SSONN_EVAL_BATCHES)
-                assert_finite_model(model, f"SSONN model after full reinit at update {step + 1}")
-            cycle_index += 1
-            cycle_start = step + 1
-            cycle_tokens_seen = 0
-            cycle_best_val = float("inf")
+            del optimizer_state
+            if has_training_after_step(step, NUM_UPDATES):
+                edge_finder = make_edge_finder(seq_len)
+                before_widths = layer_input_widths(model)
+                expanded, new_edges = ssonn_train.expand_model(model, edge_finder, thresholds)
+                after_widths = layer_input_widths(model)
+                new_edges_by_layer = {name: after_widths[name] - before_widths[name] for name in model.ssonn_layer_names}
+                selection_stats_by_layer = {
+                    name: edge_finder.last_selection_stats.get(id(getattr(model, name)), {})
+                    for name in model.ssonn_layer_names
+                }
+                saturated_layers = sum(int(stats.get("selection_saturated", 0)) for stats in selection_stats_by_layer.values())
+                print(f"edge selection: {new_edges} selected | {saturated_layers}/{len(model.ssonn_layer_names)} layers hit the per-layer cap")
+                if expanded:
+                    full_model_reinit(model)
+                    full_reinit = True
+                    muon, backbone_adam, ssonn_adam = make_ssonn_stage_optimizers(model)
+                    ssonn_train.apply_sparsity_mask(model)
+                    post_reinit_val_loss = evaluate_fixed(model, WINDOW_START, SSONN_EVAL_BATCHES)
+                    assert_finite_model(model, f"SSONN model after full reinit at update {step + 1}")
+                train_stream = TokenShardStream(TRAIN_FILES, seed=TRAIN_STREAM_SEED)
+                start_next_cycle = True
+            else:
+                print("final cycle complete: skipping expansion and full reinit because no training cycle remains")
 
-        should_eval = (step + 1) % EVAL_INTERVAL == 0 or step == 0 or expanded or step + 1 == NUM_UPDATES
+        should_eval = (step + 1) % EVAL_INTERVAL == 0 or step == 0 or cycle_finished or expanded or step + 1 == NUM_UPDATES
         if should_eval:
             if eval_val_loss is None:
-                eval_val_loss = evaluate(model, val_stream, seq_len, SSONN_EVAL_BATCHES)
+                eval_val_loss = evaluate_fixed(model, seq_len, SSONN_EVAL_BATCHES)
             cycle_best_val = min(cycle_best_val, eval_val_loss)
             elapsed = time.perf_counter() - started
             tokens_per_second = global_tokens_seen / max(elapsed, 1.0)
@@ -948,6 +1029,8 @@ def train_ssonn_stage(model: AttentionOnlyGPT, experiment) -> AttentionOnlyGPT:
                     "ssonn/cycle_last_pre_expansion_val_loss": cycle_last_pre_expansion_val_loss,
                     "ssonn/pre_expansion_val_loss": pre_expansion_val_loss,
                     "ssonn/post_reinit_val_loss": post_reinit_val_loss,
+                    "ssonn/candidate_edges_before_cap": sum(int(stats.get("candidate_count", 0)) for stats in selection_stats_by_layer.values()),
+                    "ssonn/saturated_layer_count": sum(int(stats.get("selection_saturated", 0)) for stats in selection_stats_by_layer.values()),
                 }
                 metrics.update(comparison_metrics(
                     "ssonn",
@@ -963,6 +1046,13 @@ def train_ssonn_stage(model: AttentionOnlyGPT, experiment) -> AttentionOnlyGPT:
                     elapsed,
                 ))
                 metrics.update({f"ssonn/new_edges/{name}": int(value) for name, value in new_edges_by_layer.items()})
+                for name, stats in selection_stats_by_layer.items():
+                    metrics.update({
+                        f"ssonn/candidate_edges/{name}": int(stats.get("candidate_count", 0)),
+                        f"ssonn/selection_saturated/{name}": int(stats.get("selection_saturated", 0)),
+                        f"ssonn/selected_metric_min/{name}": float(stats.get("selected_metric_min", 0.0)),
+                        f"ssonn/selected_metric_max/{name}": float(stats.get("selected_metric_max", 0.0)),
+                    })
                 experiment.log_metrics(metrics, step=step + 1)
             model.train()
 
@@ -975,13 +1065,18 @@ def train_ssonn_stage(model: AttentionOnlyGPT, experiment) -> AttentionOnlyGPT:
                     step + 1,
                 )
 
-        if (step + 1) % CHECKPOINT_INTERVAL == 0 or step + 1 == NUM_UPDATES:
+        if expanded or (step + 1) % CHECKPOINT_INTERVAL == 0 or step + 1 == NUM_UPDATES:
             save_checkpoint(
                 SSONN_CHECKPOINT.with_name("finewebedu_ssonn_latest.pt"),
                 model,
                 {"muon": muon.state_dict(), "backbone_adam": backbone_adam.state_dict(), "ssonn_adam": ssonn_adam.state_dict()},
                 step + 1,
             )
+        if start_next_cycle:
+            cycle_index += 1
+            cycle_start = step + 1
+            cycle_tokens_seen = 0
+            cycle_best_val = float("inf")
     return model
 
 
@@ -1031,10 +1126,17 @@ def run_smoke_tests() -> None:
     assert lrs[0] == 0.0 and lrs[-1] == 0.0 and max(lrs) > 0.9e-6
     assert cycle_window(0) == WINDOW_START
     assert cycle_window(SSONN_CYCLE_STEPS - 1) == WINDOW_END
+    target_tokens = 1_000_000
+    inferred_steps = infer_full_pass_cycle_steps(target_tokens)
+    assert cycle_token_budget(inferred_steps) >= target_tokens
+    assert inferred_steps == 1 or cycle_token_budget(inferred_steps - 1) < target_tokens
+    assert has_training_after_step(4, 10)
+    assert not has_training_after_step(9, 10)
     print("smoke tests ok")
 
 
 def main() -> None:
+    global NUM_UPDATES, SSONN_CYCLE_STEPS, TRAIN_FILES, VAL_FILES, TRAIN_TOKEN_COUNT, SSONN_CYCLE_TOKEN_COUNT
     set_seed(SEED)
     if ARGS.smoke_test:
         run_smoke_tests()
@@ -1042,13 +1144,39 @@ def main() -> None:
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     if DOWNLOAD_PRETOKENIZED_DATA:
         download_pretokenized_fineweb_edu(PRETOKENIZED_TRAIN_SHARDS)
-    train_files = sorted(glob.glob(TRAIN_GLOB))
-    val_files = sorted(glob.glob(VAL_GLOB))
-    if not train_files or not val_files:
-        raise FileNotFoundError(f"Missing FineWeb-Edu shards: train={TRAIN_GLOB}, val={VAL_GLOB}")
+    TRAIN_FILES, VAL_FILES = find_shards(DATA_DIR)
+    if not TRAIN_FILES or not VAL_FILES:
+        raise FileNotFoundError(
+            f"Missing FineWeb-Edu shards under {DATA_DIR}. Expected filenames containing train_ and val_."
+        )
+    TRAIN_TOKEN_COUNT = sum(shard_token_count(path) for path in TRAIN_FILES)
+    if RUN_MODE == "ssonn":
+        if SSONN_CYCLE_STEPS <= 0:
+            SSONN_CYCLE_STEPS = infer_full_pass_cycle_steps(TRAIN_TOKEN_COUNT)
+        SSONN_CYCLE_TOKEN_COUNT = cycle_token_budget(SSONN_CYCLE_STEPS)
+        if ARGS.num_updates is None:
+            NUM_UPDATES = SSONN_CYCLES * SSONN_CYCLE_STEPS
+    elif ARGS.num_updates is None:
+        NUM_UPDATES = 100_000
+    if NUM_UPDATES <= 0:
+        raise ValueError("--num-updates must be positive.")
+    if RUN_MODE == "ssonn" and SSONN_CYCLE_STEPS <= 0:
+        raise ValueError("--ssonn-cycle-steps must be positive or zero for auto mode.")
     print("data dir:", DATA_DIR)
-    print("train shards:", len(train_files), "val shards:", len(val_files))
+    print("train shards:", len(TRAIN_FILES), "val shards:", len(VAL_FILES))
+    print("first train shard:", TRAIN_FILES[0])
+    print("first val shard:", VAL_FILES[0])
+    print("train tokens:", TRAIN_TOKEN_COUNT)
     print("run mode:", RUN_MODE, "| mlp kind:", MLP_KIND)
+    if RUN_MODE == "ssonn":
+        print(
+            "ssonn cycle:",
+            SSONN_CYCLE_STEPS,
+            "updates |",
+            SSONN_CYCLE_TOKEN_COUNT,
+            "scheduled tokens | total updates:",
+            NUM_UPDATES,
+        )
     print("effective batch sequences:", MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS)
     print("effective batch tokens at max window:", MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS * WINDOW_END)
     print("amp:", ARGS.amp_dtype, "| grad scaler:", USE_SCALER)
