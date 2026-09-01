@@ -31,12 +31,19 @@ from config import load_config, results_dir  # noqa: E402
 from model import DenseGCN  # noqa: E402
 
 _RULES: dict[str, callable] = {}
+# Правила, которым разрешено менять число рёбер. Всем остальным плотность
+# задана и обязана сохраняться, иначе сравнение поедет по плотности. Здесь
+# наоборот: поиск плотности - и есть работа правила, а платой за поблажку
+# идёт пометка в выводе, чтобы никто не сравнил их наивно.
+_FREE_DENSITY: set[str] = set()
 
 
-def rule(name: str):
+def rule(name: str, free_density: bool = False):
     """Регистрирует правило обновления связей."""
     def deco(fn):
         _RULES[name] = fn
+        if free_density:
+            _FREE_DENSITY.add(name)
         return fn
     return deco
 
@@ -63,6 +70,10 @@ class Context:
     A_true: np.ndarray | None = None   # известен только на синтетике
     rng: np.random.Generator = field(default_factory=lambda:
                                      np.random.default_rng(0))
+    # Сид прогона. Нужен правилам из structure.py: без него их внутренние
+    # разбиения на половины шли бы с одним и тем же сидом при любом прогоне,
+    # и три «независимых» сида делили бы одну случайность.
+    seed: int = 0
 
 
 @dataclass
@@ -286,6 +297,50 @@ def _grad_greedy(A: np.ndarray, st: Stats, ctx: Context,
     return _apply(A, iu, drop, add)
 
 
+def _fitted(ctx: Context, score: str, n_edges: int | None) -> np.ndarray:
+    """Конвейер из structure.py, посчитанный один раз на прогон.
+
+    Кеш обязателен: от раунда результат не зависит (сеть в него не входит),
+    а перебор двух сеток с подвыборками стоит куда дороже одного раунда.
+    """
+    import structure as ST
+    key = f"_fit_{score}_{n_edges}"
+    cached = getattr(ctx, key, None)
+    if cached is None:
+        x = ctx.x_train.cpu().numpy().astype(np.float64)
+        cached = ST.fit(x, score=score, n_edges=n_edges, seed=ctx.seed).A
+        setattr(ctx, key, cached)
+    return cached.copy()      # копия: правило не должно отдавать общий буфер
+
+
+@rule("partial_static")
+def _partial_static(A: np.ndarray, st: Stats, ctx: Context, **kw) -> np.ndarray:
+    """Частная корреляция, регуляризация по устойчивости. Плотность задана.
+
+    Прямое сравнение с `corr_static` при равной плотности: обе величины
+    считаются по train, ни одна не смотрит ни на модель, ни на A_true.
+    """
+    return _fitted(ctx, "partial", int(A.sum() // 2))
+
+
+@rule("aracne_static")
+def _aracne_static(A: np.ndarray, st: Stats, ctx: Context, **kw) -> np.ndarray:
+    """То же плюс чистка треугольников. Плотность задана."""
+    return _fitted(ctx, "partial_aracne", int(A.sum() // 2))
+
+
+@rule("partial_free", free_density=True)
+def _partial_free(A: np.ndarray, st: Stats, ctx: Context, **kw) -> np.ndarray:
+    """ЧЕСТНЫЙ РЕЖИМ: плотность тоже ищется, а не сообщается.
+
+    Единственное правило, которому не подарили число рёбер. Остальным, включая
+    `corr_static`, оно известно из стартового графа. Если это правило без форы
+    обгоняет их с форой - петля наконец делает то, чего одношаговый метод не
+    может в принципе.
+    """
+    return _fitted(ctx, "auto", None)
+
+
 # ---------------------------------------------------------------------------
 #  Петля
 # ---------------------------------------------------------------------------
@@ -361,7 +416,7 @@ def refine(A0: np.ndarray, rule_name: str, ctx: Context, rounds: int = 5,
         # Число рёбер обязано сохраняться, иначе сравнение поедет по плотности.
         # Симметричность такую ошибку не ловит.
         after = int(A.sum() // 2)
-        if after != before:
+        if after != before and rule_name not in _FREE_DENSITY:
             raise AssertionError(
                 f"правило {rule_name} изменило число рёбер {before} -> {after}; "
                 f"сравнение с контролями станет нечестным по плотности. "
@@ -385,7 +440,7 @@ def synth_context(side: int, n: int, n_classes: int, m: int, seed: int,
         x_val=tt(t.x_val, torch.float32), y_val=tt(t.y_val, torch.long),
         x_test=tt(t.x_test, torch.float32), y_test=tt(t.y_test, torch.long),
         d=t.d, n_classes=t.n_classes, device=device, A_true=t.A_true,
-        rng=np.random.default_rng(seed))
+        rng=np.random.default_rng(seed), seed=seed)
 
 
 def summarize() -> int:
@@ -399,20 +454,53 @@ def summarize() -> int:
         print("нет results/refine.csv - сначала ./run_refine.sh")
         return 1
     df = pd.read_csv(f)
-    last = df.sort_values("round").groupby(
-        ["rule", "graph", "seed"], as_index=False).last()
 
-    for col, title in (("test_acc", "ТОЧНОСТЬ в последнем раунде"),
+    # Среднее по хвосту, а не последний раунд. Причины две: сеть переобучается
+    # заново каждый раунд, и `corr_greedy` на плато колеблется между двумя
+    # графами. Последний раунд ловит случайную фазу этих колебаний и добавляет
+    # разброс, которого в самих правилах нет.
+    # Хвост берётся у КАЖДОГО прогона свой. Общий порог по номеру раунда
+    # выбрасывал целиком правила, досчитанные с меньшим --rounds: их строки
+    # просто не доходили до порога, и в таблице они молча исчезали.
+    key = ["rule", "graph", "seed"]
+    df = df.sort_values(key + ["round"])
+    n_run = df.groupby(key)["round"].transform("count")
+    from_end = df.groupby(key)["round"].transform("max") - df["round"]
+    tail = np.minimum(5, np.maximum(1, n_run // 4))
+    last = df[from_end < tail].groupby(key, as_index=False).mean(
+        numeric_only=True)
+
+    lens = df.groupby(key)["round"].count()
+    if lens.nunique() > 1:
+        print(f"\n[!] РАЗНАЯ ДЛИНА ПРОГОНОВ: от {lens.min()} до {lens.max()} "
+              f"раундов. Оценка шума сравнивает неравное, пересчитай короткие "
+              f"с тем же ROUNDS.")
+    print(f"\nусреднено по последним {int(tail.min())}-{int(tail.max())} "
+          f"раундам каждого прогона")
+
+    for col, title in (("test_acc", "ТОЧНОСТЬ"),
                        ("rec_f1", "ВОССТАНОВЛЕНИЕ структуры (f1)")):
         if col not in last:
             continue
         t = last.pivot_table(index="rule", columns="graph", values=col,
                              aggfunc="mean")
         order = [r for r in ("keep", "random_rewire", "corr_static",
-                             "corr_greedy", "grad_greedy", "grad_corr")
-                 if r in t.index]
+                             "corr_greedy", "grad_greedy", "grad_corr",
+                             "partial_static", "aracne_static",
+                             "partial_free") if r in t.index]
         print(f"\n{title}\n" + "-" * 60)
         print(t.loc[order].round(4).to_string())
+
+    # Правило, само выбирающее плотность, сравнивать по точности с остальными
+    # напрямую нельзя: у них разное число рёбер. Без этой строки разницу
+    # припишут правилу, а она может быть эффектом плотности.
+    free = last[last.rule.isin(_FREE_DENSITY)]
+    if len(free):
+        print("\nПЛОТНОСТЬ НЕ СОВПАДАЕТ - эти правила искали число рёбер сами:")
+        ref = last[last.rule == "corr_static"].groupby("graph")["n_edges"].mean()
+        for (r, g), v in free.groupby(["rule", "graph"])["n_edges"].mean().items():
+            base = ref.get(g, float("nan"))
+            print(f"  {r} / {g}: {v:.0f} рёбер против {base:.0f} у остальных")
 
     # У `keep` и `corr_static` граф между раундами не меняется, поэтому разброс
     # их точности по раундам - чистый шум переобучения. Без этой строки разницу

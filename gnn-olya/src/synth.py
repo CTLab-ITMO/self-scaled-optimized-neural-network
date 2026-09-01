@@ -86,6 +86,48 @@ def community_graph(d: int, n_comm: int = 4, p_in: float = 0.11,
     return A
 
 
+def tree_graph(d: int, seed: int = 0) -> np.ndarray:
+    """Случайное дерево. Треугольников НОЛЬ по определению.
+
+    Добавлен ради предсказания, а не наблюдения: если ARACNE проваливается
+    именно из-за треугольников, то здесь он обязан выиграть. Дерево - самый
+    жёсткий случай: рёбер всего d-1, любая ошибка сразу видна.
+    """
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(d)
+    A = np.zeros((d, d), dtype=np.uint8)
+    for i in range(1, d):                    # каждый цепляется к уже вошедшему
+        a, b = order[i], order[rng.integers(0, i)]
+        A[a, b] = A[b, a] = 1
+    return A
+
+
+def smallworld_graph(d: int, k: int = 2, p: float = 0.1,
+                     seed: int = 0) -> np.ndarray:
+    """Кольцо с долей p перепроведённых рёбер (Уоттс-Строгац).
+
+    Промежуточный случай по треугольникам: их меньше, чем в кольце, но
+    больше нуля. Проверяет, что провал ARACNE идёт плавно, а не скачком.
+    """
+    import networkx as nx
+    # Связный вариант, а не обычный: обычный изредка распадается, и тогда
+    # страж на минимальную компоненту роняет весь прогон на одном сиде.
+    g = nx.connected_watts_strogatz_graph(d, 2 * k, p, tries=200, seed=seed)
+    return nx.to_numpy_array(g, dtype=np.uint8)
+
+
+def scalefree_graph(d: int, m: int = 3, seed: int = 0) -> np.ndarray:
+    """Барабаши-Альберт: узлы-концентраторы, степени по степенному закону.
+
+    Самый непохожий на остальные: у решётки и кольца степени одинаковы, здесь
+    разброс на порядок. Настоящие сети - биологические в том числе - устроены
+    так, поэтому это ближайший к реальности из синтетических случаев.
+    """
+    import networkx as nx
+    g = nx.barabasi_albert_graph(d, m, seed=seed)
+    return nx.to_numpy_array(g, dtype=np.uint8)
+
+
 def geometric_graph(d: int, k: int = 6, seed: int = 0) -> np.ndarray:
     """Случайные точки на плоскости, каждая соединена с k ближайшими.
 
@@ -175,9 +217,19 @@ def make_clusters(side: int = 16, n: int = 12000, n_classes: int = 4,
     elif graph == "ring":
         A = ring_graph(d, k=2)
         xy = None
+    elif graph == "tree":
+        A = tree_graph(d, seed=seed)
+        xy = None
+    elif graph == "smallworld":
+        A = smallworld_graph(d, seed=seed)
+        xy = None
+    elif graph == "scalefree":
+        A = scalefree_graph(d, seed=seed)
+        xy = None
     else:
-        raise ValueError(f"неизвестный тип графа {graph!r}; есть: "
-                         "grid, community, geometric, ring")
+        raise ValueError(f"неизвестный тип графа {graph!r}; есть: grid, "
+                         "community, geometric, ring, tree, smallworld, "
+                         "scalefree")
     nb = [np.flatnonzero(A[v]) for v in range(d)]
 
     # Пятно растёт по рёбрам, поэтому в компоненту меньше m вершин не влезает.

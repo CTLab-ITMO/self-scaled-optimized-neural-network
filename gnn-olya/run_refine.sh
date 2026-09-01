@@ -40,12 +40,14 @@ fi
 # Порядок правил не случаен: сначала два контроля, затем corr_static - граф по
 # корреляциям без всякой петли, - и только потом итеративные правила. Планка
 # стоит на corr_static: не обогнал его, значит итеративность не нужна.
-RULES="keep random_rewire corr_static corr_greedy grad_greedy grad_corr"
+# Последним идёт partial_free - единственное правило, которому НЕ сообщают
+# число рёбер. Оно единственное решает задачу целиком.
+RULES="keep random_rewire corr_static corr_greedy grad_greedy grad_corr partial_static aracne_static partial_free"
 
 # Четыре типа истинного графа: вывод не должен оказаться свойством решётки.
-GRAPHS="grid community geometric ring"
-
-SEEDS="0 1 2"
+# Задаются снаружи: SEEDS="0 1 2 3 4" ./run_refine.sh
+GRAPHS=${GRAPHS:-"grid community geometric ring"}
+SEEDS=${SEEDS:-"0 1 2"}
 START=${START:-random}     # с какого графа стартуем: random | knn_corr_k8
 ROUNDS=${ROUNDS:-6}
 EPOCHS=${EPOCHS:-20}

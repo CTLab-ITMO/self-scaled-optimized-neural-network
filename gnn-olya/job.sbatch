@@ -9,8 +9,10 @@
 #
 # Запуск на кластере с SLURM:
 #
-#   sbatch job.sbatch              полный перебор (~2 ч)
-#   sbatch job.sbatch --quick      быстрый (~40 мин)
+#   sbatch job.sbatch              обе серии: структурная, затем refine
+#   sbatch job.sbatch --structure  только восстановление структуры (~10 мин)
+#   sbatch job.sbatch --refine     только сравнение правил (~45 мин)
+#   sbatch job.sbatch --quick      быстрые версии обеих (~5 мин)
 #
 #   squeue -u $USER                посмотреть очередь
 #   tail -f results/slurm-*.log    смотреть лог
@@ -49,10 +51,49 @@ else:
 EOF
 echo ""
 
-PY=.venv/bin/python ./run_refine.sh "$@"
+# Что запускать. Структурная серия идёт первой: она короткая и отвечает на
+# главный вопрос, а refine добавляет к её графам точность сети.
+DO_STRUCT=1; DO_REFINE=1; QUICK=""
+# Аргументы структурной серии прокидываются целиком: она дешёвая, и оси по
+# сидам, числу объектов и шуму гоняются именно там.
+STRUCT_ARGS=${STRUCT_ARGS:-}
+for a in "$@"; do
+  case "$a" in
+    --structure) DO_REFINE=0 ;;
+    --refine)    DO_STRUCT=0 ;;
+    --quick)     QUICK="--quick" ;;
+    *) echo "неизвестный аргумент: $a"; exit 1 ;;
+  esac
+done
 
-echo ""
-echo "=== сводка ==="
-.venv/bin/python src/refine.py --summary
+# Проверка, что перенос состоялся. Устаревший на сервере скрипт молча
+# считает не то, что ты правила, и это заметно только по числу прогонов.
+for f in src/structure.py src/eval_structure.py run_structure.sh; do
+  [ -f "$f" ] || { echo "НЕТ ФАЙЛА $f - перенос неполный, останавливаюсь"; exit 1; }
+done
+NR=$(grep -c 'partial_free' run_refine.sh || true)
+if [ "$NR" = 0 ]; then
+  echo "run_refine.sh на сервере СТАРЫЙ: в нём нет правила partial_free."
+  echo "Скопируй его заново, иначе три новых правила не посчитаются."
+  exit 1
+fi
+
+fail=0
+
+if [ "$DO_STRUCT" = 1 ]; then
+  echo "=== ВОССТАНОВЛЕНИЕ СТРУКТУРЫ ==="
+  PY=.venv/bin/python bash ./run_structure.sh $QUICK $STRUCT_ARGS || fail=1
+  echo ""
+fi
+
+if [ "$DO_REFINE" = 1 ]; then
+  echo "=== СРАВНЕНИЕ ПРАВИЛ ==="
+  PY=.venv/bin/python bash ./run_refine.sh $QUICK || fail=1
+  echo ""
+  echo "=== сводка правил ==="
+  .venv/bin/python src/refine.py --summary
+fi
+
+[ "$fail" = 0 ] || echo "ВНИМАНИЕ: часть серии завершилась с ошибкой, см. выше."
 echo ""
 echo "конец: $(date '+%F %T')"
