@@ -1,3 +1,6 @@
+# проверяет, насколько хорошо методы восстанавливают настоящий граф по данным
+# запускает тесты на синтетических графах и сохраняет результаты в structure.csv
+
 from __future__ import annotations
 
 import argparse
@@ -177,9 +180,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true", help="один граф, один сид")
     ap.add_argument("--summary", action="store_true", help="только свести")
-    ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--graphs", default=",".join(GRAPHS))
-    ap.add_argument("--n-grid", default="6000",
+    ap.add_argument("--n-grid", default="500,1000,2000,6000",
                     help="через запятую: сколько объектов в выборке")
     ap.add_argument("--side", type=int, default=12)
     a = ap.parse_args()

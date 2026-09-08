@@ -1,3 +1,5 @@
+# создаёт графы, на которых обучается GNN
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

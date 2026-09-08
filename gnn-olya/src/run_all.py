@@ -1,3 +1,6 @@
+# запускает основной эксперимент сразу для многих графов и seeds
+# пропускает уже готовые запуски и дописывает новые результаты в общую таблицу
+
 from __future__ import annotations
 
 import argparse
@@ -94,22 +97,16 @@ def main() -> int:
                          "отладочный. Входит в ключ пропуска: другой бюджет - "
                          "другой эксперимент, молча переиспользовать строку "
                          "со старым бюджетом нельзя.")
-    ap.add_argument("--pool", type=int, default=None,
-                    help="Пулинг без урезания выборки (см. train.py). "
-                         "d пишется в results.csv и входит в ключ пропуска.")
     ap.add_argument("--tf32", action="store_true",
                     help="TF32 на матмулах (Ampere и новее). См. train.py.")
-    ap.add_argument("--arch", nargs="*", default=None,
-                    choices=["gcn", "gat", "gin"],
-                    help="Архитектуры, например --arch gcn gat. "
-                         "По умолчанию - одна из конфига (gcn).")
-    ap.add_argument("--in-channels", nargs="*", type=int, default=None,
-                    help="Сетка обогащения признака, например "
-                         "--in-channels 1 8. По умолчанию 1 (без обогащения).")
+    ap.add_argument("--arch", nargs="*", default=None, choices=["gcn"],
+                    help="В актуальной серии оставлена только архитектура gcn.")
+    ap.add_argument("--in-channels", nargs="*", type=int, default=None, choices=[1],
+                    help="В актуальной серии используется один скалярный признак.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    cfg = load_config(dev=args.dev, pool=args.pool)
+    cfg = load_config(dev=args.dev)
     if args.epochs is not None:
         cfg.train["epochs"] = args.epochs
     cfg.train["tf32"] = bool(args.tf32)

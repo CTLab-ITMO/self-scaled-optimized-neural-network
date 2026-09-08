@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# запуск structure/refine через SLURM
+
 #SBATCH --job-name=gnn-refine
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1

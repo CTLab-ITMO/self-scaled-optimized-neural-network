@@ -16,4 +16,5 @@ results/.run_all.lock
 *.orig
 *~
 results/smoke.csv
+results/smoke_validated.csv
 results/dev_*.csv

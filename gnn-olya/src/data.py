@@ -1,3 +1,6 @@
+# загружает MNIST и подготавливает данные для модели
+# делит данные на train/validation/test и переставляет признаки как нужно эксперименту
+
 from __future__ import annotations
 
 from dataclasses import dataclass

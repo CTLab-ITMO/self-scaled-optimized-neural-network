@@ -1,3 +1,6 @@
+# проверяет, помогает ли заменить исходный граф на граф, построенный по данным
+# сравнивает хорошие методы с вариантами «ничего не менять» и «менять случайно»
+
 from __future__ import annotations
 
 import argparse
@@ -57,7 +60,6 @@ class Context:
 class Stats:
     val_acc: float
     test_acc: float
-    edge_grad: np.ndarray      # [d, d], < 0 = ребро выгодно усилить
     n_edges: int
 
 
@@ -95,19 +97,8 @@ def train_round(A: np.ndarray, ctx: Context, epochs: int, hidden: int,
     def acc(x, y):
         return float((net(x, A_hat).argmax(1) == y).float().mean())
 
-    # --- градиент потерь по весам рёбер: A снова непрерывна и требует grad
-    At = torch.tensor(A, dtype=torch.float32, device=ctx.device,
-                      requires_grad=True)
-    sub = min(2048, n)
-    loss = lf(net(ctx.x_train[:sub], _normalize_torch(At)), ctx.y_train[:sub])
-    grad = torch.autograd.grad(loss, At)[0]
-    grad = ((grad + grad.t()) / 2)             # граф неориентированный
-    grad.fill_diagonal_(0.0)
-
-    # Градиент снимается только с train: он правит граф, с теста была бы утечка.
     return Stats(val_acc=acc(ctx.x_val, ctx.y_val),
                  test_acc=acc(ctx.x_test, ctx.y_test),
-                 edge_grad=grad.detach().cpu().numpy(),
                  n_edges=int(A.sum() // 2))
 
 

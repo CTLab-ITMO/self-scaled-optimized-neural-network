@@ -1,3 +1,6 @@
+# обучает одну модель на одном выбранном графе
+# после обучения считает качество и сохраняет результат
+
 from __future__ import annotations
 
 import os
@@ -88,8 +91,6 @@ def run_one(graph_name: str, seed: int, cfg: Config, data: Data,
     else:
         graph = build_graph(graph_name, cfg, data)
         graph_meta = {"group": graph.group, "honest": graph.honest, **graph.meta}
-        # Матрица зависит от архитектуры: GCN нужна нормализованная, GAT -
-        # маска смежности (веса он считает сам), GIN - сырая A (сумма).
         A_hat = torch.from_numpy(
             propagation_matrix(graph.A, cfg.model.kind)).to(device)
 
@@ -202,28 +203,16 @@ if __name__ == "__main__":
                     help="ТОЛЬКО для калибровки бюджета обучения. "
                          "В боевых прогонах не использовать: число эпох - "
                          "часть зафиксированного протокола.")
-    ap.add_argument("--pool", type=int, default=None,
-                    help="Пулинг pool x pool БЕЗ урезания выборки: 2 даёт "
-                         "d = 196 при полных 55k train и полном бюджете эпох. "
-                         "Отличается от --dev, который режет и выборку тоже. "
-                         "Нужен для H8: GAT квадратичен по d, и при d = 196 "
-                         "он в 16 раз дешевле. d пишется в results.csv.")
     ap.add_argument("--tf32", action="store_true",
                     help="Включить TF32 на матмулах. На Ampere кратно быстрее, "
                          "детерминизм сохраняется, но численно это другой "
                          "режим: значение пишется в results.csv и входит в "
                          "ключ пропуска. Первая серия (110 прогонов) сделана "
                          "БЕЗ него - не смешивать в одном сравнении.")
-    ap.add_argument("--arch", default=None, choices=["gcn", "gat", "gin"],
-                    help="Архитектура. Базовая - gcn, все 110 прогонов сделаны "
-                         "на ней. gat и gin добавлены под H8 "
-                         "(см. docs/PREREGISTRATION.md). Пишется в results.csv и "
-                         "входит в ключ пропуска.")
-    ap.add_argument("--in-channels", type=int, default=None,
-                    help="Обогащение признака вершины: RBF-разложение скаляра "
-                         "в k каналов. 1 - без обогащения (базовый режим). "
-                         "Информации не добавляет, только размерность - этим "
-                         "и проверяется вторая половина H8.")
+    ap.add_argument("--arch", default=None, choices=["gcn"],
+                    help="В актуальной серии оставлена только архитектура gcn.")
+    ap.add_argument("--in-channels", type=int, default=None, choices=[1],
+                    help="В актуальной серии используется один скалярный признак.")
     ap.add_argument("--layers", type=int, default=None,
                     help="Число слоёв L. Ось глубины - предмет исследования "
                          "(см. docs/PREREGISTRATION.md), поэтому L логируется в "
@@ -236,7 +225,7 @@ if __name__ == "__main__":
                          "объём данных совпадают с боевым прогоном.")
     args = ap.parse_args()
 
-    cfg = load_config(dev=args.dev, pool=args.pool)
+    cfg = load_config(dev=args.dev)
     cfg.train["tf32"] = bool(args.tf32)
     if args.arch is not None:
         cfg.model["kind"] = args.arch

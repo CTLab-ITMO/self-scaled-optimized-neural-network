@@ -63,7 +63,7 @@ python src/refine.py --summary
 ./run_refine.sh
 ```
 
-Первая серия / дополнительные оси обучения:
+Повтор подтверждённой первой серии:
 
 ```bash
 python src/run_all.py --graphs grid4 grid4_misaligned --seeds 0 1 2 3 4

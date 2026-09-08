@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# пытаемся восстановить структуру 
+# данные → один раз построили graph → сравнили с truth
+# делает self-check structure.py, затем запускает eval_structure.py; результаты в results/structure.csv
+
 
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -34,8 +38,17 @@ rm -f /tmp/structure_dev.$$
 echo "${C_OK}пройдена${C_OFF}"
 echo ""
 
-$PY src/eval_structure.py "$@"
-rc=$?
+if [ "$#" -eq 0 ]; then
+  # Сохранённая таблица считалась в два шага: 5 сидов на всей сетке n и
+  # ещё 5 сидов только на n=6000. Повторяем именно этот протокол.
+  $PY src/eval_structure.py --seeds 5 --n-grid 500,1000,2000,6000
+  rc=$?
+  [ "$rc" = 0 ] && $PY src/eval_structure.py --seeds 10 --n-grid 6000
+  rc=$?
+else
+  $PY src/eval_structure.py "$@"
+  rc=$?
+fi
 
 if [ "$rc" != 0 ]; then
   echo "${C_WARN}Прогон завершился с кодом $rc.${C_OFF}"

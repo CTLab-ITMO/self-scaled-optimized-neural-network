@@ -1,3 +1,6 @@
+# проверяет, сколько эпох нужно обучать модель, чтобы она успела нормально обучиться
+# нужен, чтобы не сравнивать недообученные модели
+
 from __future__ import annotations
 
 import argparse
@@ -38,8 +41,8 @@ def main() -> int:
                          "docs/PREREGISTRATION.md требует калибровать каждое L "
                          "отдельно, иначе сетка глубин измерит скорость "
                          "сходимости вместо качества графа.")
-    ap.add_argument("--arch", default=None, choices=["gcn", "gat", "gin"],
-                    help="Калибровать под конкретную архитектуру.")
+    ap.add_argument("--arch", default=None, choices=["gcn"],
+                    help="В актуальной серии оставлена только архитектура gcn.")
     ap.add_argument("--graphs", nargs="*", default=None,
                     help=f"Опорные кандидаты (по умолчанию {PROBE_GRAPHS}).")
     ap.add_argument("--epochs", type=int, default=120,

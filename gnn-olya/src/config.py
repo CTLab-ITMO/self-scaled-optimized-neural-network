@@ -1,3 +1,6 @@
+# читает настройки эксперимента из конфига
+# хранит общие параметры и пути к файлам
+
 from __future__ import annotations
 
 import hashlib
@@ -28,15 +31,13 @@ class Config(dict):
         return obj
 
 
-def load_config(path: str | Path = DEFAULT_CONFIG, dev: bool = False,
-                pool: int | None = None) -> Config:
+def load_config(path: str | Path = DEFAULT_CONFIG, dev: bool = False) -> Config:
     """Читает fixed.yaml. При dev=True накатывает секцию data.dev поверх.
 
     Хеш (cfg.hash) считается по ИСХОДНОМУ файлу, до применения dev-оверрайдов,
     поэтому он одинаков в dev и в боевом режиме. Режим пишется отдельным полем
     cfg.dev, и в results.csv тоже - смешивать dev- и боевые строки нельзя.
     """
-    pool_arg = pool
     path = Path(path)
     raw_text = path.read_text(encoding="utf-8")
     cfg_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:12]
@@ -59,21 +60,6 @@ def load_config(path: str | Path = DEFAULT_CONFIG, dev: bool = False,
         raw["train"]["epochs"] = dev_overrides["epochs"]
     else:
         raw["data"]["pool"] = 1
-
-    # pool отдельно от dev: пулинг БЕЗ урезания выборки. Нужен для H8, где
-    # дорога только размерность (GAT квадратичен по d), а полная выборка и
-    # полный бюджет эпох нужны - иначе меряется недообучение, а не внимание.
-    # d пишется в results.csv, так что режимы в таблице различимы.
-    if pool_arg is not None and pool_arg > 1:
-        if dev:
-            raise ValueError("--pool и --dev вместе не имеют смысла: "
-                             "dev уже включает свой пулинг и урезает выборку")
-        base = yaml.safe_load(raw_text)["data"]["side"]
-        if base % pool_arg:
-            raise ValueError(f"side={base} не делится на pool={pool_arg}")
-        raw["data"]["side"] = base // pool_arg
-        raw["data"]["d"] = raw["data"]["side"] ** 2
-        raw["data"]["pool"] = pool_arg
 
     cfg = Config._wrap(raw)
     cfg["hash"] = cfg_hash

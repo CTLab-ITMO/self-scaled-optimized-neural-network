@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# эксперимент «может ли граф сам улучшаться в процессе обучения»
+# итеративный цикл refinement: обучаем gnn немного, смотрим на граф, меняем, снова обучаем...
+# 5 правил того как меняем граф, 4 вида графа, 5 сидов
+
 
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -22,9 +26,9 @@ fi
 RULES="keep random_rewire corr_static partial_static partial_free"
 
 GRAPHS=${GRAPHS:-"grid community geometric ring"}
-SEEDS=${SEEDS:-"0 1 2"}
+SEEDS=${SEEDS:-"0 1 2 3 4"}
 START=${START:-random}     # с какого графа стартуем: random | knn_corr_k8
-ROUNDS=${ROUNDS:-6}
+ROUNDS=${ROUNDS:-20}
 EPOCHS=${EPOCHS:-20}
 BUDGET=${BUDGET:-60}
 SIDE=${SIDE:-12}
@@ -54,20 +58,57 @@ mkdir -p "$STATE"
 C_OK=$'\033[32m'; C_RUN=$'\033[36m'; C_WARN=$'\033[33m'; C_OFF=$'\033[0m'
 [ -t 1 ] || { C_OK=""; C_RUN=""; C_WARN=""; C_OFF=""; }
 
+CSV_DONE_KEYS=""
+if [ "$START" = random ] && [ "$SIDE" = 12 ] && [ "$N" = 6000 ] && \
+   [ "$CLASSES" = 4 ] && [ "$M" = 24 ] && [ -f results/refine.csv ]; then
+  CSV_DONE_KEYS=$($PY - results/refine.csv "$START" "$ROUNDS" <<'EOF' 2>/dev/null
+import csv, sys
+path, start, rounds = sys.argv[1], sys.argv[2], int(sys.argv[3])
+seen = {}
+with open(path, newline="", encoding="utf-8") as f:
+    for row in csv.DictReader(f):
+        if row.get("start") != start:
+            continue
+        try:
+            key = (row["rule"], row["graph"], int(row["seed"]))
+            seen.setdefault(key, set()).add(int(row["round"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+for (rule, graph, seed), rs in seen.items():
+    if all(r in rs for r in range(rounds)):
+        print(f"{rule}__{graph}__s{seed}")
+EOF
+  )
+fi
+
 is_done () {
-  local f="$STATE/$1.npz"
-  [ -f "$f" ] || return 1
-  $PY - "$f" "$ROUNDS" <<'EOF' 2>/dev/null
+  local key="$1" rule="$2" graph="$3" seed="$4"
+  local f="$STATE/$key.npz"
+  if [ -f "$f" ]; then
+    $PY - "$f" "$ROUNDS" <<'EOF' 2>/dev/null
 import sys, numpy as np
 z = np.load(sys.argv[1], allow_pickle=True)
 sys.exit(0 if int(z["round"]) >= int(sys.argv[2]) - 1 else 1)
 EOF
+    return $?
+  fi
+
+  # В Git локальные .npz не хранятся, поэтому полный уже посчитанный прогон
+  # дополнительно узнаём по refine.csv. CSV относится именно к этим параметрам.
+  case "
+$CSV_DONE_KEYS
+" in
+    *"
+${rule}__${graph}__s${seed}
+"*) return 0 ;;
+  esac
+  return 1
 }
 
 total=0; done_n=0
 for r in $RULES; do for g in $GRAPHS; do for s in $SEEDS; do
   total=$((total + 1))
-  is_done "${r}__${g}__${START}__s${s}__d$((SIDE*SIDE))_n${N}_c${CLASSES}_m${M}" && done_n=$((done_n + 1))
+  is_done "${r}__${g}__${START}__s${s}__d$((SIDE*SIDE))_n${N}_c${CLASSES}_m${M}" "$r" "$g" "$s" && done_n=$((done_n + 1))
 done; done; done
 
 if [ "$STATUS" = 1 ]; then
@@ -81,7 +122,7 @@ if [ "$STATUS" = 1 ]; then
     printf "  %-16s" "$r"
     for g in $GRAPHS; do
       k=0
-      for s in $SEEDS; do is_done "${r}__${g}__${START}__s${s}__d$((SIDE*SIDE))_n${N}_c${CLASSES}_m${M}" && k=$((k + 1)); done
+      for s in $SEEDS; do is_done "${r}__${g}__${START}__s${s}__d$((SIDE*SIDE))_n${N}_c${CLASSES}_m${M}" "$r" "$g" "$s" && k=$((k + 1)); done
       printf "%-13s" "$k/$(echo $SEEDS | wc -w)"
     done
     echo
@@ -114,7 +155,7 @@ for r in $RULES; do
     for s in $SEEDS; do
       i=$((i + 1))
       key="${r}__${g}__${START}__s${s}__d$((SIDE*SIDE))_n${N}_c${CLASSES}_m${M}"
-      if is_done "$key"; then
+      if is_done "$key" "$r" "$g" "$s"; then
         echo "${C_OK}[$i/$total сделан]${C_OFF} $r / $g / сид $s"
         continue
       fi
