@@ -1,21 +1,3 @@
-"""Реестр кандидатов A - единственная варьируемая часть эксперимента.
-
-Каждый сборщик возвращает бинарную симметричную матрицу с нулевой диагональю.
-Валидация и подсчёт базовых характеристик - общие для всех, чтобы кандидат
-физически не мог просочиться в эксперимент невалидным.
-
-Группы (см. docs/PLAN.md, п.3):
-    R  референсы - границы шкалы
-    O  оракулы - используют знание pi, помечены honest=False
-    D  data-driven - строятся ТОЛЬКО по train
-    C  контроли - согласованы по плотности со своим оригиналом
-    W  кривая деградации (Уоттс-Строгатц)
-    P  патологии
-
-На шаге 3 реализованы только кандидаты, нужные для санити-гейта (шаг 4).
-Остальные добавляются на шаге 6 - сюда же, тем же декоратором.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -53,9 +35,6 @@ def available() -> list[str]:
     return list(_BUILDERS)
 
 
-# --------------------------------------------------------------------------
-#  общая машинерия
-# --------------------------------------------------------------------------
 
 def validate(A: np.ndarray, d: int) -> None:
     if A.shape != (d, d):
@@ -254,127 +233,10 @@ def _thr_corr(cfg, data) -> np.ndarray:
     return top_m_edges(pixel_correlation(data), m)
 
 
+
 # --------------------------------------------------------------------------
 #  C - контроли. Каждый согласован по плотности со своим оригиналом.
 # --------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-#  Группа D2: граф из обучаемых представлений признаков и из градиентов
-#  (пункт 3 задания: "через обучаемые embeddings" и "по градиентам/активациям")
-# ---------------------------------------------------------------------------
-
-def feature_embeddings(data, rank: int = 16, steps: int = 300,
-                       seed: int = 0) -> np.ndarray:
-    """Учит вектор e_v на каждый признак, возвращает похожести <e_u, e_v>.
-
-    Постановка: x ~ x @ (E E^T) с нулём на диагонали, обучается на MSE.
-    Низкий ранг должен давить ложные корреляции редких признаков — проверено
-    и НЕ подтвердилось, см. docs/IDEAS.md, идея 30.
-    """
-    import torch
-
-    cache_key = f"_emb_cache_r{rank}_s{steps}_{seed}"
-    cached = getattr(data, cache_key, None)
-    if cached is not None:
-        return cached
-
-    x = torch.from_numpy(np.ascontiguousarray(data.x_train)).float()
-    d = x.shape[1]
-    # центрируем: иначе E ловит средние яркости, а не связи между признаками
-    x = x - x.mean(0, keepdim=True)
-    g = torch.Generator().manual_seed(seed)
-    E = torch.nn.Parameter(torch.randn(d, rank, generator=g) * 0.01)
-    opt = torch.optim.Adam([E], lr=0.05)
-    n = len(x)
-    for step in range(steps):
-        idx = torch.randint(0, n, (512,), generator=g)
-        xb = x[idx]
-        W = E @ E.t()
-        W = W - torch.diag(torch.diag(W))      # признак не предсказывает сам себя
-        loss = ((xb @ W - xb) ** 2).mean()
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-
-    with torch.no_grad():
-        S = (E @ E.t()).abs().numpy().astype(np.float64)
-    np.fill_diagonal(S, 0.0)
-    # мёртвые признаки: их эмбеддинг ничем не определён, обнуляем явно
-    dead = data.x_train.std(axis=0) == 0
-    S[dead, :] = 0.0
-    S[:, dead] = 0.0
-    setattr(data, cache_key, S)
-    return S
-
-
-def gradient_similarity(data, n_classes: int = 10, hidden: int = 128,
-                        steps: int = 400, n_probe: int = 4000,
-                        seed: int = 0) -> np.ndarray:
-    """Похожесть признаков по картам градиентов обученного MLP.
-
-    Взгляд модели, а не данных: признаки связаны, если модель использует их
-    согласованно. Всё считается на train.
-
-    Особенность: у мёртвого признака градиент ненулевой (зависит от весов, не
-    от значения), поэтому метод их не изолирует и тратит рёбра впустую.
-    Проверено — сигнал неустойчив, см. docs/IDEAS.md, идея 31.
-    """
-    import torch
-
-    cache_key = f"_grad_cache_{hidden}_{steps}_{seed}"
-    cached = getattr(data, cache_key, None)
-    if cached is not None:
-        return cached
-
-    x = torch.from_numpy(np.ascontiguousarray(data.x_train)).float()
-    y = torch.from_numpy(np.ascontiguousarray(data.y_train)).long()
-    d = x.shape[1]
-    g = torch.Generator().manual_seed(seed)
-    torch.manual_seed(seed)
-    net = torch.nn.Sequential(
-        torch.nn.Linear(d, hidden), torch.nn.ReLU(),
-        torch.nn.Linear(hidden, n_classes))
-    opt = torch.optim.Adam(net.parameters(), 1e-3)
-    lf = torch.nn.CrossEntropyLoss()
-    n = len(x)
-    for step in range(steps):
-        idx = torch.randint(0, n, (256,), generator=g)
-        opt.zero_grad()
-        lf(net(x[idx]), y[idx]).backward()
-        opt.step()
-
-    # карты градиентов по подвыборке: [n_probe, d]
-    probe = x[torch.randperm(n, generator=g)[:min(n_probe, n)]].clone()
-    probe.requires_grad_(True)
-    lf(net(probe), y[:len(probe)]).backward()
-    G = probe.grad.detach().numpy().astype(np.float64)
-
-    alive = G.std(axis=0) > 0
-    S = np.zeros((d, d), dtype=np.float64)
-    if alive.sum() > 1:
-        C = np.nan_to_num(np.corrcoef(G[:, alive], rowvar=False), nan=0.0)
-        S[np.ix_(alive, alive)] = np.abs(C)
-    np.fill_diagonal(S, 0.0)
-    setattr(data, cache_key, S)
-    return S
-
-
-def _register_emb(k: int) -> None:
-    @register(f"emb_learned_k{k}", group="D")
-    def _b(cfg, data, _k=k) -> np.ndarray:  # noqa: ANN001
-        return knn_from_similarity(feature_embeddings(data), _k)
-
-
-def _register_grad(k: int) -> None:
-    @register(f"grad_sim_k{k}", group="D")
-    def _b(cfg, data, _k=k) -> np.ndarray:  # noqa: ANN001
-        return knn_from_similarity(gradient_similarity(data), _k)
-
-
-for _k in (4, 8, 16):
-    _register_emb(_k)
-    _register_grad(_k)
-
 
 def _rng(cfg, salt: int = 0) -> np.random.Generator:
     """Сид графов, НЕ сид прогона: граф обязан быть одинаковым во всех сидах."""

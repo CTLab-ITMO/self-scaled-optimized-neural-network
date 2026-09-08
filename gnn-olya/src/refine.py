@@ -1,19 +1,3 @@
-"""Итеративное улучшение матрицы смежности (пункт 4 задания).
-
-Петля: обучить GNN -> собрать статистики -> обновить связи -> повторить.
-Правило обновления подключается по имени, см. реестр ниже.
-
-В реестре вместе с правилами лежат контроли `keep` и `random_rewire`.
-Правило, не обогнавшее оба, ничего не делает.
-
-ОСТОРОЖНО при чтении чисел: на плохом графе сеть схлопывается в один класс
-(замерено: acc ровно 0.2533 = доля класса при трёх разных сидах). Поэтому
-`keep` даёт одинаковую точность во всех раундах, а скачок точности означает
-лишь выход из вырождения, а не хороший граф. Подробности — docs/IDEAS.md, идея 34.
-
-Запуск: python src/refine.py --rule corr_greedy --rounds 6
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -31,10 +15,6 @@ from config import load_config, results_dir  # noqa: E402
 from model import DenseGCN  # noqa: E402
 
 _RULES: dict[str, callable] = {}
-# Правила, которым разрешено менять число рёбер. Всем остальным плотность
-# задана и обязана сохраняться, иначе сравнение поедет по плотности. Здесь
-# наоборот: поиск плотности - и есть работа правила, а платой за поблажку
-# идёт пометка в выводе, чтобы никто не сравнил их наивно.
 _FREE_DENSITY: set[str] = set()
 
 
@@ -52,9 +32,6 @@ def available_rules() -> list[str]:
     return sorted(_RULES)
 
 
-# ---------------------------------------------------------------------------
-#  Контекст и статистики
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Context:
@@ -196,41 +173,12 @@ def _corr_matrix(ctx: Context) -> np.ndarray:
     return S
 
 
-@rule("corr_greedy")
-def _corr_greedy(A: np.ndarray, st: Stats, ctx: Context,
-                 budget: int = 200, **kw) -> np.ndarray:
-    """БАЗОВОЕ ПРАВИЛО: менять рёбра по корреляции, не глядя на модель.
-
-    Главный ориентир: `corr_static` - тот же сигнал, но одним махом.
-    Правило, не дотянувшее до него, делает петлю ненужной.
-
-    Бюджет тратится каждый раунд целиком, даже когда менять уже нечего: на
-    плато правило выкидывает хорошие рёбра и возвращает их обратно, зависая
-    в коротком цикле чуть НИЖЕ `corr_static` (замерено: 0.861 против 0.979 на
-    кольце). Это свойство наивной жадности, а не сбой; чинится условием
-    «менять только если корреляция реально выше», но тогда правило сойдётся
-    ровно в `corr_static` и перестанет быть отдельной точкой сравнения.
-    """
-    S = _corr_matrix(ctx)
-    iu = np.triu_indices(ctx.d, 1)
-    v = S[iu]
-    present = A[iu] > 0
-    cand_add = np.flatnonzero(~present)
-    cand_del = np.flatnonzero(present)
-    k = min(budget, len(cand_add), len(cand_del))
-    if k == 0:
-        return A
-    add = cand_add[np.argsort(-v[cand_add])[:k]]     # самая сильная связь
-    drop = cand_del[np.argsort(v[cand_del])[:k]]     # самая слабая
-    return _apply(A, iu, drop, add)
-
-
 @rule("corr_static")
 def _corr_static(A: np.ndarray, st: Stats, ctx: Context, **kw) -> np.ndarray:
     """ОРИЕНТИР БЕЗ ПЕТЛИ: сразу взять |E| пар с наибольшей |корреляцией|.
 
-    Это предел corr_greedy при бесконечном бюджете: одна строка numpy, ни сети,
-    ни раундов. Правило, не обогнавшее его, не оправдывает саму итеративность.
+    Это сильный одношаговый ориентир: одна матрица корреляций, без сети и
+    дополнительных раундов. Правило, не обогнавшее его, не оправдывает итеративность.
     Побочная польза: граф после первого раунда не меняется, поэтому разброс
     точности по раундам даёт оценку шума обучения на ХОРОШЕМ графе.
     """
@@ -243,58 +191,6 @@ def _corr_static(A: np.ndarray, st: Stats, ctx: Context, **kw) -> np.ndarray:
     out = np.zeros_like(A)
     out[iu[0][top], iu[1][top]] = 1
     return np.maximum(out, out.T)
-
-
-@rule("grad_corr")
-def _grad_corr(A: np.ndarray, st: Stats, ctx: Context,
-               budget: int = 200, alpha: float = 0.5, **kw) -> np.ndarray:
-    """Смесь градиента и корреляции, обе величины приводятся к рангам.
-
-    Ранги обязательны: градиент ~1e-4, корреляция ~1, прямая сумма отдала бы
-    всё одному сигналу. Смесь осмысленна, если обгонит обе составляющие.
-    """
-    iu = np.triu_indices(ctx.d, 1)
-    g = -st.edge_grad[iu]                     # больше = полезнее добавить
-    c = _corr_matrix(ctx)[iu]
-
-    def to_rank(z):
-        r = np.empty(len(z))
-        r[np.argsort(z)] = np.arange(len(z))
-        return r / max(len(z) - 1, 1)
-
-    score = alpha * to_rank(g) + (1 - alpha) * to_rank(c)
-    present = A[iu] > 0
-    cand_add = np.flatnonzero(~present)
-    cand_del = np.flatnonzero(present)
-    k = min(budget, len(cand_add), len(cand_del))
-    if k == 0:
-        return A
-    add = cand_add[np.argsort(-score[cand_add])[:k]]
-    drop = cand_del[np.argsort(score[cand_del])[:k]]
-    return _apply(A, iu, drop, add)
-
-
-@rule("grad_greedy")
-def _grad_greedy(A: np.ndarray, st: Stats, ctx: Context,
-                 budget: int = 200, **kw) -> np.ndarray:
-    """ЗАГЛУШКА: добавить рёбра с лучшим градиентом, убрать с худшим.
-
-    Слабое место: градиент говорит о МАЛОМ изменении веса, а делается скачок
-    0 -> 1, и снят он на сети, обученной под текущий граф. См. docs/IDEAS.md, 34.
-    """
-    A = A.copy()
-    iu = np.triu_indices(ctx.d, 1)
-    g = st.edge_grad[iu]
-    present = A[iu] > 0
-
-    cand_add = np.flatnonzero(~present)
-    cand_del = np.flatnonzero(present)
-    k = min(budget, len(cand_add), len(cand_del))
-    if k == 0:
-        return A
-    add = cand_add[np.argsort(g[cand_add])[:k]]        # самый отрицательный
-    drop = cand_del[np.argsort(-g[cand_del])[:k]]      # самый положительный
-    return _apply(A, iu, drop, add)
 
 
 def _fitted(ctx: Context, score: str, n_edges: int | None) -> np.ndarray:
@@ -321,12 +217,6 @@ def _partial_static(A: np.ndarray, st: Stats, ctx: Context, **kw) -> np.ndarray:
     считаются по train, ни одна не смотрит ни на модель, ни на A_true.
     """
     return _fitted(ctx, "partial", int(A.sum() // 2))
-
-
-@rule("aracne_static")
-def _aracne_static(A: np.ndarray, st: Stats, ctx: Context, **kw) -> np.ndarray:
-    """То же плюс чистка треугольников. Плотность задана."""
-    return _fitted(ctx, "partial_aracne", int(A.sum() // 2))
 
 
 @rule("partial_free", free_density=True)
@@ -455,10 +345,8 @@ def summarize() -> int:
         return 1
     df = pd.read_csv(f)
 
-    # Среднее по хвосту, а не последний раунд. Причины две: сеть переобучается
-    # заново каждый раунд, и `corr_greedy` на плато колеблется между двумя
-    # графами. Последний раунд ловит случайную фазу этих колебаний и добавляет
-    # разброс, которого в самих правилах нет.
+    # Среднее по хвосту, а не последний раунд: сеть переобучается заново каждый
+    # раунд, поэтому последний раунд добавляет случайный шум обучения.
     # Хвост берётся у КАЖДОГО прогона свой. Общий порог по номеру раунда
     # выбрасывал целиком правила, досчитанные с меньшим --rounds: их строки
     # просто не доходили до порога, и в таблице они молча исчезали.
@@ -485,9 +373,7 @@ def summarize() -> int:
         t = last.pivot_table(index="rule", columns="graph", values=col,
                              aggfunc="mean")
         order = [r for r in ("keep", "random_rewire", "corr_static",
-                             "corr_greedy", "grad_greedy", "grad_corr",
-                             "partial_static", "aracne_static",
-                             "partial_free") if r in t.index]
+                             "partial_static", "partial_free") if r in t.index]
         print(f"\n{title}\n" + "-" * 60)
         print(t.loc[order].round(4).to_string())
 
@@ -517,7 +403,7 @@ def summarize() -> int:
     print("Правило обязано обгонять И `keep`, И `random_rewire`, иначе оно")
     print("ничего не делает. И обязано обгонять `corr_static` - граф по")
     print("корреляциям, построенный сразу и без петли; иначе итеративность")
-    print("не нужна, а `corr_greedy` - лишь медленный путь к тому же графу.")
+    print("не даёт преимущества перед одношаговым ориентиром.")
     return 0
 
 
@@ -565,11 +451,12 @@ def main() -> int:
         A0 = np.maximum(A0, A0.T)
     else:
         import graphs as G
-        from eval_builders import _Adapter, _cfg_for
-        cfg = _cfg_for(d, args.side)
-        A0 = G.build_graph("knn_corr_k8", cfg,
-                           _Adapter(ctx.x_train.cpu().numpy(),
-                                    ctx.y_train.cpu().numpy())).A
+        from types import SimpleNamespace
+        x_np = ctx.x_train.cpu().numpy()
+        adapter = SimpleNamespace(x_train=x_np, y_train=ctx.y_train.cpu().numpy())
+        cfg = SimpleNamespace(data=SimpleNamespace(d=d, side=args.side),
+                              graphs=SimpleNamespace(graph_seed=1234))
+        A0 = G.build_graph("knn_corr_k8", cfg, adapter).A
 
     print(f"устройство: {dev}   d = {d}   старт: {args.start} "
           f"({int(A0.sum() // 2)} рёбер)")

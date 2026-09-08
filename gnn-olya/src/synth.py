@@ -1,15 +1,3 @@
-"""Синтетика с ИЗВЕСТНЫМ истинным графом (пункт 5 задания).
-
-На MNIST истинного графа нет, поэтому «сколько структуры восстановлено» там
-меряется лишь приблизительно. Здесь граф задаём мы — меряется точно.
-
-Ключевое свойство: в каждом объекте ровно `m` активных вершин со значением 1
-независимо от класса, то есть гистограмма значений одинакова по построению.
-Значит без графа задача неразрешима, и пол шкалы известен заранее: 1/K.
-
-Запуск: python src/synth.py
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -87,12 +75,7 @@ def community_graph(d: int, n_comm: int = 4, p_in: float = 0.11,
 
 
 def tree_graph(d: int, seed: int = 0) -> np.ndarray:
-    """Случайное дерево. Треугольников НОЛЬ по определению.
-
-    Добавлен ради предсказания, а не наблюдения: если ARACNE проваливается
-    именно из-за треугольников, то здесь он обязан выиграть. Дерево - самый
-    жёсткий случай: рёбер всего d-1, любая ошибка сразу видна.
-    """
+    """Случайное дерево: разреженная ациклическая топология с d-1 рёбрами."""
     rng = np.random.default_rng(seed)
     order = rng.permutation(d)
     A = np.zeros((d, d), dtype=np.uint8)
@@ -104,11 +87,7 @@ def tree_graph(d: int, seed: int = 0) -> np.ndarray:
 
 def smallworld_graph(d: int, k: int = 2, p: float = 0.1,
                      seed: int = 0) -> np.ndarray:
-    """Кольцо с долей p перепроведённых рёбер (Уоттс-Строгац).
-
-    Промежуточный случай по треугольникам: их меньше, чем в кольце, но
-    больше нуля. Проверяет, что провал ARACNE идёт плавно, а не скачком.
-    """
+    """Кольцо с долей p перепроведённых рёбер (Уоттс-Строгац)."""
     import networkx as nx
     # Связный вариант, а не обычный: обычный изредка распадается, и тогда
     # страж на минимальную компоненту роняет весь прогон на одном сиде.
@@ -172,33 +151,12 @@ def _grow(A_nb: list[np.ndarray], seeds: np.ndarray, m: int,
     return np.fromiter(active, dtype=np.int64, count=len(active))
 
 
-def _blur(act: np.ndarray, nb: list[np.ndarray], noise: float, m: int,
-          rng: np.random.Generator) -> np.ndarray:
-    """Сдвигает долю активных вершин на соседа, размывая пятно, но не дробя.
-
-    Выброс в случайное место (первая версия) задачу ломал, а не усложнял.
-    """
-    act = list(act)
-    k = int(round(noise * m))
-    for _ in range(k):
-        i = rng.integers(0, len(act))
-        v = act[i]
-        cand = [int(u) for u in nb[v] if u not in act]
-        if cand:
-            act[i] = cand[rng.integers(0, len(cand))]
-    return np.array(sorted(set(act)), dtype=np.int64)
-
-
 def make_clusters(side: int = 16, n: int = 12000, n_classes: int = 4,
-                  m: int = 40, noise: float = 0.0, seed: int = 0,
-                  graph: str = "grid") -> SynthTask:
+                  m: int = 40, seed: int = 0, graph: str = "grid") -> SynthTask:
     """Класс = число связных пятен активных вершин (1, 2, ..., n_classes).
 
     Во всех объектах ровно m активных вершин, поэтому гистограмма значений от
     класса не зависит и без графа задача неразрешима.
-
-    noise — доля вершин, сдвинутых на соседа. Шкала крутая: потолок падает со
-    100% до 57% уже при 0.05. Выше 0.05 задачу считать деградировавшей.
     """
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
@@ -279,12 +237,8 @@ def make_clusters(side: int = 16, n: int = 12000, n_classes: int = 4,
     for i in range(n):
         c = int(y[i]) + 1                      # число пятен: 1..n_classes
         act, ok[i] = sample_clumps(c)
-        if noise > 0:
-            act = _blur(act, nb, noise, m, rng)
         X[i, act] = 1.0
 
-    # Метка проверена на чистой структуре, до шума: класс - это сколько пятен
-    # было, а шум портит наблюдение, а не истину.
     X, y, n = X[ok], y[ok], int(ok.sum())
 
     n_tr, n_va = int(n * 0.7), int(n * 0.1)
@@ -295,7 +249,7 @@ def make_clusters(side: int = 16, n: int = 12000, n_classes: int = 4,
         x_val=X[va], y_val=y[va],
         x_test=X[te], y_test=y[te],
         A_true=A, d=d, n_classes=n_classes,
-        name=f"clusters(side={side}, m={m}, noise={noise})",
+        name=f"clusters(side={side}, m={m})",
     )
 
 
@@ -320,15 +274,13 @@ if __name__ == "__main__":
     from sklearn.linear_model import LogisticRegression
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--noise", type=float, default=0.0)
     ap.add_argument("--side", type=int, default=12)
     ap.add_argument("--n", type=int, default=6000)
     ap.add_argument("--dev", action="store_true",
                     help="принимается для единообразия с другими модулями")
     args, _ = ap.parse_known_args()
 
-    task = make_clusters(side=args.side, n=args.n, n_classes=4, m=24,
-                         noise=args.noise)
+    task = make_clusters(side=args.side, n=args.n, n_classes=4, m=24)
     print(task.summary())
 
     # 1. Гистограмма значений обязана быть одинаковой у всех классов -
@@ -359,9 +311,7 @@ if __name__ == "__main__":
         sub = task.A_true[np.ix_(a, a)]
         ncomp, _ = connected_components(csr_matrix(sub), directed=False)
         ok += (ncomp == task.y_test[i] + 1)
-    print(f"число пятен по истинному графу совпало с меткой: {ok / n_probe:.1%}"
-          + ("" if args.noise == 0 else
-             "   (при шуме < 100% - это свойство задачи)"))
+    print(f"число пятен по истинному графу совпало с меткой: {ok / n_probe:.1%}")
 
     # 4. Метрика восстановления: сама себя обязана давать единицу.
     r = recovery(task.A_true, task.A_true)

@@ -1,9 +1,3 @@
-"""Загрузка зафиксированного конфига + его хеш.
-
-Хеш пишется в каждую строку результатов: если конфиг кто-то правил между
-прогонами, это будет видно сразу, а не через неделю при разборе таблицы.
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -42,8 +36,6 @@ def load_config(path: str | Path = DEFAULT_CONFIG, dev: bool = False,
     поэтому он одинаков в dev и в боевом режиме. Режим пишется отдельным полем
     cfg.dev, и в results.csv тоже - смешивать dev- и боевые строки нельзя.
     """
-    # Внутри ветки dev ниже есть своя локальная `pool` из dev_overrides,
-    # которая затирает этот параметр. Забираем значение до неё.
     pool_arg = pool
     path = Path(path)
     raw_text = path.read_text(encoding="utf-8")

@@ -1,12 +1,3 @@
-"""Структурный предрасчёт по оси глубины. Обучения не требует, считается за минуту.
-
-Зачем: зона охвата за L шагов и скорость перемешивания определяют, в каком
-режиме глубины кандидат вообще способен работать. Считается ДО обучения,
-чтобы предсказания по L были предсказаниями, а не подгонкой.
-
-Запуск:  python src/depth_precheck.py
-         python src/depth_precheck.py --dev   # d=196, для быстрой проверки
-"""
 import argparse
 import sys, os
 import numpy as np
@@ -35,8 +26,6 @@ def hops(A: np.ndarray, ls: list[int], target: float | None = None,
     d = len(A)
     cur = np.eye(d, dtype=np.float32)
     out, lstar = {}, -1
-    # Сканируем КАЖДОЕ L, а не только контрольные точки: иначе L* округляется
-    # вверх до ближайшей точки списка (у grid4 выдавало 35 вместо 31).
     for L in range(1, lmax + 1):
         cur = ((cur @ R) + cur > 0).astype(np.float32)
         m = float(cur.sum(1).mean())

@@ -1,18 +1,7 @@
-"""Один прогон: (кандидат A, сид) -> метрики.
-
-Протокол обучения одинаков для всех кандидатов - в этом весь смысл работы.
-Ничего, что зависит от конкретной A, здесь быть не должно.
-
-Использование:
-    python src/train.py --graph grid4 --seed 0 --dev
-"""
-
 from __future__ import annotations
 
 import os
 
-# Должно быть выставлено ДО инициализации CUDA, иначе
-# torch.use_deterministic_algorithms(True) свалится на cuBLAS.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import copy  # noqa: E402
@@ -46,8 +35,6 @@ def _set_determinism(seed: int, enabled: bool) -> None:
     try:
         torch.use_deterministic_algorithms(True)
     except Exception as exc:  # noqa: BLE001
-        # Не роняем прогон из-за версии torch: воспроизводимость важна, но
-        # разброс по сидам мы и так меряем. Факт отказа попадёт в отчёт.
         print(f"  [!] детерминизм недоступен: {exc}")
 
 

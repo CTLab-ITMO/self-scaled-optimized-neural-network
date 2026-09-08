@@ -1,13 +1,3 @@
-"""Шаг 9: анализ результатов - таблица, графики, проверка гипотез H1-H3.
-
-Считается на ноутбуке, GPU не нужен: на вход results.csv с боевой машины
-и graph_stats_*.csv, посчитанный до обучения.
-
-Использование:
-    python src/analyze.py                 # боевые результаты
-    python src/analyze.py --dev           # отладочные
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -29,10 +19,6 @@ GROUP_NAME = {
     "R": "референсы", "O": "оракулы", "D": "data-driven",
     "C": "контроли", "W": "кривая перепроводки", "P": "патологии",
 }
-# Пары "оригинал -> его density-matched контроль". Ни одно утверждение
-# "граф X помогает" не принимается без сравнения по этой таблице.
-GOOD_ACC = 0.48   # порог «осмысленного» графа для проверки H2
-
 CONTROL_PAIRS = [
     ("grid4", "grid4_misaligned"),
     ("grid4", "er_grid4"),
@@ -77,7 +63,7 @@ def aggregate(res: pd.DataFrame, gstats: pd.DataFrame) -> pd.DataFrame:
 def main_table(df: pd.DataFrame) -> str:
     lines = []
     head = (f"{'кандидат':<17} {'acc':>15} {'macro-F1':>15} {'loss':>7} "
-            f"{'|E|':>7} {'плотн':>8} {'энерг':>7} {'ассорт':>7} {'косин':>6}")
+            f"{'|E|':>7} {'плотн':>8} {'косин':>6}")
     for grp in GROUP_ORDER:
         sub = df[df.group == grp]
         if sub.empty:
@@ -95,8 +81,6 @@ def main_table(df: pd.DataFrame) -> str:
                 f"{r.test_loss_mean:>7.4f} "
                 f"{_fmt(r.get('stat_n_edges'), '.0f', 7)} "
                 f"{_fmt(r.get('stat_density'), '.5f', 8)} "
-                f"{_fmt(r.get('sig_dirichlet'), '.3f', 7)} "
-                f"{_fmt(r.get('sig_assortativity'), '.3f', 7)} "
                 f"{_fmt(r.get('node_cosine_mean'), '.3f', 6)}")
     return "\n".join(lines)
 
@@ -203,81 +187,6 @@ def test_h1_strong(res: pd.DataFrame) -> list[str]:
     return out
 
 
-def test_h2(df: pd.DataFrame) -> list[str]:
-    """H2: качество предсказывается гладкостью сигнала на графе.
-
-    Корреляция считается дважды — по всем кандидатам и по осмысленным.
-    Вырожденные графы одни создают сильную связь, не ранжируя нормальные.
-    """
-    out = ["\n" + "=" * 72,
-           "H2: m(A) предсказывается сигнальными дескрипторами", "=" * 72]
-    have_desc = df.dropna(subset=["sig_dirichlet"])
-    good = have_desc[have_desc.test_accuracy_mean > GOOD_ACC]
-    out.append(f"  «осмысленные» = accuracy > {GOOD_ACC}: {len(good)} из {len(have_desc)} графов")
-    out.append("")
-    out.append(f"  {'дескриптор':<28} {'все':>16} {'осмысленные':>16}")
-    out.append("  " + "-" * 60)
-    for col, name, kind in [
-        ("sig_dirichlet", "энергия Дирихле", "данные"),
-        ("sig_assortativity", "ассортативность сигнала", "данные"),
-        ("stat_density", "плотность", "структура"),
-        ("stat_clustering", "кластеризация", "структура"),
-    ]:
-        cells = []
-        for sub in (df, good):
-            s2 = sub[["test_accuracy_mean", col]].dropna()
-            if len(s2) < 3:
-                cells.append("—".rjust(16))
-                continue
-            rho, p = stats.spearmanr(s2[col], s2.test_accuracy_mean)
-            cells.append(f"{rho:+.3f} (p={p:.2f})".rjust(16))
-        out.append(f"  {name:<28}{cells[0]}{cells[1]}")
-
-    sub_all = df[["test_accuracy_mean", "sig_dirichlet"]].dropna()
-    sub_good = good[["test_accuracy_mean", "sig_dirichlet"]].dropna()
-    if len(sub_good) >= 3 and len(sub_all) >= 3:
-        r_all = stats.spearmanr(sub_all.sig_dirichlet, sub_all.test_accuracy_mean)[0]
-        r_good = stats.spearmanr(sub_good.sig_dirichlet, sub_good.test_accuracy_mean)[0]
-        out.append("")
-        if r_all * r_good <= 0:
-            out.append("  [!] ЗНАК ПЕРЕВОРАЧИВАЕТСЯ на осмысленном подмножестве.")
-            out.append("      Значит дескриптор отличает граф от мусора, но НЕ ранжирует")
-            out.append("      нормальные графы между собой. Как критерий выбора A он")
-            out.append("      непригоден - вся корреляция по всему набору держится на")
-            out.append("      вырожденных кандидатах.")
-            out.append("      -> H2 в форме «предиктор качества» НЕ подтверждена.")
-        else:
-            out.append("  Знак сохраняется на обоих подмножествах - дескриптор ранжирует")
-            out.append("  и осмысленные графы тоже. -> H2 подтверждена.")
-    return out
-
-
-def test_h3(df: pd.DataFrame) -> list[str]:
-    """H3: зависимость от плотности - перевёрнутая U."""
-    out = ["\n" + "=" * 72, "H3: перевёрнутая U по плотности", "=" * 72]
-    sub = df[["graph", "stat_density", "test_accuracy_mean",
-              "node_cosine_mean"]].dropna().sort_values("stat_density")
-    if len(sub) < 5:
-        return out + ["  мало точек"]
-    best = sub.loc[sub.test_accuracy_mean.idxmax()]
-    out.append(f"  максимум качества при плотности {best.stat_density:.5f} "
-               f"({best.graph})")
-    left = sub[sub.stat_density < best.stat_density]
-    right = sub[sub.stat_density > best.stat_density]
-    for side, part in (("слева от максимума", left), ("справа", right)):
-        if len(part) >= 3:
-            rho, p = stats.spearmanr(part.stat_density, part.test_accuracy_mean)
-            out.append(f"  {side:<20} rho = {rho:+.3f}  p = {p:.3f}  "
-                       f"(n = {len(part)})")
-    if len(right) >= 3:
-        rho, p = stats.spearmanr(right.stat_density, right.node_cosine_mean)
-        out.append(f"  плотность vs косинус справа: rho = {rho:+.3f} p = {p:.3f}")
-        out.append("  -> если положительная, правая ветвь падает из-за "
-                   "oversmoothing,")
-        out.append("     а не из-за неинформативности структуры")
-    return out
-
-
 def test_controls(res: pd.DataFrame) -> list[str]:
     out = ["\n" + "=" * 72,
            "Парные сравнения с density-matched контролями", "=" * 72]
@@ -327,46 +236,7 @@ def make_plots(df: pd.DataFrame, cfg, out_dir: Path) -> list[Path]:
     colors = {"R": "#888888", "O": "#d62728", "D": "#2ca02c",
               "C": "#1f77b4", "W": "#ff7f0e", "P": "#9467bd"}
 
-    # 1-2. качество против сигнального и структурного дескриптора
-    for col, xlabel, fname in [
-        ("sig_dirichlet", "энергия Дирихле (гладкость сигнала на графе)", "h2_dirichlet"),
-        ("sig_assortativity", "ассортативность сигнала по рёбрам", "h2_assortativity"),
-        ("stat_density", "плотность графа", "h3_density"),
-    ]:
-        sub = df[[col, "test_accuracy_mean", "test_accuracy_std", "graph",
-                  "group"]].dropna(subset=[col, "test_accuracy_mean"])
-        if sub.empty:
-            continue
-        fig, ax = plt.subplots(figsize=(9, 6))
-        for grp in GROUP_ORDER:
-            s = sub[sub.group == grp]
-            if s.empty:
-                continue
-            ax.errorbar(s[col], s.test_accuracy_mean,
-                        yerr=s.test_accuracy_std.fillna(0), fmt="o",
-                        color=colors[grp], label=GROUP_NAME[grp], capsize=3)
-        for _, r in sub.iterrows():
-            ax.annotate(r.graph, (r[col], r.test_accuracy_mean),
-                        fontsize=6.5, alpha=0.75,
-                        xytext=(4, 3), textcoords="offset points")
-        rho, p = stats.spearmanr(sub[col], sub.test_accuracy_mean)
-        if col == "stat_density":
-            # symlog, а не log: у empty плотность ровно 0, и на логарифмической
-            # оси эта точка молча исчезла бы - а это пол шкалы, ключевая
-            # опора для H3.
-            ax.set_xscale("symlog", linthresh=1e-4)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("accuracy на тесте")
-        ax.set_title(f"{xlabel}\nСпирмен rho = {rho:+.3f}, p = {p:.2e}")
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        path = out_dir / f"{fname}.png"
-        fig.savefig(path, dpi=150)
-        plt.close(fig)
-        paths.append(path)
-
-    # 3. кривая деградации по доле перепроводки
+    # Кривая деградации по доле перепроводки.
     ws = df[df.graph.str.startswith("ws_p", na=False)].copy()
     base = df[df.graph == "grid4"]
     if not ws.empty:
@@ -414,7 +284,7 @@ def main() -> int:
         f"сидов на кандидата: {res.groupby('graph').size().min()}"
         f"-{res.groupby('graph').size().max()}",
         main_table(df),
-        *test_h1(res, df), *test_h1_strong(res), *test_h2(df), *test_h3(df),
+        *test_h1(res, df),
         *test_controls(res), *check_budget(res),
     ]
     text = "\n".join(report)

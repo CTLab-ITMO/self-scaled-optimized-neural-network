@@ -1,17 +1,3 @@
-"""Шаг 8: основной прогон - все кандидаты x все сиды.
-
-Прерываемый и возобновляемый: строки дописываются в results.csv по одной и
-сразу сбрасываются на диск, а уже посчитанные пары (кандидат, сид, hash
-конфига, режим) пропускаются. Если прогон убьют на середине - просто запусти
-эту же команду снова.
-
-Использование:
-    python src/run_all.py                       # всё, боевой режим
-    python src/run_all.py --dev                 # всё, отладочный режим
-    python src/run_all.py --graphs grid4 empty  # подмножество
-    python src/run_all.py --groups R O          # по группам
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -92,33 +78,6 @@ def _done_keys(path: Path) -> set[tuple]:
     return done
 
 
-def _done_accs(path: Path, tf32: str, d: int, cfg_hash: str,
-               dev: str, epochs: int) -> list[tuple]:
-    """Уже посчитанные прогоны текущего режима как (группа, L, accuracy).
-
-    Нужно поиску максимума: при возобновлении прогона состояние обязано
-    учитывать то, что посчитано в прошлый раз, иначе правило обрыва начнёт
-    отсчёт заново и пересчитает уже пройденный хвост.
-    """
-    if not path.exists():
-        return []
-    out = []
-    with path.open(newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            if (str(r.get("tf32") or "False") != tf32
-                    or int(r.get("d") or 784) != d
-                    or int(r.get("epochs") or 0) != epochs
-                    or r["cfg_hash"] != cfg_hash or r["dev"] != dev):
-                continue
-            if r["graph"] == REFERENCE:
-                continue
-            out.append(((r["graph"], int(r["seed"]), r.get("arch") or "gcn",
-                         int(r.get("in_channels") or 1)),
-                        int(r.get("layers") or 3),
-                        float(r["test_accuracy"])))
-    return out
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dev", action="store_true")
@@ -135,21 +94,6 @@ def main() -> int:
                          "отладочный. Входит в ключ пропуска: другой бюджет - "
                          "другой эксперимент, молча переиспользовать строку "
                          "со старым бюджетом нельзя.")
-    ap.add_argument("--depth-search", type=int, default=0, metavar="ТЕРПЕНИЕ",
-                    help="Не гнать всю сетку глубин, а искать максимум: для "
-                         "каждого кандидата глубины идут по возрастанию, и "
-                         "кандидат закрывается после N глубин подряд без "
-                         "улучшения. Годится для H4 и H5 (им нужен только "
-                         "argmax_L). НЕ годится для H6 и H7 - им нужны точки "
-                         "по всему диапазону и вся кривая соответственно. "
-                         "Пропущенные глубины печатаются в конце поимённо. "
-                         "ОСТОРОЖНО: правило предполагает унимодальность "
-                         "кривой по глубине, а она НЕ установлена. На "
-                         "репетиции 2026-08-21 (dev, 5 эпох) вышло "
-                         "0.195 при L=3, 0.177 при L=5 и 0.244 при L=8 - "
-                         "с терпением 1 пик на L=8 был бы пропущен. Ставить "
-                         "не меньше 2, а на финальных числах лучше не "
-                         "пользоваться вовсе.")
     ap.add_argument("--pool", type=int, default=None,
                     help="Пулинг без урезания выборки (см. train.py). "
                          "d пишется в results.csv и входит в ключ пропуска.")
@@ -192,11 +136,6 @@ def main() -> int:
             for L in layers for k in chans
             if (g, s, a, L, k, str(bool(args.tf32)), cfg.data.d,
                 cfg.train.epochs, cfg.hash, str(cfg.dev)) not in done]
-    if args.depth_search:
-        # Глубины внутри каждой (граф, сид, арх, каналы) обязаны идти по
-        # возрастанию, иначе правило обрыва бессмысленно.
-        jobs.sort(key=lambda j: (j[0], j[1], j[2], j[4], j[3]))
-
     # flush обязателен: при выводе в файл Python буферизует, и первые строки
     # висели бы в буфере минутами. Со стороны это выглядит как "ничего не
     # происходит" и провоцирует запустить прогон второй раз поверх первого.
@@ -225,31 +164,7 @@ def main() -> int:
     durations: list[float] = []
     failed: list[tuple[str, int, str]] = []
 
-    best_acc: dict[tuple, float] = {}
-    misses: dict[tuple, int] = {}
-    skipped: list[tuple] = []
-
-    if args.depth_search:
-        # Проигрываем уже посчитанное в порядке возрастания глубины, чтобы
-        # возобновлённый прогон продолжил поиск, а не начал его заново.
-        prior = _done_accs(out_path, str(bool(args.tf32)), cfg.data.d,
-                           cfg.hash, str(cfg.dev), cfg.train.epochs)
-        for key, L, acc in sorted(prior, key=lambda t: (t[0], t[1])):
-            if acc > best_acc.get(key, -1.0):
-                best_acc[key] = acc
-                misses[key] = 0
-            else:
-                misses[key] = misses.get(key, 0) + 1
-        closed = sum(1 for v in misses.values() if v >= args.depth_search)
-        if prior:
-            print(f"поиск максимума: учтено {len(prior)} прошлых прогонов, "
-                  f"закрыто групп: {closed}", flush=True)
-
     for i, (graph, seed, arch, L, k) in enumerate(jobs, 1):
-        key = (graph, seed, arch, k)
-        if args.depth_search and misses.get(key, 0) >= args.depth_search:
-            skipped.append((graph, seed, arch, k, L))
-            continue
         t0 = time.time()
         cfg.model["layers"] = L
         cfg.model["kind"] = arch
@@ -291,14 +206,6 @@ def main() -> int:
         # Прогноз по медиане последних прогонов, а не по среднему за всё
         # время: mlp считается в 5 раз быстрее GNN, и среднее по смеси даёт
         # заниженную втрое оценку, пока считаются первые (быстрые) задачи.
-        if args.depth_search:
-            acc = row["test_accuracy"]
-            if acc > best_acc.get(key, -1.0):
-                best_acc[key] = acc
-                misses[key] = 0
-            else:
-                misses[key] = misses.get(key, 0) + 1
-
         durations.append(time.time() - t0)
         recent = sorted(durations[-5:])[len(durations[-5:]) // 2]
         eta = recent * (len(jobs) - i)
@@ -310,16 +217,6 @@ def main() -> int:
 
     fh.close()
     print(f"\nготово за {(time.time() - t_start) / 60:.1f} мин -> {out_path}")
-
-    # Никаких молчаливых обрезаний: что не посчитано, то названо поимённо.
-    # Иначе таблица выглядит как полная сетка, а на деле в ней дыры.
-    if skipped:
-        print(f"\nпоиск максимума закрыл {len(skipped)} прогонов "
-              f"(терпение {args.depth_search}):")
-        for graph, seed, arch, k, L in skipped:
-            print(f"  {graph} сид {seed} {arch} k={k} L={L} - не считался, "
-                  f"максимум уже пройден")
-        print("  ВАЖНО: такая таблица годится для H4 и H5, но НЕ для H6 и H7.")
 
     if failed:
         print(f"\nупало задач: {len(failed)}")

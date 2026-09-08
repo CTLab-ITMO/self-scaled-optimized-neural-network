@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# Создаёт окружение проекта в .venv и ставит всё нужное.
-#
-#   ./setup_env.sh          определить железо и поставить подходящий torch
-#   ./setup_env.sh --cpu    принудительно CPU-сборка
-#   ./setup_env.sh --cuda   принудительно CUDA-сборка
-#
-# Всё ставится ВНУТРЬ .venv в папке проекта. Системный python не трогается,
-# так что удалить окружение можно просто стерев .venv.
 
 set -eu
 cd "$(dirname "$0")"
@@ -18,7 +10,6 @@ BUILD=auto
 C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_OFF=$'\033[0m'
 [ -t 1 ] || { C_OK=""; C_WARN=""; C_OFF=""; }
 
-# --- какая сборка torch нужна -----------------------------------------------
 if [ "$BUILD" = auto ]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
     BUILD=cuda
@@ -32,7 +23,6 @@ if [ "$BUILD" = auto ]; then
   fi
 fi
 
-# --- окружение ---------------------------------------------------------------
 if [ ! -d .venv ]; then
   echo ""
   echo "Создаю .venv ..."
@@ -47,7 +37,6 @@ $PIP install --quiet --upgrade pip
 
 echo "Ставлю torch ($BUILD) ..."
 if [ "$BUILD" = cuda ]; then
-  # cu124 подходит для RTX 3060 (Ampere) и вообще для всего от 20xx и новее
   $PIP install --quiet torch --index-url https://download.pytorch.org/whl/cu124
 else
   $PIP install --quiet torch --index-url https://download.pytorch.org/whl/cpu
@@ -56,7 +45,6 @@ fi
 echo "Ставлю остальное ..."
 $PIP install --quiet -r requirements.txt
 
-# --- проверка ----------------------------------------------------------------
 echo ""
 echo "Проверяю:"
 .venv/bin/python - <<'EOF'
@@ -77,7 +65,6 @@ if missing:
 print("  все пакеты на месте")
 EOF
 
-# --- данные ------------------------------------------------------------------
 if [ ! -f artifacts/mnist.npz ]; then
   echo ""
   echo "Скачиваю MNIST (один раз, нужен интернет) ..."

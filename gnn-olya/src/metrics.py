@@ -1,5 +1,3 @@
-"""Метрики. Задача сбалансированная многоклассовая, поэтому accuracy + macro-F1."""
-
 from __future__ import annotations
 
 import numpy as np
