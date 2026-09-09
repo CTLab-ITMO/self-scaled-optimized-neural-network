@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# запуск structure/refine через SLURM
 
 #SBATCH --job-name=gnn-refine
 #SBATCH --partition=gpu
@@ -8,6 +7,8 @@
 #SBATCH --time=06:00:00
 #SBATCH --output=results/slurm-%j.log
 #SBATCH --error=results/slurm-%j.log
+
+# запуск structure/refine через SLURM
 
 set -u
 cd "$SLURM_SUBMIT_DIR" || exit 1

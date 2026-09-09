@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
+
 # пытаемся восстановить структуру 
 # данные → один раз построили graph → сравнили с truth
 # делает self-check structure.py, затем запускает eval_structure.py; результаты в results/structure.csv
 
+# результат: partial correlation лучше всего восстанавливает скрытый граф; partial_free близок без знания размера графа
 
 set -u
 cd "$(dirname "$0")" || exit 1

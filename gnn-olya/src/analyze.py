@@ -270,6 +270,104 @@ def make_plots(df: pd.DataFrame, cfg, out_dir: Path) -> list[Path]:
     return paths
 
 
+
+def structure_report(cfg) -> list[str]:
+    """Короткая сводка оставленного эксперимента восстановления структуры."""
+    path = results_dir(cfg) / "structure.csv"
+    if not path.exists():
+        return ["\n" + "=" * 72, "Восстановление структуры", "=" * 72,
+                "  нет results/structure.csv"]
+    x = pd.read_csv(path)
+    if x.empty:
+        return ["\n" + "=" * 72, "Восстановление структуры", "=" * 72,
+                "  structure.csv пуст"]
+
+    base = x[x.n == x.n.max()].copy()
+    methods = [m for m in ("corr_static", "partial_static", "partial_free")
+               if m in set(base.method)]
+    graphs = [g for g in ("tree", "grid", "smallworld", "community",
+                           "scalefree", "ring", "geometric")
+              if g in set(base.graph)]
+    table = base.pivot_table(index="method", columns="graph", values="f1")
+    table = table.reindex(index=methods, columns=graphs).round(3)
+
+    out = ["\n" + "=" * 72, "Восстановление структуры", "=" * 72,
+           f"  строк: {len(x)}   сидов: {x.seed.nunique()}   "
+           f"n: {sorted(map(int, x.n.unique()))}",
+           "  F1 на максимальном n, среднее по сидам:",
+           table.to_string()]
+
+    free = base[base.method == "partial_free"]
+    if not free.empty:
+        edges = free.groupby("graph")[["n_edges", "n_true"]].mean().round(0)
+        edges = edges.reindex(graphs)
+        out += ["", "  partial_free: найдено рёбер / истина:", edges.to_string()]
+    return out
+
+
+def refine_report(cfg) -> list[str]:
+    """Короткая сводка оставленного эксперимента замены графа."""
+    path = results_dir(cfg) / "refine.csv"
+    if not path.exists():
+        return ["\n" + "=" * 72, "Замена графа по данным", "=" * 72,
+                "  нет results/refine.csv"]
+    x = pd.read_csv(path)
+    if x.empty:
+        return ["\n" + "=" * 72, "Замена графа по данным", "=" * 72,
+                "  refine.csv пуст"]
+
+    key = ["rule", "graph", "seed"]
+    x = x.sort_values(key + ["round"])
+    n_run = x.groupby(key)["round"].transform("count")
+    from_end = x.groupby(key)["round"].transform("max") - x["round"]
+    tail = np.minimum(5, np.maximum(1, n_run // 4))
+    last = x[from_end < tail].groupby(key, as_index=False).mean(numeric_only=True)
+    rules = [r for r in ("keep", "random_rewire", "corr_static",
+                          "partial_static", "partial_free")
+             if r in set(last.rule)]
+    graphs = [g for g in ("community", "geometric", "grid", "ring")
+              if g in set(last.graph)]
+
+    acc = last.pivot_table(index="rule", columns="graph", values="test_acc")
+    rec = last.pivot_table(index="rule", columns="graph", values="rec_f1")
+    acc = acc.reindex(index=rules, columns=graphs).round(4)
+    rec = rec.reindex(index=rules, columns=graphs).round(4)
+    runs = x[key].drop_duplicates().shape[0]
+    rounds = x.groupby(key)["round"].count()
+
+    return ["\n" + "=" * 72, "Замена графа по данным", "=" * 72,
+            f"  строк: {len(x)}   прогонов: {runs}   сидов: {x.seed.nunique()}   "
+            f"раундов на прогон: {int(rounds.min())}-{int(rounds.max())}",
+            "  accuracy, среднее по хвосту каждого прогона:", acc.to_string(),
+            "", "  F1 восстановления графа:", rec.to_string(),
+            "", "  keep и random_rewire — контроли; corr_static — одношаговый baseline."]
+
+
+def depth_report(cfg) -> list[str]:
+    """Сводка сохранённого предрасчёта по глубине без обучения сети."""
+    path = results_dir(cfg) / "depth_precheck.csv"
+    if not path.exists():
+        return ["\n" + "=" * 72, "Предрасчёт глубины", "=" * 72,
+                "  нет results/depth_precheck.csv"]
+    x = pd.read_csv(path)
+    if x.empty:
+        return ["\n" + "=" * 72, "Предрасчёт глубины", "=" * 72,
+                "  depth_precheck.csv пуст"]
+
+    keep = [g for g in ("grid4", "grid4_misaligned", "er_grid4",
+                         "knn_corr_k8", "er_knn8", "empty", "complete")
+            if g in set(x.graph)]
+    cols = [c for c in ("graph", "n_edges", "n_components", "L_global",
+                         "hops_L1", "hops_L2", "hops_L3") if c in x.columns]
+    table = x[x.graph.isin(keep)][cols].copy()
+    table["graph"] = pd.Categorical(table.graph, categories=keep, ordered=True)
+    table = table.sort_values("graph")
+    for c in [c for c in table.columns if c.startswith("hops_L")]:
+        table[c] = table[c].round(2)
+    return ["\n" + "=" * 72, "Предрасчёт глубины", "=" * 72,
+            "  Сколько вершин в среднем доступно за 1/2/3 шага без обучения:",
+            table.to_string(index=False)]
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dev", action="store_true")
@@ -289,6 +387,7 @@ def main() -> int:
         main_table(df),
         *test_h1(res, df),
         *test_controls(res), *check_budget(res),
+        *structure_report(cfg), *refine_report(cfg), *depth_report(cfg),
     ]
     text = "\n".join(report)
     print(text)
