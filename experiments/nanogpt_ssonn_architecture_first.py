@@ -16,7 +16,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -29,11 +29,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=REPO_ROOT / "data" / "finewebedu10B")
     parser.add_argument("--checkpoint-dir", type=Path, default=REPO_ROOT / "checkpoints")
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--micro-batch-size", type=int, default=16)
-    parser.add_argument("--grad-accum-steps", type=int, default=1)
-    parser.add_argument("--cooldown-updates", type=int, default=640)
+    parser.add_argument("--micro-batch-size", type=int, default=16, help="Sequences per microbatch at the maximum context window; shorter windows scale this up.")
+    parser.add_argument("--grad-accum-steps", type=int, default=1, help="Deprecated legacy value retained in checkpoint metadata; architecture-first training derives accumulation from tokens.")
+    parser.add_argument("--target-tokens-per-update", type=int, default=524_288)
+    parser.add_argument("--cooldown-fraction", type=float, default=640 / 1750)
+    parser.add_argument("--cooldown-updates", type=int, default=None, help="Deprecated explicit override; prefer --cooldown-fraction.")
     parser.add_argument("--eval-interval", type=int, default=100)
-    parser.add_argument("--eval-batches", type=int, default=16)
+    parser.add_argument("--eval-batches", type=int, default=None, help="Deprecated periodic-validation override; prefer --periodic-validation-tokens.")
+    parser.add_argument("--periodic-validation-tokens", type=int, default=1_048_576)
+    parser.add_argument("--final-validation-tokens", type=int, default=10_485_760)
+    parser.add_argument("--validation-seq-len", type=int, default=1792)
     parser.add_argument("--checkpoint-interval", type=int, default=5_000)
     parser.add_argument("--amp-dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--compile", action="store_true")
@@ -45,10 +50,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--architecture-fraction", type=float, default=0.05)
     parser.add_argument("--architecture-expansions", type=int, default=4)
     parser.add_argument("--architecture-cycle-steps", type=int, default=0, help="Updates per architecture cycle. Zero derives one pass over the architecture subset.")
-    parser.add_argument("--training-passes", type=int, default=1)
-    parser.add_argument("--full-training-steps", type=int, default=0, help="Optional full-training override for smoke/dry runs. Zero derives complete passes over all train shards.")
+    parser.add_argument("--training-passes", type=int, default=0, help="Full-dataset passes. Overrides --full-training-tokens when positive.")
+    parser.add_argument("--full-training-tokens", type=int, default=917_504_000)
+    parser.add_argument("--full-training-steps", type=int, default=0, help="Optional full-training update-count override for smoke/dry runs. Zero uses the token budget.")
     parser.add_argument("--ssonn-expansion-threshold", type=float, default=0.1)
     parser.add_argument("--ssonn-max-new-edges", type=int, default=1024)
+    parser.add_argument("--backbone-grad-clip", type=float, default=1.0)
+    parser.add_argument("--ssonn-grad-clip", type=float, default=1.0)
+    parser.add_argument("--attention-backend", choices=("flex", "sdpa"), default="flex")
     parser.add_argument("--smoke-test", action="store_true", help="Run CPU model/schedule smoke checks and exit.")
     return parser.parse_args()
 
@@ -62,6 +71,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+except ImportError:
+    create_block_mask = None
+    flex_attention = None
 
 import ssonn.train.train as ssonn_train
 from ssonn.metrics.edge_finder import EdgeFinder
@@ -88,6 +103,9 @@ DOWNLOAD_PRETOKENIZED_DATA = ARGS.download_pretokenized
 PRETOKENIZED_TRAIN_SHARDS = ARGS.pretokenized_train_shards
 TRAIN_FILES: list[str] = []
 VAL_FILES: list[str] = []
+ARCHITECTURE_SLICES: list[ShardSlice] = []
+FULL_TRAINING_SLICES: list[ShardSlice] = []
+VALIDATION_SLICES: list[ShardSlice] = []
 TRAIN_TOKEN_COUNT = 0
 SSONN_CYCLE_TOKEN_COUNT = 0
 ARCHITECTURE_TOKEN_COUNT = 0
@@ -108,11 +126,16 @@ MODEL_CONFIG = GPTConfig()
 NUM_UPDATES = 0
 MICRO_BATCH_SIZE = ARGS.micro_batch_size
 GRAD_ACCUM_STEPS = ARGS.grad_accum_steps
+TARGET_TOKENS_PER_UPDATE = ARGS.target_tokens_per_update
 WINDOW_START = 256
 WINDOW_END = 1792
 COOLDOWN_UPDATES = ARGS.cooldown_updates
+COOLDOWN_FRACTION = ARGS.cooldown_fraction
 EVAL_INTERVAL = ARGS.eval_interval
 EVAL_BATCHES = ARGS.eval_batches
+PERIODIC_VALIDATION_TOKENS = ARGS.periodic_validation_tokens
+FINAL_VALIDATION_TOKENS = ARGS.final_validation_tokens
+VALIDATION_SEQ_LEN = ARGS.validation_seq_len
 CHECKPOINT_INTERVAL = ARGS.checkpoint_interval
 PRETRAIN_MUON_LR = 0.02
 PRETRAIN_ADAM_LR = 3e-4
@@ -123,9 +146,14 @@ SSONN_CYCLE_STEPS = ARGS.architecture_cycle_steps
 ARCHITECTURE_FRACTION = ARGS.architecture_fraction
 ARCHITECTURE_EXPANSIONS = ARGS.architecture_expansions
 TRAINING_PASSES = ARGS.training_passes
+FULL_TRAINING_TARGET_TOKENS = ARGS.full_training_tokens
 FULL_TRAINING_STEPS = ARGS.full_training_steps
 SSONN_EXPANSION_THRESHOLD = ARGS.ssonn_expansion_threshold
 SSONN_MAX_NEW_EDGES = ARGS.ssonn_max_new_edges
+BACKBONE_GRAD_CLIP = ARGS.backbone_grad_clip
+SSONN_GRAD_CLIP = ARGS.ssonn_grad_clip
+ATTENTION_BACKEND = ARGS.attention_backend
+EOT_TOKEN_ID = 50256
 REINIT_MODE = "full"
 
 BASE_CHECKPOINT = CHECKPOINT_DIR / "finewebedu_attention_only.pt"
@@ -136,9 +164,17 @@ assert MODEL_CONFIG.n_embd % MODEL_CONFIG.n_head == 0
 assert WINDOW_START <= WINDOW_END <= MODEL_CONFIG.max_seq_len
 assert MICRO_BATCH_SIZE >= 1
 assert GRAD_ACCUM_STEPS >= 1
+assert TARGET_TOKENS_PER_UPDATE >= WINDOW_START
+assert 0.0 < COOLDOWN_FRACTION <= 1.0
+assert PERIODIC_VALIDATION_TOKENS >= VALIDATION_SEQ_LEN
+assert FINAL_VALIDATION_TOKENS >= PERIODIC_VALIDATION_TOKENS
+assert WINDOW_START <= VALIDATION_SEQ_LEN <= WINDOW_END
 assert 0.0 < ARCHITECTURE_FRACTION <= 1.0
 assert ARCHITECTURE_EXPANSIONS >= 1
-assert TRAINING_PASSES >= 1
+assert TRAINING_PASSES >= 0
+assert FULL_TRAINING_TARGET_TOKENS > 0
+assert BACKBONE_GRAD_CLIP >= 0.0
+assert SSONN_GRAD_CLIP >= 0.0
 
 
 def amp_dtype() -> torch.dtype | None:
@@ -154,6 +190,11 @@ USE_AMP = AMP_DTYPE is not None
 USE_SCALER = ARGS.amp_dtype == "fp16"
 
 device = torch.device("cuda" if torch.cuda.is_available() and not ARGS.smoke_test else "cpu")
+USE_FLEX_ATTENTION = ATTENTION_BACKEND == "flex" and device.type == "cuda"
+if USE_FLEX_ATTENTION and (create_block_mask is None or flex_attention is None):
+    raise RuntimeError("--attention-backend flex requires torch.nn.attention.flex_attention.")
+if USE_FLEX_ATTENTION:
+    USE_COMPILE = True
 if device.type == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -168,6 +209,8 @@ if device.type == "cuda":
     )
 elif not ARGS.smoke_test:
     raise RuntimeError("CUDA is required for training. Use --smoke-test for CPU-only checks.")
+elif ATTENTION_BACKEND == "flex":
+    print("CPU smoke test: using SDPA document masks instead of FlexAttention.")
 
 
 def set_seed(seed: int) -> None:
@@ -212,44 +255,94 @@ def read_shard(path: str) -> np.ndarray:
     return raw[512 : 512 + token_count]
 
 
+@dataclass(frozen=True)
+class ShardSlice:
+    path: str
+    start: int
+    token_count: int
+
+
+def allocate_balanced_slices(files: Iterable[str], token_budget: int, seed: int) -> list[ShardSlice]:
+    """Allocate an exact token budget proportionally across every shard."""
+    paths = sorted(files)
+    counts = [shard_token_count(path) for path in paths]
+    available = sum(counts)
+    if token_budget <= 0 or token_budget > available:
+        raise ValueError(f"Token budget must be in [1, {available}], got {token_budget}.")
+
+    raw_quotas = [token_budget * count / available for count in counts]
+    quotas = [math.floor(quota) for quota in raw_quotas]
+    remainder = token_budget - sum(quotas)
+    order = sorted(range(len(paths)), key=lambda index: (raw_quotas[index] - quotas[index], -index), reverse=True)
+    for index in order[:remainder]:
+        quotas[index] += 1
+
+    rng = random.Random(seed)
+    slices = []
+    for path, available_tokens, quota in zip(paths, counts, quotas, strict=True):
+        if quota == 0:
+            continue
+        max_start = available_tokens - quota
+        start = rng.randrange(max_start + 1) if max_start > 0 else 0
+        slices.append(ShardSlice(path=path, start=start, token_count=quota))
+    if sum(item.token_count for item in slices) != token_budget:
+        raise AssertionError("Balanced shard allocation did not preserve the requested token budget.")
+    return slices
+
+
 class TokenShardStream:
-    def __init__(self, files: Iterable[str], seed: int = 0, token_limit: int | None = None):
-        all_files = sorted(files)
-        self.files: list[str] = []
-        self.file_token_limits: list[int] = []
-        remaining = token_limit
-        for path in all_files:
-            available = shard_token_count(path)
-            take = available if remaining is None else min(available, remaining)
-            if take > 0:
-                self.files.append(path)
-                self.file_token_limits.append(take)
-            if remaining is not None:
-                remaining -= take
-                if remaining == 0:
-                    break
-        if not self.files:
+    def __init__(
+        self,
+        files: Iterable[str] | None = None,
+        seed: int = 0,
+        token_limit: int | None = None,
+        slices: Sequence[ShardSlice] | None = None,
+        interleave: bool = True,
+    ):
+        if slices is not None:
+            selected = list(slices)
+        else:
+            all_files = sorted(files or [])
+            if token_limit is None:
+                selected = [ShardSlice(path, 0, shard_token_count(path)) for path in all_files]
+            else:
+                selected = allocate_balanced_slices(all_files, token_limit, seed)
+        if not selected:
             raise FileNotFoundError("TokenShardStream received no shard files.")
-        if token_limit is not None and remaining:
-            raise ValueError(f"Requested {token_limit} tokens, but only {token_limit - remaining} are available.")
+        self.slices = selected
+        self.files = [item.path for item in selected]
+        self.file_token_limits = [item.token_count for item in selected]
         self.token_count = sum(self.file_token_limits)
-        self.rng = random.Random(seed)
+        self.interleave = interleave
         self.shard_index = 0
-        self.position = 0
-        self.tokens = read_shard(self.files[self.shard_index])[: self.file_token_limits[self.shard_index]]
+        self.positions = [item.start for item in selected]
+        self.ends = [item.start + item.token_count for item in selected]
+        self.epoch = 0
+        self.tokens = read_shard(self.files[self.shard_index])
 
     def _advance(self) -> None:
         self.shard_index = (self.shard_index + 1) % len(self.files)
-        self.position = 0
-        self.tokens = read_shard(self.files[self.shard_index])[: self.file_token_limits[self.shard_index]]
+        self.tokens = read_shard(self.files[self.shard_index])
+
+    def _restart(self) -> None:
+        self.positions = [item.start for item in self.slices]
+        self.shard_index = 0
+        self.epoch += 1
+        self.tokens = read_shard(self.files[0])
 
     def _next_sequence(self, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
         required = seq_len + 1
-        if self.position + required >= len(self.tokens):
+        for _ in range(len(self.files)):
+            position = self.positions[self.shard_index]
+            if position + required <= self.ends[self.shard_index]:
+                block = torch.from_numpy(np.array(self.tokens[position : position + required], dtype=np.int64))
+                self.positions[self.shard_index] += seq_len
+                if self.interleave:
+                    self._advance()
+                return block[:-1], block[1:]
             self._advance()
-        block = torch.from_numpy(np.array(self.tokens[self.position : self.position + required], dtype=np.int64))
-        self.position += seq_len
-        return block[:-1], block[1:]
+        self._restart()
+        return self._next_sequence(seq_len)
 
     def next_batch(self, seq_len: int, batch_size: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
         xs, ys = zip(*(self._next_sequence(seq_len) for _ in range(batch_size)), strict=True)
@@ -262,18 +355,17 @@ class TokenShardStream:
 
 
 class FixedFinderLoader:
-    def __init__(self, files: Iterable[str], batches: int, seq_len: int, seed: int, token_limit: int | None = None):
-        self.files = list(files)
+    def __init__(self, slices: Sequence[ShardSlice], batches: int, seq_len: int, seed: int):
+        self.slices = list(slices)
         self.batches = batches
         self.seq_len = seq_len
         self.seed = seed
-        self.token_limit = token_limit
 
     def __len__(self) -> int:
         return self.batches
 
     def __iter__(self):
-        stream = TokenShardStream(self.files, self.seed, token_limit=self.token_limit)
+        stream = TokenShardStream(seed=self.seed, slices=self.slices)
         for _ in range(self.batches):
             yield stream.next_batch(self.seq_len, MICRO_BATCH_SIZE)
 
@@ -304,13 +396,51 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos", freqs.cos(), persistent=False)
         self.register_buffer("sin", freqs.sin(), persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, positions: torch.Tensor | None = None) -> torch.Tensor:
         seq_len = x.size(-2)
-        cos = self.cos[:seq_len].to(dtype=x.dtype, device=x.device)[None, None]
-        sin = self.sin[:seq_len].to(dtype=x.dtype, device=x.device)[None, None]
+        if positions is None:
+            cos = self.cos[:seq_len].to(dtype=x.dtype, device=x.device)[None, None]
+            sin = self.sin[:seq_len].to(dtype=x.dtype, device=x.device)[None, None]
+        else:
+            cos = self.cos.to(device=x.device)[positions].to(dtype=x.dtype)[:, None]
+            sin = self.sin.to(device=x.device)[positions].to(dtype=x.dtype)[:, None]
         x_even, x_odd = x[..., 0::2], x[..., 1::2]
         rotated = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1)
         return rotated.flatten(-2)
+
+
+def document_ids_and_positions(tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Treat EOT as the first token of a document and reset its rotary position."""
+    batch, seq_len = tokens.shape
+    starts = tokens.eq(EOT_TOKEN_ID)
+    starts[:, 0] = True
+    document_ids = starts.long().cumsum(dim=1) - 1
+    indices = torch.arange(seq_len, device=tokens.device).expand(batch, -1)
+    start_indices = torch.where(starts, indices, torch.zeros_like(indices))
+    latest_start = torch.cummax(start_indices, dim=1).values
+    return document_ids, indices - latest_start
+
+
+def make_document_attention_mask(document_ids: torch.Tensor):
+    batch, seq_len = document_ids.shape
+    if USE_FLEX_ATTENTION:
+        def document_causal_mask(batch_index, _head, query_index, key_index):
+            return (query_index >= key_index) & (
+                document_ids[batch_index, query_index] == document_ids[batch_index, key_index]
+            )
+
+        return create_block_mask(
+            document_causal_mask,
+            B=batch,
+            H=None,
+            Q_LEN=seq_len,
+            KV_LEN=seq_len,
+            device=str(document_ids.device),
+            _compile=True,
+        )
+    causal = torch.ones((seq_len, seq_len), dtype=torch.bool, device=document_ids.device).tril_()
+    same_document = document_ids[:, :, None].eq(document_ids[:, None, :])
+    return same_document[:, None] & causal[None, None]
 
 
 class CausalSelfAttention(nn.Module):
@@ -336,16 +466,19 @@ class CausalSelfAttention(nn.Module):
         self.q_norm.reset_parameters()
         self.k_norm.reset_parameters()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, positions: torch.Tensor, attention_mask) -> torch.Tensor:
         batch, seq_len, _ = x.shape
         q = self.q_proj(x).view(batch, seq_len, self.n_head, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
-        q = self.rope(self.q_norm(q))
-        k = self.rope(self.k_norm(k))
+        q = self.rope(self.q_norm(q), positions)
+        k = self.rope(self.k_norm(k), positions)
         k = k.expand(-1, self.n_head, -1, -1)
         v = v.expand(-1, self.n_head, -1, -1)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if USE_FLEX_ATTENTION:
+            y = flex_attention(q, k, v, block_mask=attention_mask)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask, is_causal=False)
         return self.o_proj(y.transpose(1, 2).contiguous().view(batch, seq_len, -1))
 
 
@@ -357,7 +490,25 @@ class TokenSSONNMLP(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        main_mask = getattr(self.scaled, "sparsity_mask", None)
+        if main_mask is not None:
+            main_mask = main_mask.detach().clone()
+        sub_masks = [
+            getattr(layer, "sparsity_mask", None).detach().clone()
+            if getattr(layer, "sparsity_mask", None) is not None else None
+            for layer in self.scaled.sub_linears
+        ]
         self.scaled.reinitialize_parameters()
+        if main_mask is not None:
+            self.scaled.sparsity_mask = main_mask
+        for layer, mask in zip(self.scaled.sub_linears, sub_masks, strict=True):
+            if mask is not None:
+                layer.sparsity_mask = mask
+        # The SSONN block is a residual delta. A zero output projection keeps
+        # every full reinitialization functionally identical to the backbone.
+        with torch.no_grad():
+            self.scaled.weight.zero_()
+            self.scaled.bias.zero_()
         self.scaled.dropout.p = 0.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -404,8 +555,8 @@ class TransformerBlock(nn.Module):
         if self.mlp is not None and hasattr(self.mlp, "reset_parameters"):
             self.mlp.reset_parameters()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm_attn(x))
+    def forward(self, x: torch.Tensor, positions: torch.Tensor, attention_mask) -> torch.Tensor:
+        x = x + self.attn(self.norm_attn(x), positions, attention_mask)
         if self.mlp_kind == "ssonn":
             x = x + self.mlp(self.norm_mlp(x))
         elif self.mlp_kind == "speedrun_mlp":
@@ -437,10 +588,18 @@ class AttentionOnlyGPT(nn.Module):
         self.norm_final.reset_parameters()
         self.lm_head.weight = self.wte.weight
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        attention_mask=None,
+    ) -> torch.Tensor:
+        if positions is None or attention_mask is None:
+            document_ids, positions = document_ids_and_positions(tokens)
+            attention_mask = make_document_attention_mask(document_ids)
         x = self.wte(tokens)
         for block in self.blocks:
-            x = block(x)
+            x = block(x, positions, attention_mask)
         logits = self.lm_head(self.norm_final(x))
         return 30.0 * torch.tanh(logits / 30.0)
 
@@ -455,6 +614,23 @@ def count_nonzero_parameters(model: nn.Module) -> int:
 
 def count_ssonn_sublinears(model: nn.Module) -> int:
     return sum(len(module.sub_linears) for module in model.modules() if isinstance(module, ScaledNet))
+
+
+def count_ssonn_stored_parameters(model: nn.Module) -> int:
+    return sum(parameter.numel() for module in model.modules() if isinstance(module, ScaledNet) for parameter in module.parameters())
+
+
+def count_ssonn_active_connections(model: nn.Module) -> int:
+    total = 0
+    for module in model.modules():
+        if not isinstance(module, ScaledNet):
+            continue
+        main_mask = getattr(module, "sparsity_mask", None)
+        total += int(main_mask.sum().item()) if main_mask is not None else module.weight.numel()
+        for sub_layer in module.sub_linears:
+            sub_mask = getattr(sub_layer, "sparsity_mask", None)
+            total += int(sub_mask.sum().item()) if sub_mask is not None else sub_layer.weight.numel()
+    return total
 
 
 def assert_finite_model(model: nn.Module, label: str) -> None:
@@ -475,6 +651,7 @@ def checkpoint_payload(
     metadata: dict | None = None,
 ) -> dict:
     payload = {
+        "checkpoint_schema_version": 2,
         "model": model.state_dict(),
         "model_config": asdict(MODEL_CONFIG),
         "mlp_kind": MLP_KIND,
@@ -482,13 +659,33 @@ def checkpoint_payload(
         "optimizer": optimizer_state,
         "recipe": {
             "source": "Deveraux-Parker/nanoGPT_1GPU_SPEEDRUN@135bc07555d47b64223c03e3da0bc6571efc6f2a",
-            "stable_deviations": ["single GPU", "standard SDPA", f"{ARGS.amp_dtype} autocast"],
+            "stable_deviations": [
+                "single GPU",
+                "residual SSONN backbone is not the full modded NanoGPT architecture",
+                f"{ARGS.amp_dtype} autocast",
+            ],
             "num_updates": NUM_UPDATES,
             "window_start": WINDOW_START,
             "window_end": WINDOW_END,
             "micro_batch_size": MICRO_BATCH_SIZE,
             "grad_accum_steps": GRAD_ACCUM_STEPS,
-            "effective_sequences_per_update": MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS,
+            "micro_batch_sequences": MICRO_BATCH_SIZE,
+            "micro_batch_sequences_meaning": "maximum-window batch size",
+            "activation_token_envelope": MICRO_BATCH_SIZE * WINDOW_END,
+            "dynamic_microbatch": True,
+            "dynamic_accumulation": True,
+            "legacy_grad_accum_steps": GRAD_ACCUM_STEPS,
+            "target_tokens_per_update": TARGET_TOKENS_PER_UPDATE,
+            "cooldown_fraction": COOLDOWN_FRACTION,
+            "cooldown_updates_override": COOLDOWN_UPDATES,
+            "attention_backend": "flex" if USE_FLEX_ATTENTION else "sdpa",
+            "torch_compile": USE_COMPILE,
+            "document_local_attention": True,
+            "periodic_validation_tokens": PERIODIC_VALIDATION_TOKENS,
+            "periodic_validation_scheduled_tokens": validation_scheduled_tokens(PERIODIC_VALIDATION_TOKENS),
+            "final_validation_tokens": FINAL_VALIDATION_TOKENS,
+            "final_validation_scheduled_tokens": validation_scheduled_tokens(FINAL_VALIDATION_TOKENS),
+            "validation_seq_len": VALIDATION_SEQ_LEN,
             "train_shards": len(TRAIN_FILES),
             "train_tokens": TRAIN_TOKEN_COUNT,
             "ssonn_cycle_steps": SSONN_CYCLE_STEPS,
@@ -496,11 +693,13 @@ def checkpoint_payload(
             "architecture_fraction": ARCHITECTURE_FRACTION,
             "architecture_expansions": ARCHITECTURE_EXPANSIONS,
             "architecture_tokens": ARCHITECTURE_TOKEN_COUNT,
+            "architecture_search_total_tokens": ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT,
             "architecture_cycle_steps": SSONN_CYCLE_STEPS,
             "training_passes": TRAINING_PASSES,
             "full_training_steps": FULL_TRAINING_STEPS,
             "full_training_pass_steps": FULL_TRAINING_PASS_STEPS,
             "full_training_tokens": FULL_TRAINING_TOKEN_COUNT,
+            "full_training_target_tokens": FULL_TRAINING_TARGET_TOKENS,
         },
         "rng": {
             "torch": torch.get_rng_state(),
@@ -535,7 +734,8 @@ def evaluate(model: nn.Module, stream: TokenShardStream, seq_len: int, batches: 
         x_cpu, y_cpu = stream.next_batch(seq_len, MICRO_BATCH_SIZE)
         x, y = to_device(x_cpu, y_cpu)
         with torch.autocast(device_type=device.type, dtype=AMP_DTYPE, enabled=USE_AMP and device.type == "cuda"):
-            logits = model(x)
+            document_ids, positions = document_ids_and_positions(x)
+            logits = model(x, positions, make_document_attention_mask(document_ids))
             assert_finite_tensor(logits, "Evaluation logits")
             loss = lm_cross_entropy(logits, y)
         assert_finite_tensor(loss, "Evaluation loss")
@@ -545,6 +745,40 @@ def evaluate(model: nn.Module, stream: TokenShardStream, seq_len: int, batches: 
 
 def evaluate_fixed(model: nn.Module, seq_len: int, batches: int) -> float:
     return evaluate(model, TokenShardStream(VAL_FILES, EVAL_STREAM_SEED), seq_len, batches)
+
+
+def validation_scheduled_tokens(token_budget: int) -> int:
+    return math.ceil(token_budget / VALIDATION_SEQ_LEN) * VALIDATION_SEQ_LEN
+
+
+@torch.no_grad()
+def evaluate_token_budget(
+    model: nn.Module,
+    token_budget: int,
+    slices: Sequence[ShardSlice] | None = None,
+) -> float:
+    """Evaluate a deterministic sample at one fixed context length."""
+    selected_slices = list(VALIDATION_SLICES if slices is None else slices)
+    stream = TokenShardStream(seed=EVAL_STREAM_SEED, slices=selected_slices)
+    model.eval()
+    weighted_loss = 0.0
+    evaluated_tokens = 0
+    target_sequences = max(1, math.ceil(token_budget / VALIDATION_SEQ_LEN))
+    while target_sequences > 0:
+        batch_size = min(MICRO_BATCH_SIZE, target_sequences)
+        x_cpu, y_cpu = stream.next_batch(VALIDATION_SEQ_LEN, batch_size)
+        x, y = to_device(x_cpu, y_cpu)
+        with torch.autocast(device_type=device.type, dtype=AMP_DTYPE, enabled=USE_AMP and device.type == "cuda"):
+            document_ids, positions = document_ids_and_positions(x)
+            logits = model(x, positions, make_document_attention_mask(document_ids))
+            assert_finite_tensor(logits, "Evaluation logits")
+            loss = lm_cross_entropy(logits, y)
+        assert_finite_tensor(loss, "Evaluation loss")
+        batch_tokens = batch_size * VALIDATION_SEQ_LEN
+        weighted_loss += loss.item() * batch_tokens
+        evaluated_tokens += batch_tokens
+        target_sequences -= batch_size
+    return weighted_loss / evaluated_tokens
 
 
 class Muon(torch.optim.Optimizer):
@@ -636,6 +870,9 @@ def speedrun_window(step: int) -> int:
 
 
 def speedrun_lr_scale(step: int, total_updates: int = NUM_UPDATES) -> float:
+    if COOLDOWN_UPDATES is None:
+        progress = step / max(total_updates - 1, 1)
+        return backbone_lr_scale_for_progress(progress, step, total_updates)
     cooldown_updates = min(COOLDOWN_UPDATES, total_updates)
     cooldown_start = total_updates - cooldown_updates
     if step < cooldown_start:
@@ -666,6 +903,84 @@ def cycle_window(cycle_step: int) -> int:
 def cycle_token_budget(cycle_steps: int) -> int:
     sequences_per_update = MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS
     return sequences_per_update * sum(cycle_window_for_steps(step, cycle_steps) for step in range(cycle_steps))
+
+
+@dataclass(frozen=True)
+class UpdateDescriptor:
+    index: int
+    total_updates: int
+    window: int
+    sequences: int
+    tokens: int
+    progress: float
+    backbone_lr_scale: float
+    ssonn_lr_scale: float
+
+    @property
+    def micro_batch_sequences(self) -> int:
+        return max(MICRO_BATCH_SIZE, (MICRO_BATCH_SIZE * WINDOW_END) // self.window)
+
+    @property
+    def accumulation_steps(self) -> int:
+        return math.ceil(self.sequences / self.micro_batch_sequences)
+
+
+def window_for_progress(progress: float) -> int:
+    if progress >= 1.0:
+        return WINDOW_END
+    raw = WINDOW_START + progress * (WINDOW_END - WINDOW_START)
+    return min(WINDOW_END, max(WINDOW_START, int(raw // 256) * 256))
+
+
+def backbone_lr_scale_for_progress(progress: float, update: int, total_updates: int) -> float:
+    if COOLDOWN_UPDATES is not None:
+        cooldown = min(max(COOLDOWN_UPDATES, 1), total_updates)
+        cooldown_start = total_updates - cooldown
+        if update < cooldown_start:
+            return 1.0
+        return max(0.0, (total_updates - update - 1) / max(cooldown - 1, 1))
+    cooldown_start = 1.0 - COOLDOWN_FRACTION
+    if progress < cooldown_start:
+        return 1.0
+    return max(0.0, (1.0 - progress) / COOLDOWN_FRACTION)
+
+
+def build_update_schedule(token_budget: int, forced_steps: int = 0) -> list[UpdateDescriptor]:
+    if token_budget <= 0:
+        raise ValueError("A token schedule needs a positive budget.")
+    total_updates = forced_steps if forced_steps > 0 else math.ceil(token_budget / TARGET_TOKENS_PER_UPDATE)
+    total_updates = max(total_updates, 2)
+    provisional: list[tuple[int, int, float]] = []
+    scheduled_tokens = 0
+    for update in range(total_updates):
+        progress = update / (total_updates - 1)
+        window = window_for_progress(progress)
+        if update == total_updates - 1 and forced_steps <= 0:
+            remaining = max(window, token_budget - scheduled_tokens)
+            sequences = max(1, math.ceil(remaining / window))
+        else:
+            sequences = max(1, round(TARGET_TOKENS_PER_UPDATE / window))
+        tokens = sequences * window
+        provisional.append((window, sequences, progress))
+        scheduled_tokens += tokens
+
+    schedule = []
+    for update, (window, sequences, progress) in enumerate(provisional):
+        schedule.append(UpdateDescriptor(
+            index=update,
+            total_updates=total_updates,
+            window=window,
+            sequences=sequences,
+            tokens=window * sequences,
+            progress=progress,
+            backbone_lr_scale=backbone_lr_scale_for_progress(progress, update, total_updates),
+            ssonn_lr_scale=0.5 * (1.0 - math.cos(2.0 * math.pi * progress)),
+        ))
+    return schedule
+
+
+def schedule_token_count(schedule: Sequence[UpdateDescriptor]) -> int:
+    return sum(update.tokens for update in schedule)
 
 
 def infer_full_pass_cycle_steps(train_tokens: int) -> int:
@@ -711,15 +1026,14 @@ def layer_input_widths(model: AttentionOnlyGPT) -> dict[str, int]:
     return {name: getattr(model, name).in_features for name in model.ssonn_layer_names}
 
 
-def make_edge_finder(seq_len: int, token_limit: int | None = None) -> EdgeFinder:
+def make_edge_finder(seq_len: int, slices: Sequence[ShardSlice] | None = None) -> EdgeFinder:
     return EdgeFinder(
         metric=AbsGradientEdgeMetric(lm_cross_entropy),
         dataloader=FixedFinderLoader(
-            TRAIN_FILES,
+            ARCHITECTURE_SLICES if slices is None else slices,
             FINDER_BATCHES,
             seq_len,
             FINDER_STREAM_SEED,
-            token_limit=token_limit,
         ),
         device=device,
         aggregation_mode="mean",
@@ -781,10 +1095,17 @@ def create_comet_experiment():
         "num_updates": NUM_UPDATES,
         "micro_batch_size": MICRO_BATCH_SIZE,
         "grad_accum_steps": GRAD_ACCUM_STEPS,
-        "effective_batch_sequences": MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS,
+        "micro_batch_sequences": MICRO_BATCH_SIZE,
+        "micro_batch_sequences_meaning": "maximum-window batch size",
+        "activation_token_envelope": MICRO_BATCH_SIZE * WINDOW_END,
+        "dynamic_microbatch": True,
+        "dynamic_accumulation": True,
+        "legacy_grad_accum_steps": GRAD_ACCUM_STEPS,
+        "target_tokens_per_update": TARGET_TOKENS_PER_UPDATE,
         "window_start": WINDOW_START,
         "window_end": WINDOW_END,
-        "cooldown_updates": COOLDOWN_UPDATES,
+        "cooldown_fraction": COOLDOWN_FRACTION,
+        "cooldown_updates_override": COOLDOWN_UPDATES,
         "amp_dtype": ARGS.amp_dtype,
         "grad_scaler": USE_SCALER,
         "gpu_arg": ARGS.gpu,
@@ -797,12 +1118,23 @@ def create_comet_experiment():
         "architecture_tokens": ARCHITECTURE_TOKEN_COUNT,
         "architecture_cycle_steps": SSONN_CYCLE_STEPS,
         "training_passes": TRAINING_PASSES,
+        "full_training_target_tokens": FULL_TRAINING_TARGET_TOKENS,
         "full_training_steps": FULL_TRAINING_STEPS,
         "full_training_pass_steps": FULL_TRAINING_PASS_STEPS,
         "full_training_tokens": FULL_TRAINING_TOKEN_COUNT,
         "train_shards": len(TRAIN_FILES),
         "train_tokens": TRAIN_TOKEN_COUNT,
-        "validation_protocol": "fixed_restart_per_eval",
+        "periodic_validation_tokens": PERIODIC_VALIDATION_TOKENS,
+        "periodic_validation_scheduled_tokens": validation_scheduled_tokens(PERIODIC_VALIDATION_TOKENS),
+        "final_validation_tokens": FINAL_VALIDATION_TOKENS,
+        "final_validation_scheduled_tokens": validation_scheduled_tokens(FINAL_VALIDATION_TOKENS),
+        "validation_seq_len": VALIDATION_SEQ_LEN,
+        "validation_protocol": "fixed_tokens_fixed_context_document_local",
+        "attention_backend": "flex" if USE_FLEX_ATTENTION else "sdpa",
+        "torch_compile": USE_COMPILE,
+        "document_local_attention": True,
+        "backbone_grad_clip": BACKBONE_GRAD_CLIP,
+        "ssonn_grad_clip": SSONN_GRAD_CLIP,
         "ssonn_expansion_threshold": SSONN_EXPANSION_THRESHOLD,
         "ssonn_max_new_edges": SSONN_MAX_NEW_EDGES,
         "finder_batches": FINDER_BATCHES,
@@ -841,6 +1173,91 @@ def finish_optimizer_step(
         for optimizer in optimizers:
             optimizer.step()
     return grad_norm, False
+
+
+@dataclass(frozen=True)
+class GradientStepStats:
+    backbone_norm: float
+    ssonn_norm: float
+    backbone_clip_coefficient: float
+    ssonn_clip_coefficient: float
+    skipped: bool
+
+
+def optimizer_parameters(*optimizers: torch.optim.Optimizer) -> list[nn.Parameter]:
+    return [parameter for optimizer in optimizers for group in optimizer.param_groups for parameter in group["params"]]
+
+
+def finish_grouped_optimizer_step(
+    muon: torch.optim.Optimizer,
+    backbone_adam: torch.optim.Optimizer,
+    ssonn_adam: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler | None,
+) -> GradientStepStats:
+    optimizers = (muon, backbone_adam, ssonn_adam)
+    if scaler is not None:
+        for optimizer in optimizers:
+            scaler.unscale_(optimizer)
+    backbone_parameters = optimizer_parameters(muon, backbone_adam)
+    ssonn_parameters = optimizer_parameters(ssonn_adam)
+    backbone_norm = torch.nn.utils.clip_grad_norm_(
+        backbone_parameters,
+        BACKBONE_GRAD_CLIP if BACKBONE_GRAD_CLIP > 0 else float("inf"),
+    )
+    ssonn_norm = torch.nn.utils.clip_grad_norm_(
+        ssonn_parameters,
+        SSONN_GRAD_CLIP if SSONN_GRAD_CLIP > 0 else float("inf"),
+    )
+    finite = bool(torch.isfinite(backbone_norm).item() and torch.isfinite(ssonn_norm).item())
+    backbone_value = float(backbone_norm)
+    ssonn_value = float(ssonn_norm)
+    backbone_coefficient = min(1.0, BACKBONE_GRAD_CLIP / (backbone_value + 1e-12)) if BACKBONE_GRAD_CLIP > 0 else 1.0
+    ssonn_coefficient = min(1.0, SSONN_GRAD_CLIP / (ssonn_value + 1e-12)) if SSONN_GRAD_CLIP > 0 else 1.0
+    if not finite:
+        if scaler is not None:
+            scaler.update()
+        for optimizer in optimizers:
+            optimizer.zero_grad(set_to_none=True)
+        return GradientStepStats(backbone_value, ssonn_value, backbone_coefficient, ssonn_coefficient, True)
+    if scaler is not None:
+        for optimizer in optimizers:
+            scaler.step(optimizer)
+        scaler.update()
+    else:
+        for optimizer in optimizers:
+            optimizer.step()
+    return GradientStepStats(backbone_value, ssonn_value, backbone_coefficient, ssonn_coefficient, False)
+
+
+def run_scheduled_update(
+    model: nn.Module,
+    stream: TokenShardStream,
+    update: UpdateDescriptor,
+    optimizers: tuple[torch.optim.Optimizer, torch.optim.Optimizer, torch.optim.Optimizer],
+    scaler: torch.amp.GradScaler | None,
+    label: str,
+) -> tuple[float, GradientStepStats]:
+    muon, backbone_adam, ssonn_adam = optimizers
+    for optimizer in optimizers:
+        optimizer.zero_grad(set_to_none=True)
+    remaining_sequences = update.sequences
+    train_loss = 0.0
+    while remaining_sequences > 0:
+        batch_size = min(update.micro_batch_sequences, remaining_sequences)
+        x_cpu, y_cpu = stream.next_batch(update.window, batch_size)
+        x, y = to_device(x_cpu, y_cpu)
+        batch_tokens = batch_size * update.window
+        loss_weight = batch_tokens / update.tokens
+        with torch.autocast(device_type=device.type, dtype=AMP_DTYPE, enabled=USE_AMP and device.type == "cuda"):
+            document_ids, positions = document_ids_and_positions(x)
+            logits = model(x, positions, make_document_attention_mask(document_ids))
+            loss = lm_cross_entropy(logits, y)
+        assert_finite_tensor(loss, label)
+        backward_loss(loss * loss_weight, scaler)
+        train_loss += loss.detach().item() * loss_weight
+        remaining_sequences -= batch_size
+    stats = finish_grouped_optimizer_step(muon, backbone_adam, ssonn_adam, scaler)
+    return train_loss, stats
 
 
 def train_autocast_stage(model: AttentionOnlyGPT, mode: str, experiment) -> AttentionOnlyGPT:
@@ -1151,13 +1568,15 @@ def expand_model_with_topology(
     model: AttentionOnlyGPT,
     edge_finder: EdgeFinder,
     thresholds: dict[str, float],
+    forward_model: nn.Module | None = None,
 ) -> tuple[bool, int, dict[str, dict[str, list[int]]]]:
     """Select all edges on a frozen topology, then apply and record them."""
+    selection_model = model if forward_model is None else forward_model
     selected: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     for name in model.ssonn_layer_names:
         layer = getattr(model, name)
         parents, children = edge_finder.choose_edges_threshold(
-            model,
+            selection_model,
             layer,
             thresholds[name],
             embed=False,
@@ -1189,154 +1608,197 @@ def architecture_checkpoint_metadata(
         "phase": phase,
         "expansion_index": expansion_index,
         "phase_step": phase_step,
+        "checkpoint_schema_version": 2,
         "architecture_fraction": ARCHITECTURE_FRACTION,
         "architecture_tokens": ARCHITECTURE_TOKEN_COUNT,
         "architecture_cycle_steps": SSONN_CYCLE_STEPS,
+        "architecture_cycle_scheduled_tokens": SSONN_CYCLE_TOKEN_COUNT,
+        "architecture_search_total_tokens": ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT,
         "full_training_steps": FULL_TRAINING_STEPS,
+        "full_training_target_tokens": FULL_TRAINING_TARGET_TOKENS,
+        "full_training_scheduled_tokens": FULL_TRAINING_TOKEN_COUNT,
+        "target_tokens_per_update": TARGET_TOKENS_PER_UPDATE,
+        "cooldown_fraction": COOLDOWN_FRACTION,
+        "attention_backend": "flex" if USE_FLEX_ATTENTION else "sdpa",
+        "torch_compile": USE_COMPILE,
+        "document_local_attention": True,
+        "periodic_validation_tokens": PERIODIC_VALIDATION_TOKENS,
+        "periodic_validation_scheduled_tokens": validation_scheduled_tokens(PERIODIC_VALIDATION_TOKENS),
+        "final_validation_tokens": FINAL_VALIDATION_TOKENS,
+        "final_validation_scheduled_tokens": validation_scheduled_tokens(FINAL_VALIDATION_TOKENS),
+        "validation_seq_len": VALIDATION_SEQ_LEN,
         "topology_history": topology_history,
     }
 
 
+def configure_optimizer_schedule(
+    optimizers: tuple[torch.optim.Optimizer, torch.optim.Optimizer, torch.optim.Optimizer],
+    update: UpdateDescriptor,
+) -> tuple[float, float, float]:
+    muon, backbone_adam, ssonn_adam = optimizers
+    muon.param_groups[0]["momentum"] = 0.85 + 0.10 * min(update.index / 300, 1.0)
+    muon_lr = PRETRAIN_MUON_LR * update.backbone_lr_scale
+    backbone_lr = PRETRAIN_ADAM_LR * update.backbone_lr_scale
+    ssonn_lr = SSONN_LEARNING_RATE * update.ssonn_lr_scale
+    muon.param_groups[0]["lr"] = muon_lr
+    backbone_adam.param_groups[0]["lr"] = backbone_lr
+    ssonn_adam.param_groups[0]["lr"] = ssonn_lr
+    return muon_lr, backbone_lr, ssonn_lr
+
+
 def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOnlyGPT:
+    architecture_schedule = build_update_schedule(ARCHITECTURE_TOKEN_COUNT, ARGS.architecture_cycle_steps)
+    full_schedule = build_update_schedule(FULL_TRAINING_TARGET_TOKENS, ARGS.full_training_steps)
     global_step = 0
     global_tokens_seen = 0
     started = time.perf_counter()
     topology_history: list[dict] = []
     thresholds = {name: SSONN_EXPANSION_THRESHOLD for name in model.ssonn_layer_names}
-    scaler = torch.amp.GradScaler("cuda", enabled=USE_SCALER)
-    scaler_or_none = scaler if USE_SCALER else None
 
     set_seed(SEED)
     full_model_reinit(model)
     ssonn_train.apply_sparsity_mask(model)
-    initial_val_loss = evaluate_fixed(model, WINDOW_START, SSONN_EVAL_BATCHES)
-    print(f"architecture search initial val loss: {initial_val_loss:.4f}")
+    initial_val_loss = evaluate_token_budget(model, PERIODIC_VALIDATION_TOKENS)
+    print(f"architecture search initial fixed val loss: {initial_val_loss:.4f}")
 
     for expansion_index in range(ARCHITECTURE_EXPANSIONS):
-        train_stream = TokenShardStream(
-            TRAIN_FILES,
-            seed=TRAIN_STREAM_SEED,
-            token_limit=ARCHITECTURE_TOKEN_COUNT,
-        )
-        muon, backbone_adam, ssonn_adam = make_ssonn_stage_optimizers(model)
+        train_stream = TokenShardStream(seed=TRAIN_STREAM_SEED, slices=ARCHITECTURE_SLICES)
+        optimizers = make_ssonn_stage_optimizers(model)
+        cycle_model: nn.Module = torch.compile(model) if USE_COMPILE else model
+        scaler = torch.amp.GradScaler("cuda", enabled=USE_SCALER)
+        scaler_or_none = scaler if USE_SCALER else None
         cycle_tokens_seen = 0
         cycle_started = time.perf_counter()
+        last_val_loss = float("nan")
         print(
             f"architecture cycle {expansion_index + 1}/{ARCHITECTURE_EXPANSIONS}: "
-            f"{SSONN_CYCLE_STEPS} updates over the same {ARCHITECTURE_TOKEN_COUNT}-token subset"
+            f"{len(architecture_schedule)} updates | {schedule_token_count(architecture_schedule):,} scheduled tokens"
         )
 
-        last_train_loss = float("nan")
-        last_grad_norm = torch.tensor(float("nan"), device=device)
-        for cycle_step in range(SSONN_CYCLE_STEPS):
-            seq_len = cycle_window_for_steps(cycle_step, SSONN_CYCLE_STEPS)
-            lr_scale = speedrun_lr_scale(cycle_step, SSONN_CYCLE_STEPS)
-            muon.param_groups[0]["momentum"] = 0.85 + 0.10 * min(cycle_step / 300, 1.0)
-            muon.param_groups[0]["lr"] = PRETRAIN_MUON_LR * lr_scale
-            backbone_adam.param_groups[0]["lr"] = PRETRAIN_ADAM_LR * lr_scale
-            ssonn_lr = ssonn_cosine_lr(cycle_step, SSONN_CYCLE_STEPS)
-            ssonn_adam.param_groups[0]["lr"] = ssonn_lr
-
-            model.train()
-            for optimizer in (muon, backbone_adam, ssonn_adam):
-                optimizer.zero_grad(set_to_none=True)
-            train_loss = 0.0
-            for _ in range(GRAD_ACCUM_STEPS):
-                x_cpu, y_cpu = train_stream.next_batch(seq_len, MICRO_BATCH_SIZE)
-                x, y = to_device(x_cpu, y_cpu)
-                with torch.autocast(device_type=device.type, dtype=AMP_DTYPE, enabled=USE_AMP and device.type == "cuda"):
-                    loss = lm_cross_entropy(model(x), y) / GRAD_ACCUM_STEPS
-                assert_finite_tensor(loss, f"Architecture loss at cycle {expansion_index}, update {cycle_step + 1}")
-                backward_loss(loss, scaler_or_none)
-                train_loss += loss.detach().item()
-
-            step_tokens = GRAD_ACCUM_STEPS * MICRO_BATCH_SIZE * seq_len
-            cycle_tokens_seen += step_tokens
-            global_tokens_seen += step_tokens
-            global_step += 1
-            grad_norm, skipped_step = finish_optimizer_step(
-                (muon, backbone_adam, ssonn_adam), scaler_or_none, model
+        for update in architecture_schedule:
+            muon_lr, backbone_lr, ssonn_lr = configure_optimizer_schedule(optimizers, update)
+            cycle_model.train()
+            train_loss, grad = run_scheduled_update(
+                cycle_model,
+                train_stream,
+                update,
+                optimizers,
+                scaler_or_none,
+                f"Architecture loss at cycle {expansion_index}, update {update.index + 1}",
             )
-            last_train_loss = train_loss
-            last_grad_norm = grad_norm
-            if skipped_step:
+            cycle_tokens_seen += update.tokens
+            global_tokens_seen += update.tokens
+            global_step += 1
+            if grad.skipped:
                 print(f"architecture step {global_step}: skipped non-finite gradients")
             else:
                 assert_finite_model(model, f"Architecture model after global update {global_step}")
 
-            should_eval = (
-                global_step == 1
-                or (cycle_step + 1) % EVAL_INTERVAL == 0
-                or cycle_step + 1 == SSONN_CYCLE_STEPS
-            )
+            should_eval = update.index == 0 or (update.index + 1) % EVAL_INTERVAL == 0 or update.index + 1 == len(architecture_schedule)
             if should_eval:
-                val_loss = evaluate_fixed(model, seq_len, SSONN_EVAL_BATCHES)
+                last_val_loss = evaluate_token_budget(cycle_model, PERIODIC_VALIDATION_TOKENS)
                 elapsed = time.perf_counter() - started
                 cycle_elapsed = time.perf_counter() - cycle_started
                 tokens_per_second = cycle_tokens_seen / max(cycle_elapsed, 1.0)
                 print(
                     f"architecture {expansion_index + 1}/{ARCHITECTURE_EXPANSIONS} | "
-                    f"step {cycle_step + 1:6d}/{SSONN_CYCLE_STEPS} | window {seq_len:4d} | "
-                    f"train {train_loss:.4f} | val {val_loss:.4f} | ssonn_lr {ssonn_lr:.2e} | "
+                    f"update {update.index + 1:4d}/{len(architecture_schedule)} | window {update.window:4d} | "
+                    f"tokens/update {update.tokens:,} | accum {update.accumulation_steps:3d} | "
+                    f"train {train_loss:.4f} | val {last_val_loss:.4f} | ssonn_lr {ssonn_lr:.2e} | "
                     f"{tokens_per_second:.0f} tok/s"
                 )
                 if experiment is not None:
                     experiment.log_metrics({
                         "architecture/phase": 0,
                         "architecture/expansion_index": expansion_index,
-                        "architecture/cycle_step": cycle_step,
+                        "architecture/cycle_step": update.index,
+                        "architecture/cycle_progress": update.progress,
                         "architecture/train_loss": train_loss,
-                        "architecture/val_loss": val_loss,
-                        "architecture/val_perplexity": math.exp(min(val_loss, 20.0)),
-                        "architecture/window": seq_len,
+                        "architecture/val_loss": last_val_loss,
+                        "architecture/val_perplexity": math.exp(min(last_val_loss, 20.0)),
+                        "architecture/window": update.window,
+                        "architecture/planned_tokens_per_update": TARGET_TOKENS_PER_UPDATE,
+                        "architecture/actual_tokens_per_update": update.tokens,
+                        "architecture/micro_batch_sequences": update.micro_batch_sequences,
+                        "architecture/accumulation_steps": update.accumulation_steps,
                         "architecture/subset_fraction": ARCHITECTURE_FRACTION,
                         "architecture/subset_tokens": ARCHITECTURE_TOKEN_COUNT,
                         "architecture/cycle_tokens_seen": cycle_tokens_seen,
                         "architecture/global_tokens_seen": global_tokens_seen,
                         "architecture/tokens_per_second": tokens_per_second,
-                        "architecture/grad_norm": float(grad_norm),
-                        "architecture/skipped_step": int(skipped_step),
-                        "architecture/muon_lr": muon.param_groups[0]["lr"],
-                        "architecture/backbone_adam_lr": backbone_adam.param_groups[0]["lr"],
+                        "architecture/backbone_grad_norm": grad.backbone_norm,
+                        "architecture/ssonn_grad_norm": grad.ssonn_norm,
+                        "architecture/backbone_clip_coefficient": grad.backbone_clip_coefficient,
+                        "architecture/ssonn_clip_coefficient": grad.ssonn_clip_coefficient,
+                        "architecture/skipped_step": int(grad.skipped),
+                        "architecture/muon_lr": muon_lr,
+                        "architecture/backbone_adam_lr": backbone_lr,
                         "architecture/ssonn_lr": ssonn_lr,
+                        "architecture/backbone_lr_scale": update.backbone_lr_scale,
                         "architecture/elapsed_seconds": elapsed,
                     }, step=global_step)
 
-        pre_expansion_val_loss = evaluate_fixed(model, WINDOW_END, SSONN_EVAL_BATCHES)
-        edge_finder = make_edge_finder(WINDOW_END, token_limit=ARCHITECTURE_TOKEN_COUNT)
+        if architecture_schedule[-1].ssonn_lr_scale != 0.0:
+            raise AssertionError("Architecture expansion must happen at the zero SSONN LR trough.")
+        pre_expansion_val_loss = last_val_loss if math.isfinite(last_val_loss) else evaluate_token_budget(model, PERIODIC_VALIDATION_TOKENS)
+        edge_finder = make_edge_finder(WINDOW_END, ARCHITECTURE_SLICES)
         before_widths = layer_input_widths(model)
-        expanded, new_edges, topology = expand_model_with_topology(model, edge_finder, thresholds)
+        params_before = count_parameters(model)
+        ssonn_params_before = count_ssonn_stored_parameters(model)
+        active_before = count_ssonn_active_connections(model)
+        expanded, selected_edges, topology = expand_model_with_topology(
+            model, edge_finder, thresholds, forward_model=cycle_model
+        )
+        del cycle_model
+        if expanded:
+            ssonn_train.apply_sparsity_mask(model)
         after_widths = layer_input_widths(model)
+        params_after = count_parameters(model)
+        ssonn_params_after = count_ssonn_stored_parameters(model)
+        active_after = count_ssonn_active_connections(model)
         selection_stats = {
             name: edge_finder.last_selection_stats.get(id(getattr(model, name)), {})
             for name in model.ssonn_layer_names
         }
+        unique_parents = sum(len(set(layer_topology["parents"])) for layer_topology in topology.values())
+        candidate_edges = sum(int(stats.get("candidate_count", 0)) for stats in selection_stats.values())
+        saturated_layers = sum(int(stats.get("selection_saturated", 0)) for stats in selection_stats.values())
         event = {
             "expansion_index": expansion_index,
             "global_step": global_step,
-            "new_edges": new_edges,
+            "selected_edges": selected_edges,
+            "new_edges": selected_edges,
+            "added_nodes": selected_edges,
+            "unique_parents": unique_parents,
+            "stored_parameter_growth": params_after - params_before,
+            "ssonn_parameter_growth": ssonn_params_after - ssonn_params_before,
+            "active_connection_growth": active_after - active_before,
             "layers": topology,
         }
         topology_history.append(event)
-        if expanded:
-            ssonn_train.apply_sparsity_mask(model)
-        total_params = count_parameters(model)
-        nonzero_params = count_nonzero_parameters(model)
-        candidate_edges = sum(int(stats.get("candidate_count", 0)) for stats in selection_stats.values())
-        saturated_layers = sum(int(stats.get("selection_saturated", 0)) for stats in selection_stats.values())
         print(
             f"architecture expansion {expansion_index + 1}/{ARCHITECTURE_EXPANSIONS}: "
-            f"expanded={expanded} new_edges={new_edges} candidates={candidate_edges} "
+            f"expanded={expanded} selected_edges={selected_edges} unique_parents={unique_parents} "
+            f"params_added={params_after - params_before:,} active_connections_added={active_after - active_before:,} "
             f"saturated_layers={saturated_layers}/{len(model.ssonn_layer_names)}"
         )
         if experiment is not None:
+            total_params = count_parameters(model)
+            nonzero_params = count_nonzero_parameters(model)
             metrics = {
                 "architecture/expansion_event": 1,
                 "architecture/expanded": int(expanded),
-                "architecture/new_edges": new_edges,
+                "architecture/selected_edges": selected_edges,
+                "architecture/new_edges": selected_edges,
+                "architecture/added_nodes": selected_edges,
+                "architecture/unique_parents": unique_parents,
                 "architecture/pre_expansion_val_loss": pre_expansion_val_loss,
                 "architecture/candidate_edges_before_cap": candidate_edges,
                 "architecture/saturated_layer_count": saturated_layers,
+                "architecture/stored_parameter_growth": params_after - params_before,
+                "architecture/ssonn_parameter_growth": ssonn_params_after - ssonn_params_before,
+                "architecture/active_connection_growth": active_after - active_before,
+                "architecture/active_connections": active_after,
                 "architecture/total_params": total_params,
                 "architecture/nonzero_params": nonzero_params,
                 "architecture/sparsity": 1.0 - nonzero_params / max(total_params, 1),
@@ -1345,8 +1807,12 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
             }
             for name in model.ssonn_layer_names:
                 stats = selection_stats[name]
+                layer_selected = after_widths[name] - before_widths[name]
+                layer_unique_parents = len(set(topology[name]["parents"]))
                 metrics.update({
-                    f"architecture/new_edges/{name}": after_widths[name] - before_widths[name],
+                    f"architecture/selected_edges/{name}": layer_selected,
+                    f"architecture/new_edges/{name}": layer_selected,
+                    f"architecture/unique_parents/{name}": layer_unique_parents,
                     f"architecture/candidate_edges/{name}": int(stats.get("candidate_count", 0)),
                     f"architecture/selection_saturated/{name}": int(stats.get("selection_saturated", 0)),
                     f"architecture/selected_metric_min/{name}": float(stats.get("selected_metric_min", 0.0)),
@@ -1358,28 +1824,20 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
             model,
             None,
             global_step,
-            architecture_checkpoint_metadata(
-                "architecture",
-                expansion_index + 1,
-                SSONN_CYCLE_STEPS,
-                topology_history,
-            ),
+            architecture_checkpoint_metadata("architecture", expansion_index + 1, len(architecture_schedule), topology_history),
         )
 
-    # Keep the discovered graph, discard all weights, and begin the real run once.
+    # Preserve the graph, discard all learned weights once, and start the quality run.
     set_seed(SEED)
     full_model_reinit(model)
     ssonn_train.apply_sparsity_mask(model)
-    post_reinit_val_loss = evaluate_fixed(model, WINDOW_START, SSONN_EVAL_BATCHES)
+    post_reinit_val_loss = evaluate_token_budget(model, PERIODIC_VALIDATION_TOKENS)
     print(
         f"architecture ready: {count_ssonn_sublinears(model)} sub-linears | "
-        f"post-reinit val loss {post_reinit_val_loss:.4f}"
+        f"zero-delta post-reinit fixed val loss {post_reinit_val_loss:.4f}"
     )
     transition_metadata = architecture_checkpoint_metadata(
-        "full_training_init",
-        ARCHITECTURE_EXPANSIONS,
-        0,
-        topology_history,
+        "full_training_init", ARCHITECTURE_EXPANSIONS, 0, topology_history
     )
     save_checkpoint(
         CHECKPOINT_DIR / "finewebedu_ssonn_architecture_ready.pt",
@@ -1394,97 +1852,90 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
         experiment.log_metrics({
             "transition/architecture_ready": 1,
             "transition/full_reinit": 1,
+            "transition/zero_delta_ssonn": 1,
             "transition/post_reinit_val_loss": post_reinit_val_loss,
             "transition/total_params": total_params,
             "transition/nonzero_params": nonzero_params,
+            "transition/active_connections": count_ssonn_active_connections(model),
             "transition/sparsity": 1.0 - nonzero_params / max(total_params, 1),
             "transition/sublinear_count": count_ssonn_sublinears(model),
         }, step=global_step)
 
     scaler = torch.amp.GradScaler("cuda", enabled=USE_SCALER)
     scaler_or_none = scaler if USE_SCALER else None
-    # Build groups before torch.compile prefixes parameter names with `_orig_mod`.
-    muon, backbone_adam, ssonn_adam = make_ssonn_stage_optimizers(model)
+    optimizers = make_ssonn_stage_optimizers(model)
     training_model: nn.Module = torch.compile(model) if USE_COMPILE else model
-    train_stream = TokenShardStream(TRAIN_FILES, seed=TRAIN_STREAM_SEED)
+    train_stream = TokenShardStream(seed=TRAIN_STREAM_SEED, slices=FULL_TRAINING_SLICES)
     training_tokens_seen = 0
     training_started = time.perf_counter()
     best_val = float("inf")
     latest_path = CHECKPOINT_DIR / "finewebedu_ssonn_architecture_first_latest.pt"
 
-    for training_step in range(FULL_TRAINING_STEPS):
-        pass_step = training_step % FULL_TRAINING_PASS_STEPS
-        seq_len = cycle_window_for_steps(pass_step, FULL_TRAINING_PASS_STEPS)
-        lr_scale = speedrun_lr_scale(pass_step, FULL_TRAINING_PASS_STEPS)
-        muon.param_groups[0]["momentum"] = 0.85 + 0.10 * min(pass_step / 300, 1.0)
-        muon.param_groups[0]["lr"] = PRETRAIN_MUON_LR * lr_scale
-        backbone_adam.param_groups[0]["lr"] = PRETRAIN_ADAM_LR * lr_scale
-        ssonn_lr = ssonn_cosine_lr(pass_step, FULL_TRAINING_PASS_STEPS)
-        ssonn_adam.param_groups[0]["lr"] = ssonn_lr
+    for update in full_schedule:
+        muon_lr, backbone_lr, ssonn_lr = configure_optimizer_schedule(optimizers, update)
         training_model.train()
-        for optimizer in (muon, backbone_adam, ssonn_adam):
-            optimizer.zero_grad(set_to_none=True)
-
-        train_loss = 0.0
-        for _ in range(GRAD_ACCUM_STEPS):
-            x_cpu, y_cpu = train_stream.next_batch(seq_len, MICRO_BATCH_SIZE)
-            x, y = to_device(x_cpu, y_cpu)
-            with torch.autocast(device_type=device.type, dtype=AMP_DTYPE, enabled=USE_AMP and device.type == "cuda"):
-                loss = lm_cross_entropy(training_model(x), y) / GRAD_ACCUM_STEPS
-            assert_finite_tensor(loss, f"Full-training loss at update {training_step + 1}")
-            backward_loss(loss, scaler_or_none)
-            train_loss += loss.detach().item()
-
-        step_tokens = GRAD_ACCUM_STEPS * MICRO_BATCH_SIZE * seq_len
-        training_tokens_seen += step_tokens
-        global_tokens_seen += step_tokens
+        train_loss, grad = run_scheduled_update(
+            training_model,
+            train_stream,
+            update,
+            optimizers,
+            scaler_or_none,
+            f"Full-training loss at update {update.index + 1}",
+        )
+        training_tokens_seen += update.tokens
+        global_tokens_seen += update.tokens
         global_step += 1
-        grad_norm, skipped_step = finish_optimizer_step(
-            (muon, backbone_adam, ssonn_adam), scaler_or_none, training_model
-        )
-        if skipped_step:
-            print(f"full-training step {training_step + 1}: skipped non-finite gradients")
+        if grad.skipped:
+            print(f"full-training update {update.index + 1}: skipped non-finite gradients")
         else:
-            assert_finite_model(training_model, f"Full-training model after update {training_step + 1}")
+            assert_finite_model(training_model, f"Full-training model after update {update.index + 1}")
 
-        should_eval = (
-            training_step == 0
-            or (training_step + 1) % EVAL_INTERVAL == 0
-            or training_step + 1 == FULL_TRAINING_STEPS
-        )
+        should_eval = update.index == 0 or (update.index + 1) % EVAL_INTERVAL == 0 or update.index + 1 == len(full_schedule)
         checkpoint_model = getattr(training_model, "_orig_mod", training_model)
         if should_eval:
-            val_loss = evaluate_fixed(training_model, seq_len, SSONN_EVAL_BATCHES)
+            val_loss = evaluate_token_budget(training_model, PERIODIC_VALIDATION_TOKENS)
             elapsed = time.perf_counter() - started
             training_elapsed = time.perf_counter() - training_started
             tokens_per_second = training_tokens_seen / max(training_elapsed, 1.0)
             print(
-                f"full training step {training_step + 1:6d}/{FULL_TRAINING_STEPS} | "
-                f"window {seq_len:4d} | train {train_loss:.4f} | val {val_loss:.4f} | "
-                f"ssonn_lr {ssonn_lr:.2e} | {tokens_per_second:.0f} tok/s"
+                f"full training update {update.index + 1:4d}/{len(full_schedule)} | window {update.window:4d} | "
+                f"tokens/update {update.tokens:,} | accum {update.accumulation_steps:3d} | "
+                f"train {train_loss:.4f} | val {val_loss:.4f} | ssonn_lr {ssonn_lr:.2e} | "
+                f"{tokens_per_second:.0f} tok/s"
             )
             if experiment is not None:
                 total_params = count_parameters(checkpoint_model)
                 nonzero_params = count_nonzero_parameters(checkpoint_model)
                 experiment.log_metrics({
                     "training/phase": 1,
-                    "training/phase_step": training_step,
+                    "training/phase_step": update.index,
+                    "training/phase_progress": update.progress,
                     "training/global_step": global_step,
                     "training/train_loss": train_loss,
                     "training/val_loss": val_loss,
                     "training/val_perplexity": math.exp(min(val_loss, 20.0)),
-                    "training/window": seq_len,
+                    "training/window": update.window,
+                    "training/planned_tokens_per_update": TARGET_TOKENS_PER_UPDATE,
+                    "training/actual_tokens_per_update": update.tokens,
+                    "training/micro_batch_sequences": update.micro_batch_sequences,
+                    "training/accumulation_steps": update.accumulation_steps,
                     "training/training_tokens_seen": training_tokens_seen,
                     "training/global_tokens_seen": global_tokens_seen,
+                    "training/search_tokens_seen": ARCHITECTURE_EXPANSIONS * schedule_token_count(architecture_schedule),
                     "training/tokens_per_second": tokens_per_second,
-                    "training/grad_norm": float(grad_norm),
-                    "training/skipped_step": int(skipped_step),
-                    "training/muon_lr": muon.param_groups[0]["lr"],
-                    "training/backbone_adam_lr": backbone_adam.param_groups[0]["lr"],
+                    "training/backbone_grad_norm": grad.backbone_norm,
+                    "training/ssonn_grad_norm": grad.ssonn_norm,
+                    "training/backbone_clip_coefficient": grad.backbone_clip_coefficient,
+                    "training/ssonn_clip_coefficient": grad.ssonn_clip_coefficient,
+                    "training/skipped_step": int(grad.skipped),
+                    "training/muon_lr": muon_lr,
+                    "training/backbone_adam_lr": backbone_lr,
                     "training/ssonn_lr": ssonn_lr,
+                    "training/backbone_lr_scale": update.backbone_lr_scale,
                     "training/elapsed_seconds": elapsed,
                     "training/total_params": total_params,
                     "training/nonzero_params": nonzero_params,
+                    "training/active_connections": count_ssonn_active_connections(checkpoint_model),
                     "training/sparsity": 1.0 - nonzero_params / max(total_params, 1),
                     "training/sublinear_count": count_ssonn_sublinears(checkpoint_model),
                 }, step=global_step)
@@ -1493,29 +1944,41 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
                 save_checkpoint(
                     SSONN_CHECKPOINT,
                     checkpoint_model,
-                    optimizer_state_dict(muon, backbone_adam, ssonn_adam),
+                    optimizer_state_dict(*optimizers),
                     global_step,
-                    architecture_checkpoint_metadata(
-                        "full_training",
-                        ARCHITECTURE_EXPANSIONS,
-                        training_step + 1,
-                        topology_history,
-                    ),
+                    architecture_checkpoint_metadata("full_training", ARCHITECTURE_EXPANSIONS, update.index + 1, topology_history),
                 )
 
-        if (training_step + 1) % CHECKPOINT_INTERVAL == 0 or training_step + 1 == FULL_TRAINING_STEPS:
+        if (update.index + 1) % CHECKPOINT_INTERVAL == 0 or update.index + 1 == len(full_schedule):
             save_checkpoint(
                 latest_path,
                 checkpoint_model,
-                optimizer_state_dict(muon, backbone_adam, ssonn_adam),
+                optimizer_state_dict(*optimizers),
                 global_step,
-                architecture_checkpoint_metadata(
-                    "full_training",
-                    ARCHITECTURE_EXPANSIONS,
-                    training_step + 1,
-                    topology_history,
-                ),
+                architecture_checkpoint_metadata("full_training", ARCHITECTURE_EXPANSIONS, update.index + 1, topology_history),
             )
+
+    final_val_loss = evaluate_token_budget(training_model, FINAL_VALIDATION_TOKENS)
+    print(
+        f"final canonical validation: loss {final_val_loss:.4f} | "
+        f"ppl {math.exp(min(final_val_loss, 20.0)):.2f} | {FINAL_VALIDATION_TOKENS:,} target tokens"
+    )
+    checkpoint_model = getattr(training_model, "_orig_mod", training_model)
+    final_metadata = architecture_checkpoint_metadata(
+        "full_training_complete", ARCHITECTURE_EXPANSIONS, len(full_schedule), topology_history
+    )
+    final_metadata["final_validation_loss"] = final_val_loss
+    save_checkpoint(latest_path, checkpoint_model, optimizer_state_dict(*optimizers), global_step, final_metadata)
+    if experiment is not None:
+        experiment.log_metrics({
+            "final/val_loss": final_val_loss,
+            "final/val_perplexity": math.exp(min(final_val_loss, 20.0)),
+            "final/validation_target_tokens": FINAL_VALIDATION_TOKENS,
+            "final/validation_scheduled_tokens": validation_scheduled_tokens(FINAL_VALIDATION_TOKENS),
+            "final/training_tokens": training_tokens_seen,
+            "final/search_tokens": ARCHITECTURE_EXPANSIONS * schedule_token_count(architecture_schedule),
+            "final/total_compute_tokens": global_tokens_seen,
+        }, step=global_step)
     return model
 
 
@@ -1555,6 +2018,17 @@ def run_smoke_tests() -> None:
         loss.backward()
         assert torch.isfinite(loss)
     model = AttentionOnlyGPT(small, mlp_kind="ssonn").to(device)
+    full_model_reinit(model)
+    model.eval()
+    identity_tokens = torch.randint(0, small.vocab_size, (2, 16), device=device)
+    residual_logits = model(identity_tokens)
+    for block in model.blocks:
+        block.mlp_kind = "none"
+    backbone_logits = model(identity_tokens)
+    for block in model.blocks:
+        block.mlp_kind = "ssonn"
+    assert torch.equal(residual_logits, backbone_logits), "Zero-delta SSONN must preserve the backbone function."
+
     muon, backbone_adam, ssonn_adam = make_ssonn_stage_optimizers(model)
     ssonn_ids = ssonn_parameter_ids(model)
     backbone_ids = {id(p) for group in muon.param_groups + backbone_adam.param_groups for p in group["params"]}
@@ -1571,6 +2045,23 @@ def run_smoke_tests() -> None:
     assert inferred_steps == 1 or cycle_token_budget(inferred_steps - 1) < target_tokens
     assert has_training_after_step(4, 10)
     assert not has_training_after_step(9, 10)
+    schedule = build_update_schedule(917_504_000)
+    assert len(schedule) == 1750
+    assert schedule[0].window == WINDOW_START and schedule[-1].window == WINDOW_END
+    assert schedule[0].ssonn_lr_scale == 0.0 and schedule[-1].ssonn_lr_scale == 0.0
+    assert max(update.ssonn_lr_scale for update in schedule) > 0.999
+    assert schedule[-1].backbone_lr_scale == 0.0
+    assert abs(schedule_token_count(schedule) - 917_504_000) < 2 * TARGET_TOKENS_PER_UPDATE
+
+    metadata_tokens = torch.tensor([[1, EOT_TOKEN_ID, 2, 3, EOT_TOKEN_ID, 4]], device=device)
+    document_ids, positions = document_ids_and_positions(metadata_tokens)
+    assert document_ids.tolist() == [[0, 1, 1, 1, 2, 2]]
+    assert positions.tolist() == [[0, 0, 1, 2, 0, 1]]
+    attention_mask = make_document_attention_mask(document_ids)
+    assert bool(attention_mask[0, 0, 3, 2])
+    assert bool(attention_mask[0, 0, 2, 1])
+    assert not bool(attention_mask[0, 0, 1, 0])
+    assert not bool(attention_mask[0, 0, 2, 3])
 
     topology_model = AttentionOnlyGPT(small, mlp_kind="ssonn").to(device)
     first_layer = getattr(topology_model, topology_model.ssonn_layer_names[0])
@@ -1597,21 +2088,40 @@ def run_smoke_tests() -> None:
         first = root / "finewebedu_train_000001.bin"
         second = root / "finewebedu_train_000002.bin"
         write_test_shard(first, np.arange(30, dtype=np.uint16))
-        write_test_shard(second, np.arange(100, 140, dtype=np.uint16))
+        write_test_shard(second, np.arange(60, 100, dtype=np.uint16))
         subset_a = TokenShardStream([str(first), str(second)], seed=7, token_limit=35)
         subset_b = TokenShardStream([str(first), str(second)], seed=7, token_limit=35)
         assert subset_a.token_count == 35
-        assert subset_a.file_token_limits == [30, 5]
+        assert sum(subset_a.file_token_limits) == 35
+        assert len(subset_a.file_token_limits) == 2
+        assert subset_a.slices == subset_b.slices
         a_x, a_y = subset_a.next_batch(4, 2)
         b_x, b_y = subset_b.next_batch(4, 2)
         assert torch.equal(a_x, b_x) and torch.equal(a_y, b_y)
+        update_model = AttentionOnlyGPT(small, mlp_kind="ssonn").to(device)
+        full_model_reinit(update_model)
+        ssonn_train.apply_sparsity_mask(update_model)
+        update_optimizers = make_ssonn_stage_optimizers(update_model)
+        update = UpdateDescriptor(0, 2, 16, 2, 32, 0.0, 1.0, 0.0)
+        update_loss, update_stats = run_scheduled_update(
+            update_model,
+            TokenShardStream(seed=7, slices=subset_a.slices),
+            update,
+            update_optimizers,
+            None,
+            "Smoke scheduled update",
+        )
+        assert math.isfinite(update_loss) and not update_stats.skipped
+        assert math.isfinite(update_stats.backbone_norm) and math.isfinite(update_stats.ssonn_norm)
     print("smoke tests ok")
 
 
 def main() -> None:
     global NUM_UPDATES, SSONN_CYCLE_STEPS, FULL_TRAINING_STEPS, FULL_TRAINING_PASS_STEPS
     global TRAIN_FILES, VAL_FILES, TRAIN_TOKEN_COUNT, SSONN_CYCLE_TOKEN_COUNT
-    global ARCHITECTURE_TOKEN_COUNT, FULL_TRAINING_TOKEN_COUNT
+    global ARCHITECTURE_TOKEN_COUNT, FULL_TRAINING_TOKEN_COUNT, FULL_TRAINING_TARGET_TOKENS
+    global ARCHITECTURE_SLICES, FULL_TRAINING_SLICES, VALIDATION_SLICES
+    global PERIODIC_VALIDATION_TOKENS, SSONN_EVAL_BATCHES
     set_seed(SEED)
     if ARGS.smoke_test:
         run_smoke_tests()
@@ -1628,16 +2138,31 @@ def main() -> None:
     ARCHITECTURE_TOKEN_COUNT = math.floor(TRAIN_TOKEN_COUNT * ARCHITECTURE_FRACTION)
     if ARCHITECTURE_TOKEN_COUNT <= WINDOW_END + 1:
         raise ValueError("Architecture subset is too small for the maximum context window.")
-    if SSONN_CYCLE_STEPS <= 0:
-        SSONN_CYCLE_STEPS = infer_full_pass_cycle_steps(ARCHITECTURE_TOKEN_COUNT)
-    SSONN_CYCLE_TOKEN_COUNT = cycle_token_budget(SSONN_CYCLE_STEPS)
-    if FULL_TRAINING_STEPS <= 0:
-        FULL_TRAINING_PASS_STEPS = infer_full_pass_cycle_steps(TRAIN_TOKEN_COUNT)
-        FULL_TRAINING_STEPS = TRAINING_PASSES * FULL_TRAINING_PASS_STEPS
-        FULL_TRAINING_TOKEN_COUNT = TRAINING_PASSES * cycle_token_budget(FULL_TRAINING_PASS_STEPS)
-    else:
-        FULL_TRAINING_PASS_STEPS = FULL_TRAINING_STEPS
-        FULL_TRAINING_TOKEN_COUNT = cycle_token_budget(FULL_TRAINING_STEPS)
+    if TRAINING_PASSES > 0 and FULL_TRAINING_STEPS <= 0:
+        FULL_TRAINING_TARGET_TOKENS = TRAINING_PASSES * TRAIN_TOKEN_COUNT
+    architecture_schedule = build_update_schedule(ARCHITECTURE_TOKEN_COUNT, SSONN_CYCLE_STEPS)
+    full_schedule = build_update_schedule(FULL_TRAINING_TARGET_TOKENS, FULL_TRAINING_STEPS)
+    SSONN_CYCLE_STEPS = len(architecture_schedule)
+    SSONN_CYCLE_TOKEN_COUNT = schedule_token_count(architecture_schedule)
+    FULL_TRAINING_STEPS = len(full_schedule)
+    FULL_TRAINING_PASS_STEPS = FULL_TRAINING_STEPS
+    FULL_TRAINING_TOKEN_COUNT = schedule_token_count(full_schedule)
+    ARCHITECTURE_SLICES = allocate_balanced_slices(TRAIN_FILES, ARCHITECTURE_TOKEN_COUNT, TRAIN_STREAM_SEED)
+    full_slice_budget = min(TRAIN_TOKEN_COUNT, FULL_TRAINING_TARGET_TOKENS, FULL_TRAINING_TOKEN_COUNT)
+    FULL_TRAINING_SLICES = allocate_balanced_slices(TRAIN_FILES, full_slice_budget, TRAIN_STREAM_SEED + 10)
+    validation_available = sum(shard_token_count(path) for path in VAL_FILES)
+    if FINAL_VALIDATION_TOKENS > validation_available:
+        raise ValueError(
+            f"Final validation needs {FINAL_VALIDATION_TOKENS:,} tokens, but validation shards contain {validation_available:,}."
+        )
+    if ARGS.ssonn_eval_batches is not None:
+        PERIODIC_VALIDATION_TOKENS = ARGS.ssonn_eval_batches * MICRO_BATCH_SIZE * VALIDATION_SEQ_LEN
+    elif EVAL_BATCHES is not None:
+        PERIODIC_VALIDATION_TOKENS = EVAL_BATCHES * MICRO_BATCH_SIZE * VALIDATION_SEQ_LEN
+    if PERIODIC_VALIDATION_TOKENS > FINAL_VALIDATION_TOKENS:
+        raise ValueError("Periodic validation cannot use more tokens than final validation.")
+    SSONN_EVAL_BATCHES = math.ceil(PERIODIC_VALIDATION_TOKENS / (MICRO_BATCH_SIZE * VALIDATION_SEQ_LEN))
+    VALIDATION_SLICES = allocate_balanced_slices(VAL_FILES, FINAL_VALIDATION_TOKENS, EVAL_STREAM_SEED)
     NUM_UPDATES = ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_STEPS + FULL_TRAINING_STEPS
     if SSONN_CYCLE_STEPS <= 0 or FULL_TRAINING_STEPS <= 0:
         raise ValueError("Architecture and full-training step counts must be positive.")
@@ -1654,13 +2179,33 @@ def main() -> None:
         ARCHITECTURE_EXPANSIONS, "expansions",
     )
     print(
-        "full training:", FULL_TRAINING_STEPS, "updates |",
+        "architecture search:", SSONN_CYCLE_TOKEN_COUNT, "scheduled tokens/cycle |",
+        ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT, "total search tokens",
+    )
+    print(
+        "full training:", FULL_TRAINING_STEPS, "updates |", FULL_TRAINING_TARGET_TOKENS, "target tokens |",
         FULL_TRAINING_TOKEN_COUNT, "scheduled tokens |",
-        TRAINING_PASSES, "pass(es)",
+        len(FULL_TRAINING_SLICES), "balanced shard slices",
+    )
+    print(
+        "total compute tokens:", ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT + FULL_TRAINING_TOKEN_COUNT,
+        "| target tokens/update:", TARGET_TOKENS_PER_UPDATE,
+        "| cooldown:", COOLDOWN_UPDATES if COOLDOWN_UPDATES is not None else f"{COOLDOWN_FRACTION:.6f} fraction",
     )
     print("total optimizer updates:", NUM_UPDATES)
-    print("effective batch sequences:", MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS)
-    print("effective batch tokens at max window:", MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS * WINDOW_END)
+    print(
+        "micro batch sequences at max window:", MICRO_BATCH_SIZE,
+        "| activation-token envelope:", MICRO_BATCH_SIZE * WINDOW_END,
+        "| dynamic microbatch and accumulation enabled",
+    )
+    print(
+        "validation:", PERIODIC_VALIDATION_TOKENS, "periodic target tokens",
+        f"({validation_scheduled_tokens(PERIODIC_VALIDATION_TOKENS)} scheduled) |",
+        FINAL_VALIDATION_TOKENS, "final target tokens",
+        f"({validation_scheduled_tokens(FINAL_VALIDATION_TOKENS)} scheduled) | context", VALIDATION_SEQ_LEN,
+    )
+    print("attention backend:", "flex" if USE_FLEX_ATTENTION else "sdpa", "| document-local causal")
+    print("comparison note: upstream 3.25 is only an orientation point; this residual SSONN backbone is not full modded NanoGPT.")
     print("amp:", ARGS.amp_dtype, "| grad scaler:", USE_SCALER)
 
     model = AttentionOnlyGPT(MODEL_CONFIG, mlp_kind=MLP_KIND).to(device)
