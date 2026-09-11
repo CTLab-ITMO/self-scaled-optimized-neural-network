@@ -235,6 +235,9 @@ if USE_FLEX_ATTENTION:
         dynamo_config.accumulated_cache_size_limit = max(
             int(dynamo_config.accumulated_cache_size_limit), 1024
         )
+    dynamo_config.suppress_errors = True
+    flex_attention = torch.compile(flex_attention, dynamic=False)
+    create_block_mask = torch.compile(create_block_mask, dynamic=False)
     USE_COMPILE = True
 if device.type == "cuda":
     torch.set_float32_matmul_precision("high")
@@ -489,7 +492,7 @@ def make_document_attention_mask(document_ids: torch.Tensor):
             Q_LEN=seq_len,
             KV_LEN=seq_len,
             device=str(document_ids.device),
-            _compile=True,
+            _compile=False,
         )
     causal = torch.ones((seq_len, seq_len), dtype=torch.bool, device=document_ids.device).tril_()
     same_document = document_ids[:, :, None].eq(document_ids[:, None, :])
@@ -814,6 +817,8 @@ def checkpoint_payload(
             "inductor_max_autotune": bool(USE_FLEX_ATTENTION),
             "inductor_gemm_backends": os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", ""),
             "torch_compile": USE_COMPILE,
+            "torch_compile_dynamic": False,
+            "dynamo_suppress_errors": bool(USE_FLEX_ATTENTION),
             "document_local_attention": True,
             "periodic_validation_tokens": PERIODIC_VALIDATION_TOKENS,
             "periodic_validation_scheduled_tokens": validation_scheduled_tokens(PERIODIC_VALIDATION_TOKENS),
@@ -1332,6 +1337,8 @@ def create_comet_experiment():
         "inductor_max_autotune": bool(USE_FLEX_ATTENTION),
         "inductor_gemm_backends": os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", ""),
         "torch_compile": USE_COMPILE,
+        "torch_compile_dynamic": False,
+        "dynamo_suppress_errors": bool(USE_FLEX_ATTENTION),
         "document_local_attention": True,
         "backbone_grad_clip": BACKBONE_GRAD_CLIP,
         "ssonn_grad_clip": SSONN_GRAD_CLIP,
@@ -1829,6 +1836,8 @@ def architecture_checkpoint_metadata(
         "inductor_max_autotune": bool(USE_FLEX_ATTENTION),
         "inductor_gemm_backends": os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", ""),
         "torch_compile": USE_COMPILE,
+        "torch_compile_dynamic": False,
+        "dynamo_suppress_errors": bool(USE_FLEX_ATTENTION),
         "document_local_attention": True,
         "periodic_validation_tokens": PERIODIC_VALIDATION_TOKENS,
         "periodic_validation_scheduled_tokens": validation_scheduled_tokens(PERIODIC_VALIDATION_TOKENS),
@@ -1873,7 +1882,7 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
     for expansion_index in range(ARCHITECTURE_EXPANSIONS):
         train_stream = TokenShardStream(seed=TRAIN_STREAM_SEED, slices=ARCHITECTURE_SLICES)
         optimizers = make_ssonn_stage_optimizers(model)
-        cycle_model: nn.Module = torch.compile(model) if USE_COMPILE else model
+        cycle_model: nn.Module = torch.compile(model, dynamic=False) if USE_COMPILE else model
         scaler = torch.amp.GradScaler("cuda", enabled=USE_SCALER)
         scaler_or_none = scaler if USE_SCALER else None
         cycle_tokens_seen = 0
@@ -2079,7 +2088,7 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
     scaler = torch.amp.GradScaler("cuda", enabled=USE_SCALER)
     scaler_or_none = scaler if USE_SCALER else None
     optimizers = make_ssonn_stage_optimizers(model)
-    training_model: nn.Module = torch.compile(model) if USE_COMPILE else model
+    training_model: nn.Module = torch.compile(model, dynamic=False) if USE_COMPILE else model
     train_stream = TokenShardStream(seed=TRAIN_STREAM_SEED, slices=FULL_TRAINING_SLICES)
     training_tokens_seen = 0
     training_started = time.perf_counter()
