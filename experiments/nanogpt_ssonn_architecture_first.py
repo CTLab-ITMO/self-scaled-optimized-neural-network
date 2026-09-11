@@ -471,8 +471,8 @@ class CausalSelfAttention(nn.Module):
         q = self.q_proj(x).view(batch, seq_len, self.n_head, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
-        q = self.rope(self.q_norm(q), positions)
-        k = self.rope(self.k_norm(k), positions)
+        q = self.rope(self.q_norm(q), positions).to(dtype=v.dtype)
+        k = self.rope(self.k_norm(k), positions).to(dtype=v.dtype)
         k = k.expand(-1, self.n_head, -1, -1)
         v = v.expand(-1, self.n_head, -1, -1)
         if USE_FLEX_ATTENTION:
@@ -2028,6 +2028,9 @@ def run_smoke_tests() -> None:
     for block in model.blocks:
         block.mlp_kind = "ssonn"
     assert torch.equal(residual_logits, backbone_logits), "Zero-delta SSONN must preserve the backbone function."
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        mixed_precision_logits = model(identity_tokens)
+    assert torch.isfinite(mixed_precision_logits).all()
 
     muon, backbone_adam, ssonn_adam = make_ssonn_stage_optimizers(model)
     ssonn_ids = ssonn_parameter_ids(model)
