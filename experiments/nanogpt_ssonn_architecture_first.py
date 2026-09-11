@@ -58,6 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone-grad-clip", type=float, default=1.0)
     parser.add_argument("--ssonn-grad-clip", type=float, default=1.0)
     parser.add_argument("--attention-backend", choices=("flex", "sdpa"), default="flex")
+    parser.add_argument("--strict-flex", action="store_true", help="Fail if the CUDA FlexAttention backward preflight fails instead of falling back to SDPA.")
+    parser.add_argument("--skip-cuda-preflight", action="store_true", help="Skip the synthetic CUDA forward/backward preflight.")
     parser.add_argument("--smoke-test", action="store_true", help="Run CPU model/schedule smoke checks and exit.")
     return parser.parse_args()
 
@@ -65,6 +67,18 @@ def parse_args() -> argparse.Namespace:
 ARGS = parse_args()
 if ARGS.gpu:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(ARGS.gpu)
+if ARGS.attention_backend == "flex":
+    # PyTorch 2.6 selects an eight-warp default for head_dim=128 and then
+    # rejects that configuration in FlexAttention backward. Autotuning adds
+    # valid four-warp candidates before any torch/Inductor modules are loaded.
+    os.environ["TORCHINDUCTOR_MAX_AUTOTUNE"] = "1"
+    configured_backends = os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "")
+    backend_names = [name.strip().upper() for name in configured_backends.split(",") if name.strip()]
+    if "ATEN" not in backend_names:
+        backend_names.insert(0, "ATEN")
+    if "TRITON" not in backend_names:
+        backend_names.append("TRITON")
+    os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS"] = ",".join(backend_names)
 
 import numpy as np
 import torch
@@ -155,6 +169,14 @@ SSONN_GRAD_CLIP = ARGS.ssonn_grad_clip
 ATTENTION_BACKEND = ARGS.attention_backend
 EOT_TOKEN_ID = 50256
 REINIT_MODE = "full"
+FLEX_KERNEL_OPTIONS = {
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_M1": 32,
+    "BLOCK_N1": 64,
+    "BLOCK_M2": 64,
+    "BLOCK_N2": 32,
+}
 
 BASE_CHECKPOINT = CHECKPOINT_DIR / "finewebedu_attention_only.pt"
 SSONN_CHECKPOINT = CHECKPOINT_DIR / "finewebedu_ssonn_architecture_first_best.pt"
@@ -175,6 +197,13 @@ assert TRAINING_PASSES >= 0
 assert FULL_TRAINING_TARGET_TOKENS > 0
 assert BACKBONE_GRAD_CLIP >= 0.0
 assert SSONN_GRAD_CLIP >= 0.0
+assert EVAL_INTERVAL >= 1
+assert CHECKPOINT_INTERVAL >= 1
+assert FINDER_BATCHES >= 1
+assert SSONN_LEARNING_RATE >= 0.0
+assert 0.0 < SSONN_EXPANSION_THRESHOLD <= 1.0
+assert SSONN_MAX_NEW_EDGES >= 1
+assert PRETOKENIZED_TRAIN_SHARDS >= 1
 
 
 def amp_dtype() -> torch.dtype | None:
@@ -194,10 +223,25 @@ USE_FLEX_ATTENTION = ATTENTION_BACKEND == "flex" and device.type == "cuda"
 if USE_FLEX_ATTENTION and (create_block_mask is None or flex_attention is None):
     raise RuntimeError("--attention-backend flex requires torch.nn.attention.flex_attention.")
 if USE_FLEX_ATTENTION:
+    import torch._dynamo.config as dynamo_config
+    import torch._inductor.config as inductor_config
+
+    inductor_config.max_autotune = True
+    inductor_config.max_autotune_gemm_backends = os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS"]
+    if hasattr(dynamo_config, "recompile_limit"):
+        dynamo_config.recompile_limit = 128
+    else:
+        dynamo_config.cache_size_limit = 128
+        dynamo_config.accumulated_cache_size_limit = max(
+            int(dynamo_config.accumulated_cache_size_limit), 1024
+        )
     USE_COMPILE = True
 if device.type == "cuda":
+    torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    if ARGS.amp_dtype == "bf16" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("--amp-dtype bf16 was requested, but the selected CUDA device does not support BF16.")
     print(
         "visible cuda device:",
         torch.cuda.get_device_name(0),
@@ -243,7 +287,16 @@ def shard_token_count(path: str) -> int:
     header = np.memmap(path, dtype=np.int32, mode="r", shape=(256,))
     if int(header[0]) != 20240520:
         raise ValueError(f"Unexpected FineWeb-Edu shard header in {path}")
-    return int(header[2])
+    token_count = int(header[2])
+    if token_count <= 0:
+        raise ValueError(f"FineWeb-Edu shard reports a non-positive token count in {path}")
+    expected_bytes = 1024 + 2 * token_count
+    actual_bytes = Path(path).stat().st_size
+    if actual_bytes < expected_bytes:
+        raise ValueError(
+            f"Truncated FineWeb-Edu shard {path}: expected at least {expected_bytes} bytes, found {actual_bytes}."
+        )
+    return token_count
 
 
 def read_shard(path: str) -> np.ndarray:
@@ -473,15 +526,18 @@ class CausalSelfAttention(nn.Module):
         v = self.v_proj(x).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
         q = self.rope(self.q_norm(q), positions).to(dtype=v.dtype)
         k = self.rope(self.k_norm(k), positions).to(dtype=v.dtype)
-        # FlexAttention backward in PyTorch 2.6 cannot reliably lower either a
-        # stride-0 KV expansion or its native GQA gradient reduction on H200.
-        # Materialize the shared head while preserving the same tied-KV math:
-        # autograd sums gradients from all materialized heads into k_proj/v_proj.
-        k = k.expand(-1, self.n_head, -1, -1).contiguous()
-        v = v.expand(-1, self.n_head, -1, -1).contiguous()
         if USE_FLEX_ATTENTION:
-            y = flex_attention(q, k, v, block_mask=attention_mask)
+            y = flex_attention(
+                q,
+                k,
+                v,
+                block_mask=attention_mask,
+                kernel_options=FLEX_KERNEL_OPTIONS,
+                enable_gqa=True,
+            )
         else:
+            k = k.expand(-1, self.n_head, -1, -1).contiguous()
+            v = v.expand(-1, self.n_head, -1, -1).contiguous()
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask, is_causal=False)
         return self.o_proj(y.transpose(1, 2).contiguous().view(batch, seq_len, -1))
 
@@ -608,6 +664,54 @@ class AttentionOnlyGPT(nn.Module):
         return 30.0 * torch.tanh(logits / 30.0)
 
 
+def run_cuda_attention_preflight() -> None:
+    """Compile one real FlexAttention backward graph before the long run."""
+    global USE_FLEX_ATTENTION, USE_COMPILE
+    if not USE_FLEX_ATTENTION or ARGS.skip_cuda_preflight:
+        return
+    print(
+        "CUDA FlexAttention preflight: compiling forward/backward |",
+        "torch", torch.__version__,
+        "| max_autotune", True,
+        "| GEMM backends", os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS"],
+    )
+    test_attention = CausalSelfAttention(MODEL_CONFIG).to(device).train()
+    nn.init.normal_(test_attention.o_proj.weight, std=MODEL_CONFIG.n_embd ** -0.5)
+    tokens = torch.randint(0, MODEL_CONFIG.vocab_size, (2, WINDOW_START), device=device)
+    document_ids, positions = document_ids_and_positions(tokens)
+    hidden = torch.randn(2, WINDOW_START, MODEL_CONFIG.n_embd, device=device)
+    compiled_attention = None
+    try:
+        block_mask = make_document_attention_mask(document_ids)
+        compiled_attention = torch.compile(test_attention, dynamic=False)
+        with torch.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=USE_AMP):
+            output = compiled_attention(hidden, positions, block_mask)
+            loss = output.float().square().mean()
+        loss.backward()
+        assert_finite_tensor(output, "CUDA preflight output")
+        for name, parameter in test_attention.named_parameters():
+            if parameter.grad is not None:
+                assert_finite_tensor(parameter.grad, f"CUDA preflight gradient {name}")
+        torch.cuda.synchronize()
+        print("CUDA FlexAttention preflight: passed")
+    except Exception as error:
+        if ARGS.strict_flex:
+            raise RuntimeError("CUDA FlexAttention forward/backward preflight failed.") from error
+        print(
+            "WARNING: CUDA FlexAttention preflight failed; falling back to uncompiled SDPA for this run:",
+            f"{type(error).__name__}: {error}",
+        )
+        USE_FLEX_ATTENTION = False
+        USE_COMPILE = bool(ARGS.compile)
+        import torch._dynamo as dynamo
+
+        dynamo.reset()
+    finally:
+        test_attention.zero_grad(set_to_none=True)
+        del compiled_attention, test_attention, hidden, tokens
+        torch.cuda.empty_cache()
+
+
 def count_parameters(model: nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
 
@@ -635,6 +739,28 @@ def count_ssonn_active_connections(model: nn.Module) -> int:
             sub_mask = getattr(sub_layer, "sparsity_mask", None)
             total += int(sub_mask.sum().item()) if sub_mask is not None else sub_layer.weight.numel()
     return total
+
+
+def apply_sparsity_masks(model: nn.Module) -> None:
+    """Apply masks immediately and keep exactly one gradient hook per weight."""
+    for module in model.modules():
+        weight = getattr(module, "weight", None)
+        mask = getattr(module, "sparsity_mask", None)
+        if not isinstance(weight, nn.Parameter) or mask is None or not weight.requires_grad:
+            continue
+        with torch.no_grad():
+            weight.mul_(mask)
+        if getattr(module, "_ssonn_mask_hook_parameter_id", None) == id(weight):
+            continue
+        old_handle = getattr(module, "_ssonn_mask_hook_handle", None)
+        if old_handle is not None:
+            old_handle.remove()
+
+        def mask_gradient(gradient: torch.Tensor, owner=module) -> torch.Tensor:
+            return gradient * owner.sparsity_mask
+
+        module._ssonn_mask_hook_handle = weight.register_hook(mask_gradient)
+        module._ssonn_mask_hook_parameter_id = id(weight)
 
 
 def assert_finite_model(model: nn.Module, label: str) -> None:
@@ -683,6 +809,10 @@ def checkpoint_payload(
             "cooldown_fraction": COOLDOWN_FRACTION,
             "cooldown_updates_override": COOLDOWN_UPDATES,
             "attention_backend": "flex" if USE_FLEX_ATTENTION else "sdpa",
+            "requested_attention_backend": ATTENTION_BACKEND,
+            "flex_kernel_options": FLEX_KERNEL_OPTIONS if USE_FLEX_ATTENTION else None,
+            "inductor_max_autotune": bool(USE_FLEX_ATTENTION),
+            "inductor_gemm_backends": os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", ""),
             "torch_compile": USE_COMPILE,
             "document_local_attention": True,
             "periodic_validation_tokens": PERIODIC_VALIDATION_TOKENS,
@@ -697,7 +827,11 @@ def checkpoint_payload(
             "architecture_fraction": ARCHITECTURE_FRACTION,
             "architecture_expansions": ARCHITECTURE_EXPANSIONS,
             "architecture_tokens": ARCHITECTURE_TOKEN_COUNT,
-            "architecture_search_total_tokens": ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT,
+            "architecture_training_tokens": ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT,
+            "edge_finder_tokens_per_expansion": edge_finder_tokens_per_expansion(),
+            "architecture_search_total_tokens": ARCHITECTURE_EXPANSIONS * (
+                SSONN_CYCLE_TOKEN_COUNT + edge_finder_tokens_per_expansion()
+            ),
             "architecture_cycle_steps": SSONN_CYCLE_STEPS,
             "training_passes": TRAINING_PASSES,
             "full_training_steps": FULL_TRAINING_STEPS,
@@ -726,7 +860,9 @@ def save_checkpoint(
 ) -> None:
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     assert_finite_model(model, f"Refusing to save {path.name}")
-    torch.save(checkpoint_payload(model, optimizer_state, update, metadata), path)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(checkpoint_payload(model, optimizer_state, update, metadata), temporary_path)
+    os.replace(temporary_path, path)
     print("saved", path)
 
 
@@ -957,7 +1093,12 @@ def build_update_schedule(token_budget: int, forced_steps: int = 0) -> list[Upda
     provisional: list[tuple[int, int, float]] = []
     scheduled_tokens = 0
     for update in range(total_updates):
-        progress = update / (total_updates - 1)
+        if update == total_updates - 1:
+            progress = 1.0
+        elif forced_steps > 0:
+            progress = update / (total_updates - 1)
+        else:
+            progress = min(scheduled_tokens / token_budget, 1.0)
         window = window_for_progress(progress)
         if update == total_updates - 1 and forced_steps <= 0:
             remaining = max(window, token_budget - scheduled_tokens)
@@ -1030,9 +1171,51 @@ def layer_input_widths(model: AttentionOnlyGPT) -> dict[str, int]:
     return {name: getattr(model, name).in_features for name in model.ssonn_layer_names}
 
 
+class AutocastAbsGradientEdgeMetric(AbsGradientEdgeMetric):
+    """Compute finder gradients with the same numerical precision as training."""
+
+    def calculate(
+        self,
+        model: nn.Module,
+        layer: ScaledNet,
+        X_arr: torch.Tensor | None,
+        y_arr: torch.Tensor | None,
+        embed: bool = False,
+    ) -> torch.Tensor:
+        if X_arr is None or y_arr is None:
+            raise ValueError("X_arr and y_arr are required for gradient computation.")
+        model.eval()
+        model.zero_grad(set_to_none=True)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=AMP_DTYPE,
+            enabled=USE_AMP and device.type == "cuda",
+        ):
+            prediction = model(X_arr)
+            loss = self.loss_fn(prediction, y_arr)
+        assert_finite_tensor(loss, "EdgeFinder loss")
+        loss.backward()
+        if embed:
+            if not layer.sub_linears:
+                return torch.zeros_like(layer.weight)
+            target_parameter = layer.sub_linears[-1].weight
+        else:
+            target_parameter = layer.weight
+        if target_parameter.grad is None:
+            raise ValueError("EdgeFinder target has no gradient; verify that the SSONN layer is active.")
+        result = target_parameter.grad.detach().abs().clone()
+        model.zero_grad(set_to_none=True)
+        return result
+
+
+def edge_finder_tokens_per_expansion(layer_count: int = MODEL_CONFIG.n_layer) -> int:
+    # The stock EdgeFinder performs one complete dataloader pass per layer.
+    return layer_count * FINDER_BATCHES * MICRO_BATCH_SIZE * WINDOW_END
+
+
 def make_edge_finder(seq_len: int, slices: Sequence[ShardSlice] | None = None) -> EdgeFinder:
     return EdgeFinder(
-        metric=AbsGradientEdgeMetric(lm_cross_entropy),
+        metric=AutocastAbsGradientEdgeMetric(lm_cross_entropy),
         dataloader=FixedFinderLoader(
             ARCHITECTURE_SLICES if slices is None else slices,
             FINDER_BATCHES,
@@ -1079,13 +1262,17 @@ def create_comet_experiment():
     if not os.environ.get("COMET_API_KEY") or not os.environ.get("COMET_WORKSPACE"):
         print("Comet logging disabled: set COMET_API_KEY and COMET_WORKSPACE to enable it.")
         return None
-    from comet_ml import start
+    try:
+        from comet_ml import start
 
-    experiment = start(
-        api_key=os.environ["COMET_API_KEY"],
-        workspace=os.environ["COMET_WORKSPACE"],
-        project_name=os.environ.get("COMET_PROJECT_NAME", "nanogpt-ssonn"),
-    )
+        experiment = start(
+            api_key=os.environ["COMET_API_KEY"],
+            workspace=os.environ["COMET_WORKSPACE"],
+            project_name=os.environ.get("COMET_PROJECT_NAME", "nanogpt-ssonn"),
+        )
+    except Exception as error:
+        print(f"Comet logging disabled after startup failure: {type(error).__name__}: {error}")
+        return None
     experiment.set_name(f"nanogpt_h200_ssonn_architecture_first_{ARGS.amp_dtype}_seed{SEED}")
     experiment.log_parameters({
         "run_mode": RUN_MODE,
@@ -1121,6 +1308,11 @@ def create_comet_experiment():
         "architecture_expansions": ARCHITECTURE_EXPANSIONS,
         "architecture_tokens": ARCHITECTURE_TOKEN_COUNT,
         "architecture_cycle_steps": SSONN_CYCLE_STEPS,
+        "architecture_training_tokens": ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT,
+        "edge_finder_tokens_per_expansion": edge_finder_tokens_per_expansion(),
+        "architecture_search_total_tokens": ARCHITECTURE_EXPANSIONS * (
+            SSONN_CYCLE_TOKEN_COUNT + edge_finder_tokens_per_expansion()
+        ),
         "training_passes": TRAINING_PASSES,
         "full_training_target_tokens": FULL_TRAINING_TARGET_TOKENS,
         "full_training_steps": FULL_TRAINING_STEPS,
@@ -1135,6 +1327,10 @@ def create_comet_experiment():
         "validation_seq_len": VALIDATION_SEQ_LEN,
         "validation_protocol": "fixed_tokens_fixed_context_document_local",
         "attention_backend": "flex" if USE_FLEX_ATTENTION else "sdpa",
+        "requested_attention_backend": ATTENTION_BACKEND,
+        "flex_kernel_options": FLEX_KERNEL_OPTIONS if USE_FLEX_ATTENTION else None,
+        "inductor_max_autotune": bool(USE_FLEX_ATTENTION),
+        "inductor_gemm_backends": os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", ""),
         "torch_compile": USE_COMPILE,
         "document_local_attention": True,
         "backbone_grad_clip": BACKBONE_GRAD_CLIP,
@@ -1355,7 +1551,7 @@ def train_ssonn_stage(model: AttentionOnlyGPT, experiment) -> AttentionOnlyGPT:
     full_model_reinit(model)
     ssonn_train.weights_init = ssonn_only_weights_init
     muon, backbone_adam, ssonn_adam = make_ssonn_stage_optimizers(model)
-    ssonn_train.apply_sparsity_mask(model)
+    apply_sparsity_masks(model)
     thresholds = {name: SSONN_EXPANSION_THRESHOLD for name in model.ssonn_layer_names}
     train_stream = TokenShardStream(TRAIN_FILES, seed=TRAIN_STREAM_SEED)
     initial_loss = evaluate_fixed(model, WINDOW_START, SSONN_EVAL_BATCHES)
@@ -1458,7 +1654,7 @@ def train_ssonn_stage(model: AttentionOnlyGPT, experiment) -> AttentionOnlyGPT:
                     full_model_reinit(model)
                     full_reinit = True
                     muon, backbone_adam, ssonn_adam = make_ssonn_stage_optimizers(model)
-                    ssonn_train.apply_sparsity_mask(model)
+                    apply_sparsity_masks(model)
                     post_reinit_val_loss = evaluate_fixed(model, WINDOW_START, SSONN_EVAL_BATCHES)
                     assert_finite_model(model, f"SSONN model after full reinit at update {step + 1}")
                 train_stream = TokenShardStream(TRAIN_FILES, seed=TRAIN_STREAM_SEED)
@@ -1617,13 +1813,21 @@ def architecture_checkpoint_metadata(
         "architecture_tokens": ARCHITECTURE_TOKEN_COUNT,
         "architecture_cycle_steps": SSONN_CYCLE_STEPS,
         "architecture_cycle_scheduled_tokens": SSONN_CYCLE_TOKEN_COUNT,
-        "architecture_search_total_tokens": ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT,
+        "architecture_training_tokens": ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT,
+        "edge_finder_tokens_per_expansion": edge_finder_tokens_per_expansion(),
+        "architecture_search_total_tokens": ARCHITECTURE_EXPANSIONS * (
+            SSONN_CYCLE_TOKEN_COUNT + edge_finder_tokens_per_expansion()
+        ),
         "full_training_steps": FULL_TRAINING_STEPS,
         "full_training_target_tokens": FULL_TRAINING_TARGET_TOKENS,
         "full_training_scheduled_tokens": FULL_TRAINING_TOKEN_COUNT,
         "target_tokens_per_update": TARGET_TOKENS_PER_UPDATE,
         "cooldown_fraction": COOLDOWN_FRACTION,
         "attention_backend": "flex" if USE_FLEX_ATTENTION else "sdpa",
+        "requested_attention_backend": ATTENTION_BACKEND,
+        "flex_kernel_options": FLEX_KERNEL_OPTIONS if USE_FLEX_ATTENTION else None,
+        "inductor_max_autotune": bool(USE_FLEX_ATTENTION),
+        "inductor_gemm_backends": os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", ""),
         "torch_compile": USE_COMPILE,
         "document_local_attention": True,
         "periodic_validation_tokens": PERIODIC_VALIDATION_TOKENS,
@@ -1655,13 +1859,14 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
     full_schedule = build_update_schedule(FULL_TRAINING_TARGET_TOKENS, ARGS.full_training_steps)
     global_step = 0
     global_tokens_seen = 0
+    finder_tokens_seen = 0
     started = time.perf_counter()
     topology_history: list[dict] = []
     thresholds = {name: SSONN_EXPANSION_THRESHOLD for name in model.ssonn_layer_names}
 
     set_seed(SEED)
     full_model_reinit(model)
-    ssonn_train.apply_sparsity_mask(model)
+    apply_sparsity_masks(model)
     initial_val_loss = evaluate_token_budget(model, PERIODIC_VALIDATION_TOKENS)
     print(f"architecture search initial fixed val loss: {initial_val_loss:.4f}")
 
@@ -1753,9 +1958,12 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
         expanded, selected_edges, topology = expand_model_with_topology(
             model, edge_finder, thresholds, forward_model=cycle_model
         )
+        finder_tokens = edge_finder_tokens_per_expansion(len(model.ssonn_layer_names))
+        finder_tokens_seen += finder_tokens
+        global_tokens_seen += finder_tokens
         del cycle_model
         if expanded:
-            ssonn_train.apply_sparsity_mask(model)
+            apply_sparsity_masks(model)
         after_widths = layer_input_widths(model)
         params_after = count_parameters(model)
         ssonn_params_after = count_ssonn_stored_parameters(model)
@@ -1798,6 +2006,9 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
                 "architecture/unique_parents": unique_parents,
                 "architecture/pre_expansion_val_loss": pre_expansion_val_loss,
                 "architecture/candidate_edges_before_cap": candidate_edges,
+                "architecture/finder_tokens": finder_tokens,
+                "architecture/finder_tokens_seen": finder_tokens_seen,
+                "architecture/global_tokens_seen": global_tokens_seen,
                 "architecture/saturated_layer_count": saturated_layers,
                 "architecture/stored_parameter_growth": params_after - params_before,
                 "architecture/ssonn_parameter_growth": ssonn_params_after - ssonn_params_before,
@@ -1834,7 +2045,7 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
     # Preserve the graph, discard all learned weights once, and start the quality run.
     set_seed(SEED)
     full_model_reinit(model)
-    ssonn_train.apply_sparsity_mask(model)
+    apply_sparsity_masks(model)
     post_reinit_val_loss = evaluate_token_budget(model, PERIODIC_VALIDATION_TOKENS)
     print(
         f"architecture ready: {count_ssonn_sublinears(model)} sub-linears | "
@@ -1925,7 +2136,9 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
                     "training/accumulation_steps": update.accumulation_steps,
                     "training/training_tokens_seen": training_tokens_seen,
                     "training/global_tokens_seen": global_tokens_seen,
-                    "training/search_tokens_seen": ARCHITECTURE_EXPANSIONS * schedule_token_count(architecture_schedule),
+                    "training/search_tokens_seen": ARCHITECTURE_EXPANSIONS * (
+                        schedule_token_count(architecture_schedule) + edge_finder_tokens_per_expansion()
+                    ),
                     "training/tokens_per_second": tokens_per_second,
                     "training/backbone_grad_norm": grad.backbone_norm,
                     "training/ssonn_grad_norm": grad.ssonn_norm,
@@ -1980,7 +2193,9 @@ def train_architecture_first(model: AttentionOnlyGPT, experiment) -> AttentionOn
             "final/validation_target_tokens": FINAL_VALIDATION_TOKENS,
             "final/validation_scheduled_tokens": validation_scheduled_tokens(FINAL_VALIDATION_TOKENS),
             "final/training_tokens": training_tokens_seen,
-            "final/search_tokens": ARCHITECTURE_EXPANSIONS * schedule_token_count(architecture_schedule),
+            "final/search_tokens": ARCHITECTURE_EXPANSIONS * (
+                schedule_token_count(architecture_schedule) + edge_finder_tokens_per_expansion()
+            ),
             "final/total_compute_tokens": global_tokens_seen,
         }, step=global_step)
     return model
@@ -2078,9 +2293,54 @@ def run_smoke_tests() -> None:
     )
     topology_before = (first_layer.in_features, len(first_layer.sub_linears))
     full_model_reinit(topology_model)
+    apply_sparsity_masks(topology_model)
+    first_hook = first_layer._ssonn_mask_hook_handle
+    apply_sparsity_masks(topology_model)
+    assert first_layer._ssonn_mask_hook_handle is first_hook
     topology_after = (first_layer.in_features, len(first_layer.sub_linears))
     assert topology_after == topology_before
     assert torch.isfinite(topology_model(torch.randint(0, small.vocab_size, (2, 16), device=device))).all()
+    finder_x = torch.randint(0, small.vocab_size, (2, 16), device=device)
+    finder_y = torch.randint(0, small.vocab_size, (2, 16), device=device)
+    finder_gradient = AutocastAbsGradientEdgeMetric(lm_cross_entropy).calculate(
+        topology_model, first_layer, finder_x, finder_y
+    )
+    assert finder_gradient.shape == first_layer.weight.shape
+    assert torch.isfinite(finder_gradient).all()
+    assert finder_gradient[0, 0].item() == 0.0
+
+    class StubEdgeFinder:
+        def choose_edges_threshold(self, _model, layer, _threshold, embed=False):
+            assert not embed
+            return (
+                torch.tensor([0], device=layer.weight.device),
+                torch.tensor([0], device=layer.weight.device),
+            )
+
+    widths_before = layer_input_widths(topology_model)
+    expanded, selected_edges, topology = expand_model_with_topology(
+        topology_model,
+        StubEdgeFinder(),
+        {name: 0.1 for name in topology_model.ssonn_layer_names},
+    )
+    assert expanded and selected_edges == len(topology_model.ssonn_layer_names)
+    assert set(topology) == set(topology_model.ssonn_layer_names)
+    assert all(
+        layer_input_widths(topology_model)[name] == width + 1
+        for name, width in widths_before.items()
+    )
+    sublinears_before_reinit = count_ssonn_sublinears(topology_model)
+    full_model_reinit(topology_model)
+    apply_sparsity_masks(topology_model)
+    assert count_ssonn_sublinears(topology_model) == sublinears_before_reinit
+    transition_optimizers = make_ssonn_stage_optimizers(topology_model)
+    transition_backbone_ids = {
+        id(parameter)
+        for parameter in optimizer_parameters(transition_optimizers[0], transition_optimizers[1])
+    }
+    transition_ssonn_ids = {id(parameter) for parameter in optimizer_parameters(transition_optimizers[2])}
+    assert not transition_backbone_ids.intersection(transition_ssonn_ids)
+    assert transition_ssonn_ids == ssonn_parameter_ids(topology_model)
 
     def write_test_shard(path: Path, values: np.ndarray) -> None:
         raw = np.zeros(512 + len(values), dtype=np.uint16)
@@ -2094,8 +2354,18 @@ def run_smoke_tests() -> None:
         root = Path(temporary_directory)
         first = root / "finewebedu_train_000001.bin"
         second = root / "finewebedu_train_000002.bin"
+        truncated = root / "finewebedu_train_000003.bin"
         write_test_shard(first, np.arange(30, dtype=np.uint16))
         write_test_shard(second, np.arange(60, 100, dtype=np.uint16))
+        write_test_shard(truncated, np.arange(10, dtype=np.uint16))
+        with truncated.open("r+b") as file:
+            file.truncate(1024)
+        try:
+            shard_token_count(str(truncated))
+        except ValueError as error:
+            assert "Truncated" in str(error)
+        else:
+            raise AssertionError("Truncated shards must fail validation.")
         subset_a = TokenShardStream([str(first), str(second)], seed=7, token_limit=35)
         subset_b = TokenShardStream([str(first), str(second)], seed=7, token_limit=35)
         assert subset_a.token_count == 35
@@ -2107,7 +2377,7 @@ def run_smoke_tests() -> None:
         assert torch.equal(a_x, b_x) and torch.equal(a_y, b_y)
         update_model = AttentionOnlyGPT(small, mlp_kind="ssonn").to(device)
         full_model_reinit(update_model)
-        ssonn_train.apply_sparsity_mask(update_model)
+        apply_sparsity_masks(update_model)
         update_optimizers = make_ssonn_stage_optimizers(update_model)
         update = UpdateDescriptor(0, 2, 16, 2, 32, 0.0, 1.0, 0.0)
         update_loss, update_stats = run_scheduled_update(
@@ -2187,7 +2457,10 @@ def main() -> None:
     )
     print(
         "architecture search:", SSONN_CYCLE_TOKEN_COUNT, "scheduled tokens/cycle |",
-        ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT, "total search tokens",
+        ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT, "training tokens |",
+        edge_finder_tokens_per_expansion(), "finder tokens/expansion |",
+        ARCHITECTURE_EXPANSIONS * (SSONN_CYCLE_TOKEN_COUNT + edge_finder_tokens_per_expansion()),
+        "total search tokens",
     )
     print(
         "full training:", FULL_TRAINING_STEPS, "updates |", FULL_TRAINING_TARGET_TOKENS, "target tokens |",
@@ -2195,7 +2468,9 @@ def main() -> None:
         len(FULL_TRAINING_SLICES), "balanced shard slices",
     )
     print(
-        "total compute tokens:", ARCHITECTURE_EXPANSIONS * SSONN_CYCLE_TOKEN_COUNT + FULL_TRAINING_TOKEN_COUNT,
+        "optimization tokens excluding validation:",
+        ARCHITECTURE_EXPANSIONS * (SSONN_CYCLE_TOKEN_COUNT + edge_finder_tokens_per_expansion())
+        + FULL_TRAINING_TOKEN_COUNT,
         "| target tokens/update:", TARGET_TOKENS_PER_UPDATE,
         "| cooldown:", COOLDOWN_UPDATES if COOLDOWN_UPDATES is not None else f"{COOLDOWN_FRACTION:.6f} fraction",
     )
@@ -2211,6 +2486,7 @@ def main() -> None:
         FINAL_VALIDATION_TOKENS, "final target tokens",
         f"({validation_scheduled_tokens(FINAL_VALIDATION_TOKENS)} scheduled) | context", VALIDATION_SEQ_LEN,
     )
+    run_cuda_attention_preflight()
     print("attention backend:", "flex" if USE_FLEX_ATTENTION else "sdpa", "| document-local causal")
     print("comparison note: upstream 3.25 is only an orientation point; this residual SSONN backbone is not full modded NanoGPT.")
     print("amp:", ARGS.amp_dtype, "| grad scaler:", USE_SCALER)
