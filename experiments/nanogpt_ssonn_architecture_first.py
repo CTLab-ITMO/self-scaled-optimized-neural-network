@@ -473,11 +473,15 @@ class CausalSelfAttention(nn.Module):
         v = self.v_proj(x).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
         q = self.rope(self.q_norm(q), positions).to(dtype=v.dtype)
         k = self.rope(self.k_norm(k), positions).to(dtype=v.dtype)
-        k = k.expand(-1, self.n_head, -1, -1)
-        v = v.expand(-1, self.n_head, -1, -1)
         if USE_FLEX_ATTENTION:
-            y = flex_attention(q, k, v, block_mask=attention_mask)
+            # Keep the shared K/V head physical. Expanding it creates stride-0
+            # tensors for which Inductor may not find a FlexAttention backward kernel.
+            y = flex_attention(q, k, v, block_mask=attention_mask, enable_gqa=True)
         else:
+            # The CPU smoke path is intentionally independent of optional GQA
+            # support in SDPA. Materialization also keeps its layout conventional.
+            k = k.expand(-1, self.n_head, -1, -1).contiguous()
+            v = v.expand(-1, self.n_head, -1, -1).contiguous()
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask, is_causal=False)
         return self.o_proj(y.transpose(1, 2).contiguous().view(batch, seq_len, -1))
 
