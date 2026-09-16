@@ -18,3 +18,7 @@ results/.run_all.lock
 results/smoke.csv
 results/smoke_validated.csv
 results/dev_*.csv
+
+# Local data and checkpoints
+data/
+results/*.pt
