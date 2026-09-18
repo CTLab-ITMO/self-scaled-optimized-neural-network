@@ -22,3 +22,14 @@ results/dev_*.csv
 # Local data and checkpoints
 data/
 results/*.pt
+
+.venv/
+data/
+__pycache__/
+*.pyc
+
+results/logs/
+results/submitted_code/
+results/*.pt
+
+slurm-*.out

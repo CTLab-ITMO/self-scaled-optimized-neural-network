@@ -1,0 +1,489 @@
+"""
+Эксперимент 4: эволюционная оптимизация матрицы смежности без фиксированной плотности
+- Число рёбер тоже является частью поиска
+- Для лучших графов пробуем add / remove / rewire
+- Fitness = лучшая validation accuracy GenericGNN
+"""
+
+import argparse
+import os
+import random
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from src.evolution_utils import (
+    add_edges,
+    edge_count,
+    existing_edges,
+    load_checkpoint,
+    log_graph_figure,
+    remove_edges,
+    rewire_edges,
+    save_checkpoint,
+    start_comet_experiment,
+)
+
+import pandas as pd
+import torch
+import torch.nn as nn
+
+from src.data import get_mnist_dataloaders
+from src.graph import get_empty_adjacency, get_grid8_adjacency
+from src.models import GenericGNN
+from src.train import set_seed, get_device, train_model, evaluate
+
+
+def evaluate_graph(adj, train_loader, val_loader, device, epochs, training_seed):
+    set_seed(training_seed)
+
+    model = GenericGNN(
+        adj=adj,
+        num_classes=10,
+        hidden_dim=128,
+        num_layers=3,
+    )
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+    history = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        epochs=epochs,
+        device=device,
+        save_path=None,
+        verbose=False,
+    )
+    return max(history["val_acc"])
+
+
+def mutation_size_for_generation(generation, total_generations):
+    fraction = generation / total_generations
+    if fraction <= 0.25:
+        return 256
+    if fraction <= 0.50:
+        return 128
+    if fraction <= 0.75:
+        return 64
+    return 32
+
+
+def run_evolution(
+    generations=15,
+    elite_size=3,
+    fitness_epochs=20,
+    final_epochs=20,
+    batch_size=64,
+    seed=42,
+    resume=False,
+):
+    set_seed(seed)
+    device = get_device()
+    print(f"Устройство: {device}")
+
+    train_loader, val_loader, test_loader = get_mnist_dataloaders(
+        data_dir="./data",
+        batch_size=batch_size,
+        val_size=10000,
+        seed=seed,
+    )
+
+    grid8_adj = get_grid8_adjacency(28, 28)
+    max_edges = edge_count(grid8_adj)
+    bootstrap_edges = [256, 500, 1000, 1500, 2000, 2500, max_edges]
+
+    history_path = f"./results/evolution_variable_seed_{seed}.csv"
+    checkpoint_path = f"./results/evolution_variable_checkpoint_seed_{seed}.pt"
+    best_adj_path = f"./results/evolution_variable_best_adj_seed_{seed}.pt"
+    figure_dir = f"./results/figures/evolution_variable_seed_{seed}"
+
+    experiment = start_comet_experiment(
+        seed,
+        {
+            "seed": seed,
+            "generations": generations,
+            "elite_size": elite_size,
+            "fitness_epochs": fitness_epochs,
+            "final_epochs": final_epochs,
+            "batch_size": batch_size,
+            "max_edges": max_edges,
+            "bootstrap_edges": bootstrap_edges,
+            "resume": resume,
+        },
+    )
+
+    rows = []
+    elites = None
+    start_generation = 0
+    visual_step = 0
+    training_seed = seed
+
+    log_graph_figure(
+        grid8_adj,
+        "reference_grid8",
+        experiment,
+        figure_dir,
+        visual_step,
+    )
+    visual_step += 1
+
+    if resume:
+        state = load_checkpoint(checkpoint_path, history_path)
+        if state is not None:
+            start_generation, elites, rows = state
+            print(
+                f"RESUME: generation={start_generation}, "
+                f"best={elites[0]['fitness'] * 100:.2f}%, "
+                f"edges={edge_count(elites[0]['adj'])}"
+            )
+            log_graph_figure(
+                elites[0]["adj"],
+                f"resume_generation_{start_generation:02d}",
+                experiment,
+                figure_dir,
+                visual_step,
+                elites[0]["fitness"],
+            )
+            visual_step += 1
+        else:
+            print("Resume checkpoint не найден. Начинаем с нуля.")
+
+    if elites is None:
+        empty_graph = get_empty_adjacency(784)
+        empty_fitness = evaluate_graph(
+            empty_graph,
+            train_loader,
+            val_loader,
+            device,
+            fitness_epochs,
+            training_seed,
+        )
+
+        print(f"Empty graph | val_acc={empty_fitness * 100:.2f}%")
+
+        rows.append({
+            "generation": 0,
+            "candidate": 0,
+            "operation": "empty",
+            "parent_rank": -1,
+            "mutation_size": 0,
+            "edges": 0,
+            "val_acc": empty_fitness,
+            "selected": False,
+        })
+
+        log_graph_figure(
+            empty_graph,
+            "initial_empty",
+            experiment,
+            figure_dir,
+            visual_step,
+            empty_fitness,
+        )
+        visual_step += 1
+
+        print("\n=== BOOTSTRAP POPULATION ===")
+        bootstrap = []
+
+        for candidate, edge_target in enumerate(bootstrap_edges, start=1):
+            rng = random.Random(seed * 1_000_000 + edge_target)
+
+            adj = add_edges(
+                get_empty_adjacency(784),
+                edge_target,
+                rng,
+                max_edges,
+            )
+            fitness = evaluate_graph(
+                adj,
+                train_loader,
+                val_loader,
+                device,
+                fitness_epochs,
+                training_seed,
+            )
+
+            bootstrap.append({
+                "adj": adj,
+                "fitness": fitness,
+                "operation": "bootstrap",
+                "mutation_size": edge_target,
+                "parent_rank": -1,
+                "candidate": candidate,
+            })
+
+            print(
+                f"Bootstrap | edges={edge_count(adj):4d} | "
+                f"val_acc={fitness * 100:.2f}%"
+            )
+
+        bootstrap.sort(key=lambda item: item["fitness"], reverse=True)
+        elites = bootstrap[:elite_size]
+        selected_ids = {id(item) for item in elites}
+
+        for item in bootstrap:
+            rows.append({
+                "generation": 0,
+                "candidate": item["candidate"],
+                "operation": item["operation"],
+                "parent_rank": item["parent_rank"],
+                "mutation_size": item["mutation_size"],
+                "edges": edge_count(item["adj"]),
+                "val_acc": item["fitness"],
+                "selected": id(item) in selected_ids,
+            })
+
+        best = elites[0]
+        print(
+            f"BEST BOOTSTRAP: edges={edge_count(best['adj'])}, "
+            f"val_acc={best['fitness'] * 100:.2f}%"
+        )
+
+        log_graph_figure(
+            best["adj"],
+            "bootstrap_best",
+            experiment,
+            figure_dir,
+            visual_step,
+            best["fitness"],
+        )
+        visual_step += 1
+
+        torch.save(best["adj"].cpu(), best_adj_path)
+        save_checkpoint(checkpoint_path, history_path, 0, elites, rows)
+
+    print("\n=== VARIABLE-DENSITY EVOLUTION ===")
+
+    for generation in range(start_generation + 1, generations + 1):
+        mutation_size = mutation_size_for_generation(generation, generations)
+
+        print(
+            f"\n--- Generation {generation}/{generations} | "
+            f"mutation_size={mutation_size} ---"
+        )
+
+        candidates = []
+        candidate = 0
+
+        for parent_rank, parent in enumerate(elites):
+            for operation in ["add", "remove", "rewire"]:
+                rng = random.Random(
+                    seed * 10_000_000
+                    + generation * 100_000
+                    + parent_rank * 1_000
+                    + candidate
+                )
+
+                if operation == "add":
+                    if edge_count(parent["adj"]) >= max_edges:
+                        candidate += 1
+                        continue
+                    adj = add_edges(parent["adj"], mutation_size, rng, max_edges)
+
+                elif operation == "remove":
+                    if edge_count(parent["adj"]) == 0:
+                        candidate += 1
+                        continue
+                    adj = remove_edges(parent["adj"], mutation_size, rng)
+
+                else:
+                    adj = rewire_edges(parent["adj"], mutation_size, rng, max_edges)
+
+                fitness = evaluate_graph(
+                    adj,
+                    train_loader,
+                    val_loader,
+                    device,
+                    fitness_epochs,
+                    training_seed,
+                )
+
+                candidates.append({
+                    "adj": adj,
+                    "fitness": fitness,
+                    "operation": operation,
+                    "mutation_size": mutation_size,
+                    "parent_rank": parent_rank,
+                    "candidate": candidate,
+                })
+
+                print(
+                    f"Generation {generation:02d} | "
+                    f"parent={parent_rank} | "
+                    f"{operation:6s} | "
+                    f"edges={edge_count(adj):4d} | "
+                    f"val_acc={fitness * 100:.2f}%"
+                )
+                candidate += 1
+
+        pool = [
+            {
+                "adj": elite["adj"],
+                "fitness": elite["fitness"],
+                "operation": "elite",
+                "mutation_size": 0,
+                "parent_rank": i,
+                "candidate": -1 - i,
+            }
+            for i, elite in enumerate(elites)
+        ]
+        pool.extend(candidates)
+        pool.sort(key=lambda item: item["fitness"], reverse=True)
+
+        elites = pool[:elite_size]
+        selected_ids = {id(item) for item in elites}
+
+        for item in pool:
+            rows.append({
+                "generation": generation,
+                "candidate": item["candidate"],
+                "operation": item["operation"],
+                "parent_rank": item["parent_rank"],
+                "mutation_size": item["mutation_size"],
+                "edges": edge_count(item["adj"]),
+                "val_acc": item["fitness"],
+                "selected": id(item) in selected_ids,
+            })
+
+        best = elites[0]
+
+        print(
+            f"BEST GENERATION {generation:02d}: "
+            f"edges={edge_count(best['adj'])}, "
+            f"val_acc={best['fitness'] * 100:.2f}%"
+        )
+
+        log_graph_figure(
+            best["adj"],
+            f"generation_{generation:02d}",
+            experiment,
+            figure_dir,
+            visual_step,
+            best["fitness"],
+        )
+        visual_step += 1
+
+        torch.save(best["adj"].cpu(), best_adj_path)
+        save_checkpoint(
+            checkpoint_path,
+            history_path,
+            generation,
+            elites,
+            rows,
+        )
+
+    best_graph = elites[0]["adj"]
+    best_search_fitness = elites[0]["fitness"]
+
+    pd.DataFrame(
+        existing_edges(best_graph).cpu().numpy(),
+        columns=["u", "v"],
+    ).to_csv(
+        f"./results/evolution_variable_best_edges_seed_{seed}.csv",
+        index=False,
+    )
+
+    print("\n=== FINAL TRAINING OF BEST GRAPH ===")
+    set_seed(seed)
+
+    final_model = GenericGNN(
+        adj=best_graph,
+        num_classes=10,
+        hidden_dim=128,
+        num_layers=3,
+    )
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(
+        final_model.parameters(),
+        lr=1e-3,
+        weight_decay=1e-4,
+    )
+
+    model_path = f"./results/best_evolution_variable_model_seed_{seed}.pt"
+
+    final_history = train_model(
+        model=final_model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        epochs=final_epochs,
+        device=device,
+        save_path=model_path,
+        verbose=True,
+    )
+
+    final_model.load_state_dict(torch.load(model_path, map_location=device))
+    _, test_acc = evaluate(final_model, test_loader, criterion, device)
+
+    summary = pd.DataFrame([{
+        "seed": seed,
+        "generations": generations,
+        "elite_size": elite_size,
+        "fitness_epochs": fitness_epochs,
+        "final_epochs": final_epochs,
+        "final_edges": edge_count(best_graph),
+        "best_search_val_acc": best_search_fitness,
+        "final_best_val_acc": max(final_history["val_acc"]),
+        "test_acc": test_acc,
+    }])
+
+    summary_path = f"./results/evolution_variable_summary_seed_{seed}.csv"
+    summary.to_csv(summary_path, index=False)
+
+    log_graph_figure(
+        best_graph,
+        "final_best_graph",
+        experiment,
+        figure_dir,
+        visual_step,
+        max(final_history["val_acc"]),
+    )
+
+    if experiment is not None:
+        try:
+            experiment.log_metric("final_test_acc", test_acc, step=visual_step)
+            experiment.log_metric(
+                "final_best_val_acc",
+                max(final_history["val_acc"]),
+                step=visual_step,
+            )
+            experiment.log_metric(
+                "final_edge_count",
+                edge_count(best_graph),
+                step=visual_step,
+            )
+            experiment.end()
+        except Exception as e:
+            print(f"COMET WARNING: финальное логирование не удалось: {e}")
+
+    print("\nИтог:")
+    print(summary.to_string(index=False))
+    print(f"История поиска: {history_path}")
+    print(f"Лучший граф: {best_adj_path}")
+    print(f"Summary: {summary_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--generations", type=int, default=15)
+    parser.add_argument("--elite-size", type=int, default=3)
+    parser.add_argument("--fitness-epochs", type=int, default=20)
+    parser.add_argument("--final-epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--resume", action="store_true")
+    args = parser.parse_args()
+
+    run_evolution(
+        generations=args.generations,
+        elite_size=args.elite_size,
+        fitness_epochs=args.fitness_epochs,
+        final_epochs=args.final_epochs,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        resume=args.resume,
+    )

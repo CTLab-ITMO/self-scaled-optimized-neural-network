@@ -1,7 +1,7 @@
 """
 Эксперимент 1: SimpleCNN на MNIST
-- 10 эпох
-- Acc = 99.15%
+- 20 эпох
+- Acc = 99.23%
 - Результаты в results/cnn_baseline.csv
 """
 
@@ -10,6 +10,7 @@ import sys
 import pandas as pd
 import torch
 import torch.nn as nn
+import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -40,7 +41,7 @@ def run_cnn_experiment(
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    best_model_path = "./results/best_cnn.pt"
+    save_path = f"./results/best_cnn_seed_{seed}.pt"
 
     print(f"\nСтарт обучения на {epochs} эпох")
     history = train_model(
@@ -51,12 +52,12 @@ def run_cnn_experiment(
         optimizer=optimizer,
         epochs=epochs,
         device=device,
-        save_path=best_model_path,
+        save_path=save_path,
         verbose=True
     )
 
     print("Оценка на тесте")
-    model.load_state_dict(torch.load(best_model_path))
+    model.load_state_dict(torch.load(save_path))
     test_loss, test_acc = evaluate(model, test_loader, criterion, device)
     print(f"\nTest Accuracy: {test_acc * 100:.2f}%")
 
@@ -72,9 +73,12 @@ def run_cnn_experiment(
     df_results["test_acc"] = test_acc
     df_results["model"] = "SimpleCNN"
 
-    csv_path = "./results/cnn_baseline.csv"
+    csv_path = f"./results/cnn_baseline_seed_{seed}.csv"
     df_results.to_csv(csv_path, index=False)
 
 
 if __name__ == "__main__":
-    run_cnn_experiment(epochs=10, batch_size=64, lr=1e-3, seed=42)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    run_cnn_experiment(epochs=20, batch_size=64, lr=1e-3, seed=args.seed)

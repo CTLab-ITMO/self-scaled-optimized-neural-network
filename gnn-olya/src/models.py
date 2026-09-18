@@ -49,7 +49,7 @@ class SimpleCNN(nn.Module):
 
 
 class DirectionalConv(nn.Module):
-    """Слой графовой свёртки с 9 отдельными весами для каждого направления."""
+    """Слой графовой свёртки с 9 отдельными весами для каждого направления"""
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.dir_linears = nn.ModuleDict({
@@ -59,35 +59,39 @@ class DirectionalConv(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_channels))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, H, W)
-        """
-        B, C, H, W = x.shape
+        weights = torch.stack([
+            self.dir_linears["up_left"].weight,
+            self.dir_linears["up"].weight,
+            self.dir_linears["up_right"].weight,
+            self.dir_linears["left"].weight,
+            self.dir_linears["self"].weight,
+            self.dir_linears["right"].weight,
+            self.dir_linears["down_left"].weight,
+            self.dir_linears["down"].weight,
+            self.dir_linears["down_right"].weight,
+        ], dim=-1)
 
-        # Делаем паддинг нулями по краям: (B, C, 30, 30)
-        padded = F.pad(x, (1, 1, 1, 1), mode="constant", value=0.0)
+        kernel = weights.reshape(
+            self.dir_linears["self"].out_features,
+            self.dir_linears["self"].in_features,
+            3,
+            3
+        )
 
-        out = 0.0
-        # Собираем сообщения со всех 9 направлений
-        for dir_name, (dr, dc) in DIRECTIONS.items():
-            r_start, r_end = 1 + dr, 1 + dr + H
-            c_start, c_end = 1 + dc, 1 + dc + W
-            
-            # neighbor_slice: (B, C, 28, 28) -> переводим в узлы (B, 784, C)
-            neighbor = padded[:, :, r_start:r_end, c_start:c_end]
-            neighbor_nodes = neighbor.permute(0, 2, 3, 1).reshape(B, H * W, C)
-            
-            out = out + self.dir_linears[dir_name](neighbor_nodes)
-
-        return out + self.bias
+        out = F.conv2d(x, kernel, bias=self.bias, padding=1)
+        return out.permute(0, 2, 3, 1).reshape(
+            x.size(0),
+            x.size(2) * x.size(3),
+            self.dir_linears["self"].out_features
+        )
 
 
 class SimpleGNN(nn.Module):
     """
-    GNN на 8-связной сетке.
-    - Входной признак узла: только яркость (1 канал), без (x, y) координат.
-    - 2 слоя DirectionalConv.
-    - Readout: Flatten фиксированного порядка узлов -> Linear классификатор.
+    GNN на 8-связной сетке:
+    - Входной признак узла: только яркость (1 канал), без (x, y) координат
+    - 2 слоя DirectionalConv
+    - Readout: Flatten фиксированного порядка узлов -> Linear классификатор
     """
     def __init__(self, num_classes: int = 10, hidden_dim: int = 32):
         super().__init__()
@@ -98,40 +102,53 @@ class SimpleGNN(nn.Module):
         self.bn1 = nn.BatchNorm1d(hidden_dim)
 
         # Слой 2: hidden_dim -> hidden_dim
-        self.conv2 = DirectionalConv(hidden_dim, hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.conv2 = DirectionalConv(hidden_dim, 64)
+        self.bn2 = nn.BatchNorm1d(64)
 
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.25)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
         # Классификатор: 784 узла * hidden_dim -> 128 -> 10
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(784 * hidden_dim, 128),
+            nn.Linear(64 * 7 * 7, 128),
             nn.ReLU(),
             self.dropout,
             nn.Linear(128, num_classes)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Принимает вход любого вида: (B, 1, 28, 28) или (B, 784, 1), возвращает логиты (B, 10)."""
+        """Принимает вход любого вида: (B, 1, 28, 28) или (B, 784, 1), возвращает логиты (B, 10)"""
         # Если пришло (B, 784, 1), возвращаем к (B, 1, 28, 28)
         if x.dim() == 3:
             x = x.view(x.size(0), 1, 28, 28)
 
-        h1 = self.conv1(x)                                 # (B, 784, hidden_dim)
+        h1 = self.conv1(x)                                  # (B, 784, hidden_dim)
         h1 = self.bn1(h1.transpose(1, 2)).transpose(1, 2)
         h1 = self.relu(h1)
 
         B, N, C = h1.shape
         h1_2d = h1.view(B, 28, 28, C).permute(0, 3, 1, 2)  # (B, hidden_dim, 28, 28)
+        h1_2d = self.pool(h1_2d)
 
-        h2 = self.conv2(h1_2d)                              # (B, 784, hidden_dim)
+        h2 = self.conv2(h1_2d)                              # (B, 196, 64)
         h2 = self.bn2(h2.transpose(1, 2)).transpose(1, 2)
         h2 = self.relu(h2)
 
-        logits = self.classifier(h2)
+        B, N, C = h2.shape
+        h2_2d = h2.view(B, 14, 14, C).permute(0, 3, 1, 2)
+        h2_2d = self.pool(h2_2d)
+
+        logits = self.classifier(h2_2d)
         return logits
+
+def _sparse_batch_mm(adj_sparse: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Умножает одну sparse adjacency (N, N) на batch признаков (B, N, C) без построения плотной матрицы для каждого объекта"""
+    B, N, C = x.shape
+    x_flat = x.permute(1, 0, 2).reshape(N, B * C)
+    out_flat = torch.sparse.mm(adj_sparse, x_flat)
+    return out_flat.reshape(N, B, C).permute(1, 0, 2)
 
 
 class GenericGCNLayer(nn.Module):
@@ -142,32 +159,41 @@ class GenericGCNLayer(nn.Module):
         self.w_neigh = nn.Linear(in_features, out_features, bias=False)
         self.bias = nn.Parameter(torch.zeros(out_features))
 
-    def forward(self, x: torch.Tensor, adj_norm: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, adj_norm_sparse: torch.Tensor) -> torch.Tensor:
         # x: (B, N, in_features)
-        # adj_norm: (N, N)
-        neigh_msg = torch.matmul(adj_norm, x)  # агрегация сообщений соседей
+        # adj_norm_sparse: sparse (N, N)
+        neigh_msg = _sparse_batch_mm(adj_norm_sparse, x)
         out = self.w_self(x) + self.w_neigh(neigh_msg) + self.bias
         return out
 
 
 class GenericGNN(nn.Module):
     """
-    GNN для работы с любой произвольной матрицей смежности A.
-    - Вход: (B, 1, 28, 28) или (B, 784, 1).
-    - Permutation-invariant readout (Mean + Max pooling).
-    - Точность напрямую отражает полезность матрицы A.
+    GNN для работы с любой произвольной матрицей смежности A:
+    - Вход: (B, 1, 28, 28) или (B, 784, 1)
+    - Permutation-invariant readout (Mean + Max pooling)
+    - Точность напрямую отражает полезность матрицы A
     """
     def __init__(
         self,
         adj: torch.Tensor,
         num_classes: int = 10,
-        hidden_dim: int = 64,
-        num_layers: int = 2
+        hidden_dim: int = 128,
+        num_layers: int = 3
     ):
         super().__init__()
-        # Сохраняем нормализованную матрицу смежности как буфер
+
+        # Dense-версию оставляем в state_dict для совместимости со старыми checkpoint
         adj_norm = normalize_adjacency(adj)
         self.register_buffer("adj_norm", adj_norm)
+
+        # Для вычислений используем sparse-версию
+        # persistent=False: не меняет формат checkpoint/state_dict
+        self.register_buffer(
+            "adj_norm_sparse",
+            adj_norm.to_sparse_coo().coalesce(),
+            persistent=False
+        )
 
         self.num_layers = num_layers
         self.layers = nn.ModuleList()
@@ -175,15 +201,15 @@ class GenericGNN(nn.Module):
 
         # Первый слой: 1 -> hidden_dim
         self.layers.append(GenericGCNLayer(1, hidden_dim))
-        self.bns.append(nn.BatchNorm1d(hidden_dim))
+        self.bns.append(nn.LayerNorm(hidden_dim))
 
         # Последующие скрытые слои
         for _ in range(num_layers - 1):
             self.layers.append(GenericGCNLayer(hidden_dim, hidden_dim))
-            self.bns.append(nn.BatchNorm1d(hidden_dim))
+            self.bns.append(nn.LayerNorm(hidden_dim))
 
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.2)
+        self.dropout = nn.Dropout(0.1)
 
         # Классификатор: Mean + Max pooling дают 2 * hidden_dim фичей
         self.classifier = nn.Sequential(
@@ -199,8 +225,12 @@ class GenericGNN(nn.Module):
 
         h = x
         for i in range(self.num_layers):
-            h = self.layers[i](h, self.adj_norm)
-            h = self.relu(self.bns[i](h.transpose(1, 2)).transpose(1, 2))
+            h_next = self.layers[i](h, self.adj_norm_sparse)
+            # h_next = self.bns[i](h_next.transpose(1, 2)).transpose(1, 2)
+            h_next = self.bns[i](h_next)
+            if i > 0:
+                h_next = h_next + h
+            h = self.relu(h_next)
 
         mean_pool = h.mean(dim=1)
         max_pool = h.max(dim=1)[0]

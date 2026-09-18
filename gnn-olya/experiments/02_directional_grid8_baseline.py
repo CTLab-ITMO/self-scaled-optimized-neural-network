@@ -1,7 +1,7 @@
 """
 Эксперимент 2: Sanity-бейзлайн Directional Grid-8 GNN на MNIST
-- 10 эпох
-- Acc = 98.83%
+- 20 эпох
+- Acc = 99.14%
 - Результаты в results/directional_grid8.csv
 """
 
@@ -10,12 +10,43 @@ import sys
 import pandas as pd
 import torch
 import torch.nn as nn
+import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.data import get_mnist_dataloaders
-from src.models import SimpleGNN
+from src.models import SimpleGNN, DirectionalConv
 from src.train import set_seed, get_device, train_model, evaluate
+
+def verify_directional_conv_equivalence():
+    conv = nn.Conv2d(3, 5, kernel_size=3, padding=1)
+    directional = DirectionalConv(3, 5)
+
+    mapping = [
+        ("up_left", 0, 0),
+        ("up", 0, 1),
+        ("up_right", 0, 2),
+        ("left", 1, 0),
+        ("self", 1, 1),
+        ("right", 1, 2),
+        ("down_left", 2, 0),
+        ("down", 2, 1),
+        ("down_right", 2, 2),
+    ]
+
+    with torch.no_grad():
+        for name, r, c in mapping:
+            directional.dir_linears[name].weight.copy_(conv.weight[:, :, r, c])
+        directional.bias.copy_(conv.bias)
+
+    x = torch.randn(4, 3, 28, 28)
+    expected = conv(x)
+    actual = directional(x)
+    actual = actual.view(4, 28, 28, 5).permute(0, 3, 1, 2)
+
+    max_error = (expected - actual).abs().max().item()
+    print(f"DirectionalConv == Conv2d, max error: {max_error:.2e}")
+    assert max_error < 1e-5
 
 
 def run_gnn_baseline_experiment(
@@ -25,6 +56,7 @@ def run_gnn_baseline_experiment(
     hidden_dim: int = 32,
     seed: int = 42
 ):
+    verify_directional_conv_equivalence()
     set_seed(seed)
     device = get_device()
     print(f"Используемое устройство: {device}")
@@ -41,7 +73,7 @@ def run_gnn_baseline_experiment(
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    best_model_path = "./results/best_directional_grid8.pt"
+    save_path = f"./results/best_directional_grid8_seed_{seed}.pt"
 
     print(f"\nСтарт обучения на {epochs} эпох")
     history = train_model(
@@ -52,12 +84,12 @@ def run_gnn_baseline_experiment(
         optimizer=optimizer,
         epochs=epochs,
         device=device,
-        save_path=best_model_path,
+        save_path=save_path,
         verbose=True
     )
 
     print("Оценка на тесте")
-    model.load_state_dict(torch.load(best_model_path))
+    model.load_state_dict(torch.load(save_path))
     test_loss, test_acc = evaluate(model, test_loader, criterion, device)
     print(f"\nTest Accuracy: {test_acc * 100:.2f}%")
 
@@ -72,10 +104,13 @@ def run_gnn_baseline_experiment(
     df_results["test_acc"] = test_acc
     df_results["model"] = "SimpleGNN_DirectionalGrid8"
 
-    csv_path = "./results/directional_grid8.csv"
+    csv_path = f"./results/directional_grid8_seed_{seed}.csv"
     df_results.to_csv(csv_path, index=False)
     print(f"Результаты эксперимента сохранены в: {csv_path}\n")
 
 
 if __name__ == "__main__":
-    run_gnn_baseline_experiment(epochs=10, batch_size=64, lr=1e-3, hidden_dim=32, seed=42)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    run_gnn_baseline_experiment(epochs=20, batch_size=64, lr=1e-3, hidden_dim=32, seed=args.seed)

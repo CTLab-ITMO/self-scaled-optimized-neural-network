@@ -1,13 +1,6 @@
 """
-Эксперимент 3: Проверка чувствительности GenericGNN к структуре графа A.
-Сравниваем 3 варианта:
-1. Empty graph (A = 0)
-2. Random graph (случайная топология)
-3. Grid-8 graph (осмысленная топология)
-
-Цель:
-- Доказать, что accuracy модели строго зависит от матрицы A.
-- Подтвердить готовность модели к поиску топологии через эволюцию.
+Эксперимент 3: Проверка чувствительности GenericGNN к структуре графа A
+Сравниваем 3 варианта: Empty graph (A = 0), Random graph, Grid-8 graph
 """
 
 import os
@@ -15,6 +8,7 @@ import sys
 import pandas as pd
 import torch
 import torch.nn as nn
+import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -24,7 +18,7 @@ from src.models import GenericGNN
 from src.train import set_seed, get_device, train_model, evaluate
 
 
-def run_generic_gnn_comparison(epochs: int = 5, batch_size: int = 64, lr: float = 1e-3, seed: int = 42):
+def run_generic_gnn_comparison(epochs: int = 20, batch_size: int = 64, lr: float = 1e-3, seed: int = 42):
     set_seed(seed)
     device = get_device()
     print(f"Устройство: {device}")
@@ -48,11 +42,11 @@ def run_generic_gnn_comparison(epochs: int = 5, batch_size: int = 64, lr: float 
         print(f"\nОбучение GenericGNN на графе: [{graph_name}] (рёбер: {int(adj.sum().item() // 2)})")
         set_seed(seed)
 
-        model = GenericGNN(adj=adj, num_classes=10, hidden_dim=64, num_layers=2)
+        model = GenericGNN(adj=adj, num_classes=10, hidden_dim=128, num_layers=3)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 
-        save_path = f"./results/best_generic_{graph_name}.pt"
+        save_path = f"./results/best_generic_{graph_name}_seed_{seed}.pt"
         history = train_model(
             model=model,
             train_loader=train_loader,
@@ -78,7 +72,7 @@ def run_generic_gnn_comparison(epochs: int = 5, batch_size: int = 64, lr: float 
 
     os.makedirs("./results", exist_ok=True)
     df = pd.DataFrame(results)
-    csv_path = "./results/generic_gnn.csv"
+    csv_path = f"./results/generic_gnn_seed_{seed}.csv"
     df.to_csv(csv_path, index=False)
 
     print("\nИтоговая сводка:")
@@ -86,4 +80,7 @@ def run_generic_gnn_comparison(epochs: int = 5, batch_size: int = 64, lr: float 
 
 
 if __name__ == "__main__":
-    run_generic_gnn_comparison(epochs=10, batch_size=64, lr=1e-3, seed=42)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    run_generic_gnn_comparison(epochs=20, batch_size=64, lr=1e-3, seed=args.seed)

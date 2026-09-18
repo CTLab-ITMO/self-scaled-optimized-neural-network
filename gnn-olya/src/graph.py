@@ -1,6 +1,10 @@
 """
 Модуль для построения графовых структур:
 - get_grid8_neighbor_indices: строит карту 8 направлений для сетки HxW (MNIST)
+- get_empty_adjacency: пустой граф (вообще без ребер)
+- get_grid8_adjacency: ненаправленная бинарная матрица смежности grid-8 размера (784, 784)
+- get_random_adjacency: случайный симметричный граф с заданным числом ребер
+- normalize_adjacency: нормализация
 """
 
 import torch
@@ -46,12 +50,10 @@ def get_grid8_neighbor_indices(height: int = 28, width: int = 28) -> dict[str, t
 
 
 def get_empty_adjacency(num_nodes: int = 784) -> torch.Tensor:
-    """Пустой граф (вообще нет рёбер)"""
     return torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
 
 
 def get_grid8_adjacency(height: int = 28, width: int = 28) -> torch.Tensor:
-    """Ненаправленная бинарная матрица смежности grid-8 размера (784, 784)"""
     num_nodes = height * width
     adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
 
@@ -70,7 +72,6 @@ def get_grid8_adjacency(height: int = 28, width: int = 28) -> torch.Tensor:
 
 
 def get_random_adjacency(num_nodes: int = 784, num_edges: int = 2800, seed: int = 42) -> torch.Tensor:
-    """Случайный симметричный граф (Erdos-Renyi) с заданным числом рёбер"""
     gen = torch.Generator().manual_seed(seed)
     adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
 
@@ -86,7 +87,7 @@ def get_random_adjacency(num_nodes: int = 784, num_edges: int = 2800, seed: int 
 
 
 def normalize_adjacency(adj: torch.Tensor) -> torch.Tensor:
-    """Симметричная GCN-нормализация: D^(-1/2) * (A + I) * D^(-1/2)"""
+    """Row-normalization D^(-1) A"""
     deg = adj.sum(dim=1, keepdim=True)
     deg_clamped = torch.clamp(deg, min=1.0)
     adj_norm = adj / deg_clamped
