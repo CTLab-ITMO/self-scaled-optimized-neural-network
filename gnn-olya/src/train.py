@@ -111,7 +111,9 @@ def train_model(
     best_val_acc = -1.0
 
     if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        directory = os.path.dirname(save_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
 
     for epoch in range(1, epochs + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)

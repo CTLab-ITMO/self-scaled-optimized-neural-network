@@ -45,10 +45,13 @@ def get_mnist_dataloaders(
         generator=generator
     )
 
+    loader_generator = torch.Generator().manual_seed(seed)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
+        generator=loader_generator,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available()
     )
@@ -57,6 +60,7 @@ def get_mnist_dataloaders(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        generator=loader_generator,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available()
     )

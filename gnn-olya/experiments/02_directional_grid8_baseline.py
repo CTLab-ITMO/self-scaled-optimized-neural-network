@@ -90,7 +90,7 @@ def run_gnn_baseline_experiment(
     )
 
     print("Оценка на тесте")
-    model.load_state_dict(torch.load(save_path, map_location=device))
+    model.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
     test_loss, test_acc = evaluate(model, test_loader, criterion, device)
     print(f"\nTest Accuracy: {test_acc * 100:.2f}%")
 

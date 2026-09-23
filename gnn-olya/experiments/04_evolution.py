@@ -201,38 +201,43 @@ def run_evolution(
 
         print("\n=== BOOTSTRAP POPULATION ===")
         bootstrap = []
+        candidate = 1
+        samples_per_density = 10
 
-        for candidate, edge_target in enumerate(bootstrap_edges, start=1):
-            rng = random.Random(seed * 1_000_000 + edge_target)
+        for edge_target in bootstrap_edges:
+            for sample_idx in range(samples_per_density):
+                rng = random.Random(seed * 1_000_000 + edge_target * 100 + sample_idx)
 
-            adj = add_edges(
-                get_empty_adjacency(784),
-                edge_target,
-                rng,
-                max_edges,
-            )
-            fitness = evaluate_graph(
-                adj,
-                train_loader,
-                val_loader,
-                device,
-                fitness_epochs,
-                training_seed,
-            )
+                adj = add_edges(
+                    get_empty_adjacency(784),
+                    edge_target,
+                    rng,
+                    max_edges,
+                )
+                fitness = evaluate_graph(
+                    adj,
+                    train_loader,
+                    val_loader,
+                    device,
+                    fitness_epochs,
+                    training_seed,
+                )
 
-            bootstrap.append({
-                "adj": adj,
-                "fitness": fitness,
-                "operation": "bootstrap",
-                "mutation_size": edge_target,
-                "parent_rank": -1,
-                "candidate": candidate,
-            })
+                bootstrap.append({
+                    "adj": adj,
+                    "fitness": fitness,
+                    "operation": "bootstrap",
+                    "mutation_size": edge_target,
+                    "parent_rank": -1,
+                    "candidate": candidate,
+                })
 
-            print(
-                f"Bootstrap | edges={edge_count(adj):4d} | "
-                f"val_acc={fitness * 100:.2f}%"
-            )
+                print(
+                    f"Bootstrap [{sample_idx+1}/{samples_per_density}] | "
+                    f"edges={edge_count(adj):4d} | "
+                    f"val_acc={fitness * 100:.2f}%"
+                )
+                candidate += 1
 
         bootstrap.sort(key=lambda item: item["fitness"], reverse=True)
         elites = bootstrap[:elite_size]
@@ -491,7 +496,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--generations", type=int, default=15)
     parser.add_argument("--elite-size", type=int, default=3)
-    parser.add_argument("--fitness-epochs", type=int, default=20)
+    parser.add_argument("--fitness-epochs", type=int, default=5)
     parser.add_argument("--final-epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--resume", action="store_true")

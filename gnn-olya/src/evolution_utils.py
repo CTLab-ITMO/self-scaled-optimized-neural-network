@@ -28,6 +28,15 @@ def add_edges(adj, count, rng, max_edges):
     count = min(count, max_edges - edge_count(out))
     n = out.size(0)
 
+    possible_edges = n * (n - 1) // 2
+    current_edges = edge_count(out)
+
+    if count < 0:
+        raise ValueError("count must be non-negative")
+
+    if current_edges + count > possible_edges:
+        raise ValueError("Requested edge count exceeds graph capacity")
+
     while count > 0:
         u = rng.randrange(n)
         v = rng.randrange(n - 1)
