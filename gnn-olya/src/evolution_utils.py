@@ -164,3 +164,20 @@ def load_checkpoint(checkpoint_path, history_path):
         rows = pd.read_csv(history_path).to_dict("records")
 
     return int(checkpoint["generation"]), elites, rows
+
+
+def crossover_graphs(adj1, adj2, rng, max_edges):
+    seed = rng.randint(0, 2**31 - 1)
+    gen = torch.Generator().manual_seed(seed)
+    
+    mask = torch.rand(adj1.shape, generator=gen) < 0.5
+    mask_triu = torch.triu(mask, diagonal=1)
+    
+    child_triu = torch.where(mask_triu, adj1, adj2)
+    child_triu = torch.triu(child_triu, diagonal=1)
+    
+    out = child_triu + child_triu.T
+    
+    if edge_count(out) > max_edges:
+        out = remove_edges(out, edge_count(out) - max_edges, rng)
+    return out

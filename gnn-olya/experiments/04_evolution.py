@@ -14,6 +14,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.evolution_utils import (
     add_edges,
+    crossover_graphs,
     edge_count,
     existing_edges,
     load_checkpoint,
@@ -34,7 +35,13 @@ from src.models import GenericGNN
 from src.train import set_seed, get_device, train_model, evaluate
 
 
+GRAPH_FITNESS_CACHE = {}
+
 def evaluate_graph(adj, train_loader, val_loader, device, epochs, training_seed):
+    graph_key = existing_edges(adj).cpu().numpy().tobytes()
+    if graph_key in GRAPH_FITNESS_CACHE:
+        return GRAPH_FITNESS_CACHE[graph_key]
+
     set_seed(training_seed)
 
     model = GenericGNN(
@@ -57,7 +64,14 @@ def evaluate_graph(adj, train_loader, val_loader, device, epochs, training_seed)
         save_path=None,
         verbose=False,
     )
-    return max(history["val_acc"])
+    best_acc = max(history["val_acc"])
+
+    del model, optimizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    GRAPH_FITNESS_CACHE[graph_key] = best_acc
+    return best_acc
 
 
 def mutation_size_for_generation(generation, total_generations):
@@ -269,7 +283,7 @@ def run_evolution(
         candidate = 0
 
         for parent_rank, parent in enumerate(elites):
-            for operation in ["add", "remove", "rewire"]:
+            for operation in ["add", "remove", "rewire", "crossover"]:
                 rng = random.Random(
                     seed * 10_000_000
                     + generation * 100_000
@@ -289,8 +303,13 @@ def run_evolution(
                         continue
                     adj = remove_edges(parent["adj"], mutation_size, rng)
 
-                else:
+                elif operation == "rewire":
                     adj = rewire_edges(parent["adj"], mutation_size, rng, max_edges)
+
+                elif operation == "crossover":
+                    other_parents = [p for i, p in enumerate(elites) if i != parent_rank]
+                    other_parent = rng.choice(other_parents)
+                    adj = crossover_graphs(parent["adj"], other_parent["adj"], rng, max_edges)
 
                 fitness = evaluate_graph(
                     adj,

@@ -18,7 +18,14 @@ from src.models import GenericGNN
 from src.train import set_seed, get_device, train_model, evaluate
 
 
-def run_generic_gnn_comparison(epochs: int = 20, batch_size: int = 64, lr: float = 1e-3, seed: int = 42):
+def run_generic_gnn_comparison(
+    epochs: int = 20,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    hidden_dim: int = 32,
+    num_layers: int = 2,
+    seed: int = 42,
+):
     set_seed(seed)
     device = get_device()
     print(f"Устройство: {device}")
@@ -42,7 +49,12 @@ def run_generic_gnn_comparison(epochs: int = 20, batch_size: int = 64, lr: float
         print(f"\nОбучение GenericGNN на графе: [{graph_name}] (рёбер: {int(adj.sum().item() // 2)})")
         set_seed(seed)
 
-        model = GenericGNN(adj=adj, num_classes=10, hidden_dim=128, num_layers=3)
+        model = GenericGNN(
+            adj=adj,
+            num_classes=10,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+        )
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 
@@ -59,7 +71,7 @@ def run_generic_gnn_comparison(epochs: int = 20, batch_size: int = 64, lr: float
             verbose=True
         )
 
-        model.load_state_dict(torch.load(save_path))
+        model.load_state_dict(torch.load(save_path, map_location=device))
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
         print(f"[{graph_name.upper()}] Test Accuracy: {test_acc * 100:.2f}%")
 
@@ -82,5 +94,18 @@ def run_generic_gnn_comparison(epochs: int = 20, batch_size: int = 64, lr: float
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--hidden-dim", type=int, default=32)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
     args = parser.parse_args()
-    run_generic_gnn_comparison(epochs=20, batch_size=64, lr=1e-3, seed=args.seed)
+
+    run_generic_gnn_comparison(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        seed=args.seed,
+    )

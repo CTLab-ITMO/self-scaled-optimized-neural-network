@@ -1,7 +1,7 @@
 """
 Эксперимент 2: Sanity-бейзлайн Directional Grid-8 GNN на MNIST
 - 20 эпох
-- Acc = 99.14%
+- Acc = 91.98% 0.19 п. п.
 - Результаты в results/directional_grid8.csv
 """
 
@@ -50,11 +50,12 @@ def verify_directional_conv_equivalence():
 
 
 def run_gnn_baseline_experiment(
-    epochs: int = 10,
+    epochs: int = 20,
     batch_size: int = 64,
     lr: float = 1e-3,
     hidden_dim: int = 32,
-    seed: int = 42
+    num_layers: int = 2,
+    seed: int = 42,
 ):
     verify_directional_conv_equivalence()
     set_seed(seed)
@@ -69,7 +70,7 @@ def run_gnn_baseline_experiment(
     )
     print(f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
 
-    model = SimpleGNN(num_classes=10, hidden_dim=hidden_dim)
+    model = SimpleGNN(num_classes=10, hidden_dim=hidden_dim, num_layers=num_layers)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 
@@ -89,7 +90,7 @@ def run_gnn_baseline_experiment(
     )
 
     print("Оценка на тесте")
-    model.load_state_dict(torch.load(save_path))
+    model.load_state_dict(torch.load(save_path, map_location=device))
     test_loss, test_acc = evaluate(model, test_loader, criterion, device)
     print(f"\nTest Accuracy: {test_acc * 100:.2f}%")
 
@@ -112,5 +113,13 @@ def run_gnn_baseline_experiment(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-layers", type=int, default=2)
     args = parser.parse_args()
-    run_gnn_baseline_experiment(epochs=20, batch_size=64, lr=1e-3, hidden_dim=32, seed=args.seed)
+    run_gnn_baseline_experiment(
+        epochs=20,
+        batch_size=64,
+        lr=1e-3,
+        hidden_dim=32,
+        num_layers=args.num_layers,
+        seed=args.seed,
+    )
