@@ -1,7 +1,8 @@
 """
 Эксперимент 4: эволюционная оптимизация матрицы смежности без фиксированной плотности
-- Число рёбер тоже является частью поиска
-- Для лучших графов пробуем add / remove / rewire
+- Число рёбер является частью поиска
+- 40 лучших графов порождают 40 потомков через crossover + bit-flip mutation
+- При мутации инвертируется около 5% от текущего числа рёбер
 - Fitness = лучшая validation accuracy GenericGNN
 """
 
@@ -15,12 +16,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.evolution_utils import (
     add_edges,
     crossover_graphs,
+    mutate_bitflip,
     edge_count,
     existing_edges,
     load_checkpoint,
     log_graph_figure,
-    remove_edges,
-    rewire_edges,
+    # remove_edges,
+    # rewire_edges,
     save_checkpoint,
     start_comet_experiment,
 )
@@ -36,6 +38,7 @@ from src.train import set_seed, get_device, train_model, evaluate
 
 
 GRAPH_FITNESS_CACHE = {}
+mutation_percent = 0.05
 
 def evaluate_graph(adj, train_loader, val_loader, device, epochs, training_seed):
     graph_key = existing_edges(adj).cpu().numpy().tobytes()
@@ -44,6 +47,9 @@ def evaluate_graph(adj, train_loader, val_loader, device, epochs, training_seed)
 
     set_seed(training_seed)
 
+    if train_loader.generator is not None:
+        train_loader.generator.manual_seed(training_seed)
+
     model = GenericGNN(
         adj=adj,
         num_classes=10,
@@ -51,7 +57,7 @@ def evaluate_graph(adj, train_loader, val_loader, device, epochs, training_seed)
         num_layers=3,
     )
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-3, weight_decay=1e-4)
 
     history = train_model(
         model=model,
@@ -74,23 +80,23 @@ def evaluate_graph(adj, train_loader, val_loader, device, epochs, training_seed)
     return best_acc
 
 
-def mutation_size_for_generation(generation, total_generations):
-    fraction = generation / total_generations
-    if fraction <= 0.25:
-        return 256
-    if fraction <= 0.50:
-        return 128
-    if fraction <= 0.75:
-        return 64
-    return 32
+# def mutation_size_for_generation(generation, total_generations):
+#     fraction = generation / total_generations
+#     if fraction <= 0.25:
+#         return 256
+#     if fraction <= 0.50:
+#         return 128
+#     if fraction <= 0.75:
+#         return 64
+#     return 32
 
 
 def run_evolution(
-    generations=15,
-    elite_size=3,
-    fitness_epochs=20,
+    generations=10,
+    elite_size=40,
+    fitness_epochs=3,
     final_epochs=20,
-    batch_size=64,
+    batch_size=256,
     seed=42,
     resume=False,
 ):
@@ -107,7 +113,7 @@ def run_evolution(
 
     grid8_adj = get_grid8_adjacency(28, 28)
     max_edges = edge_count(grid8_adj)
-    bootstrap_edges = [256, 500, 1000, 1500, 2000, 2500, max_edges]
+    bootstrap_edges = [100, 300, 600, 1000, 1500, 2000, 2500, max_edges]
 
     history_path = f"./results/evolution_variable_seed_{seed}.csv"
     checkpoint_path = f"./results/evolution_variable_checkpoint_seed_{seed}.pt"
@@ -277,71 +283,46 @@ def run_evolution(
     print("\n=== VARIABLE-DENSITY EVOLUTION ===")
 
     for generation in range(start_generation + 1, generations + 1):
-        mutation_size = mutation_size_for_generation(generation, generations)
-
-        print(
-            f"\n--- Generation {generation}/{generations} | "
-            f"mutation_size={mutation_size} ---"
-        )
+        print(f"\n--- Generation {generation}/{generations} ---")
 
         candidates = []
-        candidate = 0
+        gen_rng = random.Random(seed * 100_000 + generation)
 
-        for parent_rank, parent in enumerate(elites):
-            for operation in ["add", "remove", "rewire", "crossover"]:
-                rng = random.Random(
-                    seed * 10_000_000
-                    + generation * 100_000
-                    + parent_rank * 1_000
-                    + candidate
-                )
+        for candidate in range(elite_size):
+            p1, p2 = gen_rng.sample(elites, 2)
 
-                if operation == "add":
-                    if edge_count(parent["adj"]) >= max_edges:
-                        candidate += 1
-                        continue
-                    adj = add_edges(parent["adj"], mutation_size, rng, max_edges)
+            child_adj = crossover_graphs(p1["adj"], p2["adj"], gen_rng, max_edges)
+            child_adj = mutate_bitflip(
+                child_adj,
+                percent=mutation_percent,
+                rng=gen_rng,
+                max_edges=max_edges,
+            )
 
-                elif operation == "remove":
-                    if edge_count(parent["adj"]) == 0:
-                        candidate += 1
-                        continue
-                    adj = remove_edges(parent["adj"], mutation_size, rng)
+            fitness = evaluate_graph(
+                child_adj,
+                train_loader,
+                val_loader,
+                device,
+                fitness_epochs,
+                training_seed,
+            )
 
-                elif operation == "rewire":
-                    adj = rewire_edges(parent["adj"], mutation_size, rng, max_edges)
+            candidates.append({
+                "adj": child_adj,
+                "fitness": fitness,
+                "operation": "cross+mut",
+                "mutation_size": mutation_percent,
+                "parent_rank": -1,
+                "candidate": candidate,
+            })
 
-                elif operation == "crossover":
-                    other_parents = [p for i, p in enumerate(elites) if i != parent_rank]
-                    other_parent = rng.choice(other_parents)
-                    adj = crossover_graphs(parent["adj"], other_parent["adj"], rng, max_edges)
-
-                fitness = evaluate_graph(
-                    adj,
-                    train_loader,
-                    val_loader,
-                    device,
-                    fitness_epochs,
-                    training_seed,
-                )
-
-                candidates.append({
-                    "adj": adj,
-                    "fitness": fitness,
-                    "operation": operation,
-                    "mutation_size": mutation_size,
-                    "parent_rank": parent_rank,
-                    "candidate": candidate,
-                })
-
-                print(
-                    f"Generation {generation:02d} | "
-                    f"parent={parent_rank} | "
-                    f"{operation:6s} | "
-                    f"edges={edge_count(adj):4d} | "
-                    f"val_acc={fitness * 100:.2f}%"
-                )
-                candidate += 1
+            print(
+                f"Generation {generation:02d} | "
+                f"child={candidate + 1:02d}/{elite_size} | "
+                f"edges={edge_count(child_adj):5d} | "
+                f"val_acc={fitness * 100:.2f}%"
+            )
 
         pool = [
             {
@@ -412,6 +393,9 @@ def run_evolution(
 
     print("\n=== FINAL TRAINING OF BEST GRAPH ===")
     set_seed(seed)
+
+    if train_loader.generator is not None:
+        train_loader.generator.manual_seed(seed)
 
     final_model = GenericGNN(
         adj=best_graph,
@@ -494,11 +478,11 @@ def run_evolution(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--generations", type=int, default=15)
-    parser.add_argument("--elite-size", type=int, default=3)
-    parser.add_argument("--fitness-epochs", type=int, default=5)
+    parser.add_argument("--generations", type=int, default=10)
+    parser.add_argument("--elite-size", type=int, default=40)
+    parser.add_argument("--fitness-epochs", type=int, default=3)
     parser.add_argument("--final-epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 

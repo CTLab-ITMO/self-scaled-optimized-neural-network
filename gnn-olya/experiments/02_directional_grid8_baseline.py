@@ -15,8 +15,12 @@ import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.data import get_mnist_dataloaders
-from src.models import SimpleGNN, DirectionalConv
+from src.models import SimpleCNN, SimpleGNN, DirectionalConv
 from src.train import set_seed, get_device, train_model, evaluate
+
+
+DATA_SEED = 42
+
 
 def verify_directional_conv_equivalence():
     conv = nn.Conv2d(3, 5, kernel_size=3, padding=1)
@@ -49,6 +53,42 @@ def verify_directional_conv_equivalence():
     assert max_error < 1e-5
 
 
+def copy_cnn_weights_to_gnn(cnn, gnn):
+    mapping = [
+        ("up_left", 0, 0),
+        ("up", 0, 1),
+        ("up_right", 0, 2),
+        ("left", 1, 0),
+        ("self", 1, 1),
+        ("right", 1, 2),
+        ("down_left", 2, 0),
+        ("down", 2, 1),
+        ("down_right", 2, 2),
+    ]
+
+    with torch.no_grad():
+        for cnn_conv, gnn_conv in zip(cnn.convs, gnn.convs):
+            for name, r, c in mapping:
+                gnn_conv.dir_linears[name].weight.copy_(cnn_conv.weight[:, :, r, c])
+            gnn_conv.bias.copy_(cnn_conv.bias)
+
+        gnn.classifier.weight.copy_(cnn.classifier.weight)
+        gnn.classifier.bias.copy_(cnn.classifier.bias)
+
+
+def verify_model_equivalence(cnn, gnn, sample):
+    cnn.eval()
+    gnn.eval()
+
+    with torch.no_grad():
+        expected = cnn(sample)
+        actual = gnn(sample)
+
+    max_error = (expected - actual).abs().max().item()
+    print(f"SimpleCNN == SimpleGNN, max error: {max_error:.2e}")
+    assert max_error < 1e-6
+
+
 def run_gnn_baseline_experiment(
     epochs: int = 20,
     batch_size: int = 64,
@@ -66,11 +106,19 @@ def run_gnn_baseline_experiment(
         data_dir="./data",
         batch_size=batch_size,
         val_size=10000,
-        seed=seed
+        seed=DATA_SEED
     )
     print(f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
 
+    set_seed(seed)
+    reference_cnn = SimpleCNN(num_classes=10, hidden_dim=hidden_dim, num_layers=num_layers)
     model = SimpleGNN(num_classes=10, hidden_dim=hidden_dim, num_layers=num_layers)
+    copy_cnn_weights_to_gnn(reference_cnn, model)
+
+    sample, _ = val_loader.dataset[0]
+    sample = sample.unsqueeze(0)
+    verify_model_equivalence(reference_cnn, model, sample)
+
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 

@@ -65,10 +65,10 @@ def remove_edges(adj, count, rng):
     return out
 
 
-def rewire_edges(adj, count, rng, max_edges):
-    target_edges = edge_count(adj)
-    out = remove_edges(adj, count, rng)
-    return add_edges(out, target_edges - edge_count(out), rng, max_edges)
+# def rewire_edges(adj, count, rng, max_edges):
+#     target_edges = edge_count(adj)
+#     out = remove_edges(adj, count, rng)
+#     return add_edges(out, target_edges - edge_count(out), rng, max_edges)
 
 
 def start_comet_experiment(seed, parameters):
@@ -189,4 +189,44 @@ def crossover_graphs(adj1, adj2, rng, max_edges):
     
     if edge_count(out) > max_edges:
         out = remove_edges(out, edge_count(out) - max_edges, rng)
+    return out
+
+
+def mutate_bitflip(adj, percent=0.05, rng=None, max_edges=None):
+    rng = rng or random.Random()
+    out = adj.clone()
+
+    idx = torch.triu_indices(adj.size(0), adj.size(0), offset=1)
+    values = out[idx[0], idx[1]]
+
+    ones = torch.where(values == 1)[0]
+    zeros = torch.where(values == 0)[0]
+
+    k = max(1, round(len(ones) * percent))
+
+    min_remove = 0
+    if max_edges is not None:
+        min_remove = max(
+            0,
+            (len(ones) + k - max_edges + 1) // 2,
+        )
+
+    max_remove = min(k, len(ones))
+    remove_count = rng.randint(min_remove, max_remove)
+    add_count = k - remove_count
+    gen = torch.Generator().manual_seed(rng.randint(0, 2**31 - 1))
+
+    remove_idx = ones[
+        torch.randperm(len(ones), generator=gen)[:remove_count]
+    ]
+    add_idx = zeros[
+        torch.randperm(len(zeros), generator=gen)[:add_count]
+    ]
+
+    flip_idx = torch.cat([remove_idx, add_idx])
+
+    u = idx[0, flip_idx]
+    v = idx[1, flip_idx]
+    out[u, v] = 1.0 - out[u, v]
+    out[v, u] = out[u, v]
     return out

@@ -19,6 +19,9 @@ from src.models import SimpleCNN
 from src.train import set_seed, get_device, train_model, evaluate
 
 
+DATA_SEED = 42
+
+
 def run_cnn_experiment(
     epochs: int = 20,
     batch_size: int = 64,
@@ -35,10 +38,11 @@ def run_cnn_experiment(
         data_dir="./data",
         batch_size=batch_size,
         val_size=10000,
-        seed=seed
+        seed=DATA_SEED
     )
     print(f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
 
+    set_seed(seed)
     model = SimpleCNN(num_classes=10, hidden_dim=hidden_dim, num_layers=num_layers)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
