@@ -11,27 +11,12 @@ class Evolution:
         self.train_size = train_size
         self.test_size = test_size
         self.graph_count = len(graphs)
-        vertex_count = len(graphs[0])
-        self.mutation_probability = mutation_rate / vertex_count**2
+        self.mutation_probability = mutation_rate
         self.rng = np.random.default_rng(seed)
         self.split_rng = np.random.RandomState(seed)
-        self.images, self.test_images, self.labels, self.test_labels = train_test_split(
-            images,
-            labels,
-            test_size=test_size,
-            random_state=self.split_rng,
-            stratify=labels,
-        )
-        if self.train_size == len(self.images):
-            self.train_images, self.train_labels = self.images, self.labels
-        else:
-            self.train_images, _, self.train_labels, _ = train_test_split(
-                self.images,
-                self.labels,
-                train_size=self.train_size,
-                random_state=self.split_rng,
-                stratify=self.labels,
-            )
+        self.images = images
+        self.labels = labels
+
         self.graphs = np.array(graphs)
         self.scores = self.evaluate(self.graphs)
         self.sort_by_score()
@@ -44,9 +29,18 @@ class Evolution:
 
     def evaluate(self, graphs):
         """Use the same training and validation objects for every generation."""
+        train_images, test_images, train_labels, test_labels = train_test_split(
+            self.images,
+            self.labels,
+            train_size = self.train_size,
+            test_size=self.test_size,
+            random_state=self.split_rng,
+            stratify=self.labels,
+        )
+
         return np.array([
             self.fitness_function(
-                graph, self.train_images, self.train_labels, self.test_images, self.test_labels,
+                graph, train_images, train_labels, test_images, test_labels,
             )
             for graph in graphs
         ])
@@ -55,8 +49,7 @@ class Evolution:
         survivor_count = self.graph_count // 2
         children = self.make_children(self.graphs[:survivor_count], self.graph_count - survivor_count)
         self.graphs[survivor_count:] = children
-        # Survivors keep their scores on the same fixed validation set.
-        self.scores[survivor_count:] = self.evaluate(children)
+        self.scores = self.evaluate(self.graphs)
         self.sort_by_score()
 
     def sort_by_score(self):

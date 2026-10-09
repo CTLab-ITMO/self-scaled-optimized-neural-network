@@ -13,39 +13,22 @@ class SmallGCN(nn.Module):
         self.num_classes = num_classes
         self.vertex_count = vertex_count
         # Для поэлементного умножения на adj
-        self.w = nn.Parameter(torch.ones(vertex_count + num_classes))
+        self.w = nn.Parameter(torch.ones(vertex_count))
+        self.linear = nn.Linear(vertex_count, num_classes)
 
     def forward(self, images, adjacency, *, return_logits=False):
-        # A: исходная adjacency, форма (vertex_count, vertex_count).
-        A = torch.as_tensor(adjacency, dtype=self.w.dtype, device=self.w.device) # (VC, VC)
+        A = torch.as_tensor(adjacency, dtype=self.w.dtype, device=self.w.device)
+        images = torch.as_tensor(images, dtype=self.w.dtype, device=self.w.device)
 
-        images = torch.as_tensor(images, dtype=self.w.dtype, device=self.w.device) # (B, VC)
+        # Шаг 1: обновляем реальные вершины через A и их веса.
+        updated_vertices = (images @ A) * self.w[:self.vertex_count]
 
-
-        O = A.new_zeros((self.vertex_count, self.num_classes))
-        I = A.new_ones((self.num_classes, self.vertex_count))
-        E = torch.eye(self.num_classes, dtype=A.dtype, device=A.device)
-
-        # A | 0
-        # I | E
-        A_new = torch.cat((torch.cat((A, O), dim=1), torch.cat((I, E), dim=1)), dim=0)
-        A_new = A_new * self.w # (VC + num_classes, VC + num_classes)
-
-        # К изображениям допишем 10 единичек
-        images_padded = torch.cat((images, images.new_ones((images.shape[0], self.num_classes))), dim=1) # (B, VC + num_classes)
-        image_embs = images_padded @ A_new
-
-        # Последние num_classes
-        logits = image_embs[:, -self.num_classes:]
+        # Шаг 2: фиктивные вершины получают информацию о классах
+        logits = self.linear(updated_vertices)
 
         if return_logits:
             return logits  # CrossEntropyLoss принимает значения до softmax.
         return torch.softmax(logits, dim=1)
-
-def normalize(adjacency):
-    adjacency = torch.tensor(adjacency, device=DEVICE) + torch.eye(len(adjacency), device=DEVICE)
-    inverse_sqrt_degree = adjacency.sum(1) ** -0.5
-    return inverse_sqrt_degree[:, None] * adjacency * inverse_sqrt_degree[None, :]
 
 
 def train_gnn(adjacency, images, labels, epochs, seed=0):
