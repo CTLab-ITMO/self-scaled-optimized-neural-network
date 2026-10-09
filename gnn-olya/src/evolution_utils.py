@@ -109,7 +109,7 @@ def log_graph_figure(adj, name, experiment, figure_dir, step, val_acc=None):
             ],
             axis=1,
         )
-        ax.add_collection(LineCollection(segments, linewidths=0.35, alpha=0.16))
+        ax.add_collection(LineCollection(segments, linewidths=0.5, alpha=0.3))
 
     ax.scatter(x, y, s=7, zorder=3)
     ax.set_aspect("equal")
@@ -210,6 +210,7 @@ def mutate_bitflip(adj, percent=0.05, rng=None, max_edges=None):
             0,
             (len(ones) + k - max_edges + 1) // 2,
         )
+    min_remove = max(min_remove, k - len(zeros))
 
     max_remove = min(k, len(ones))
     remove_count = rng.randint(min_remove, max_remove)

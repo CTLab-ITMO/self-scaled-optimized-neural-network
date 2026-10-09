@@ -38,10 +38,15 @@ from src.train import set_seed, get_device, train_model, evaluate
 
 
 GRAPH_FITNESS_CACHE = {}
-mutation_percent = 0.05
+mutation_percent = 0.1
 
 def evaluate_graph(adj, train_loader, val_loader, device, epochs, training_seed):
-    graph_key = existing_edges(adj).cpu().numpy().tobytes()
+    graph_key = (
+        existing_edges(adj).cpu().numpy().tobytes(),
+        training_seed,
+        epochs,
+        train_loader.batch_size,
+    )
     if graph_key in GRAPH_FITNESS_CACHE:
         return GRAPH_FITNESS_CACHE[graph_key]
 
@@ -92,7 +97,7 @@ def evaluate_graph(adj, train_loader, val_loader, device, epochs, training_seed)
 
 
 def run_evolution(
-    generations=10,
+    generations=40,
     elite_size=40,
     fitness_epochs=3,
     final_epochs=20,
@@ -108,14 +113,17 @@ def run_evolution(
         data_dir="./data",
         batch_size=batch_size,
         val_size=10000,
-        seed=seed,
+        seed=42,
+        num_workers=2,
     )
 
     grid8_adj = get_grid8_adjacency(28, 28)
-    max_edges = edge_count(grid8_adj)
-    bootstrap_edges = [100, 300, 600, 1000, 1500, 2000, 2500, max_edges]
+    max_edges = 784 * 783 // 2
+    # bootstrap_edges = [0, 100, 300, 1000, 3000, 10000, 30000, 100000, max_edges]
+    bootstrap_edges = [0, 300, 600, 1000, 2000, 3000, 30000, 100000, max_edges]
 
     history_path = f"./results/evolution_variable_seed_{seed}.csv"
+    generation_stats_path = f"./results/evolution_variable_generation_stats_seed_{seed}.csv"
     checkpoint_path = f"./results/evolution_variable_checkpoint_seed_{seed}.pt"
     best_adj_path = f"./results/evolution_variable_best_adj_seed_{seed}.pt"
     figure_dir = f"./results/figures/evolution_variable_seed_{seed}"
@@ -136,6 +144,7 @@ def run_evolution(
     )
 
     rows = []
+    generation_stats_rows = []
     elites = None
     start_generation = 0
     visual_step = 0
@@ -151,6 +160,9 @@ def run_evolution(
     visual_step += 1
 
     if resume:
+        if os.path.exists(generation_stats_path):
+            generation_stats_rows = pd.read_csv(generation_stats_path).to_dict("records")
+
         state = load_checkpoint(checkpoint_path, history_path)
         if state is not None:
             start_generation, elites, rows = state
@@ -210,9 +222,14 @@ def run_evolution(
         candidate = 1
         samples_per_density = 10
 
-        for edge_target in bootstrap_edges:
+        for edge_idx in range(len(bootstrap_edges) - 1):
             for sample_idx in range(samples_per_density):
-                rng = random.Random(seed * 1_000_000 + edge_target * 100 + sample_idx)
+                rng = random.Random(seed * 1_000_000 + edge_idx * 100 + sample_idx)
+                edge_min = bootstrap_edges[edge_idx]
+                edge_max = bootstrap_edges[edge_idx + 1]
+                if edge_idx < len(bootstrap_edges) - 2:
+                    edge_max -= 1
+                edge_target = rng.randint(edge_min, edge_max)
 
                 adj = add_edges(
                     get_empty_adjacency(784),
@@ -266,6 +283,27 @@ def run_evolution(
             f"BEST BOOTSTRAP: edges={edge_count(best['adj'])}, "
             f"val_acc={best['fitness'] * 100:.2f}%"
         )
+
+        population_edges = torch.tensor([edge_count(item["adj"]) for item in bootstrap], dtype=torch.float32)
+        generation_stats_rows.append({
+            "generation": 0,
+            "population_size": len(bootstrap),
+            "min_edges": int(population_edges.min().item()),
+            "max_edges": int(population_edges.max().item()),
+            "mean_edges": population_edges.mean().item(),
+            "median_edges": population_edges.quantile(0.5).item(),
+            "std_edges": population_edges.std(unbiased=False).item(),
+            "best_edges": edge_count(best["adj"]),
+            "best_fitness": best["fitness"],
+        })
+        print(
+            f"EDGE STATS: min={generation_stats_rows[-1]['min_edges']}, "
+            f"max={generation_stats_rows[-1]['max_edges']}, "
+            f"mean={generation_stats_rows[-1]['mean_edges']:.2f}, "
+            f"median={generation_stats_rows[-1]['median_edges']:.2f}, "
+            f"std={generation_stats_rows[-1]['std_edges']:.2f}"
+        )
+        pd.DataFrame(generation_stats_rows).to_csv(generation_stats_path, index=False)
 
         log_graph_figure(
             best["adj"],
@@ -360,6 +398,27 @@ def run_evolution(
             f"edges={edge_count(best['adj'])}, "
             f"val_acc={best['fitness'] * 100:.2f}%"
         )
+
+        population_edges = torch.tensor([edge_count(item["adj"]) for item in pool], dtype=torch.float32)
+        generation_stats_rows.append({
+            "generation": generation,
+            "population_size": len(pool),
+            "min_edges": int(population_edges.min().item()),
+            "max_edges": int(population_edges.max().item()),
+            "mean_edges": population_edges.mean().item(),
+            "median_edges": population_edges.quantile(0.5).item(),
+            "std_edges": population_edges.std(unbiased=False).item(),
+            "best_edges": edge_count(best["adj"]),
+            "best_fitness": best["fitness"],
+        })
+        print(
+            f"EDGE STATS: min={generation_stats_rows[-1]['min_edges']}, "
+            f"max={generation_stats_rows[-1]['max_edges']}, "
+            f"mean={generation_stats_rows[-1]['mean_edges']:.2f}, "
+            f"median={generation_stats_rows[-1]['median_edges']:.2f}, "
+            f"std={generation_stats_rows[-1]['std_edges']:.2f}"
+        )
+        pd.DataFrame(generation_stats_rows).to_csv(generation_stats_path, index=False)
 
         log_graph_figure(
             best["adj"],
@@ -478,7 +537,7 @@ def run_evolution(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--generations", type=int, default=10)
+    parser.add_argument("--generations", type=int, default=40)
     parser.add_argument("--elite-size", type=int, default=40)
     parser.add_argument("--fitness-epochs", type=int, default=3)
     parser.add_argument("--final-epochs", type=int, default=20)
