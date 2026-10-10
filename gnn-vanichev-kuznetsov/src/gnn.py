@@ -14,11 +14,11 @@ class SmallGCN(nn.Module):
         self.vertex_count = vertex_count
         # Для поэлементного умножения на adj
         self.w1 = nn.Parameter(torch.ones(vertex_count))
-        self.w2 = nn.Parameter(num_classes)
+        self.w2 = nn.Parameter(torch.ones(num_classes))
 
     def forward(self, images, adjacency, *, return_logits=False):
-        A = torch.as_tensor(adjacency, dtype=self.w.dtype, device=self.w.device)
-        images = torch.as_tensor(images, dtype=self.w.dtype, device=self.w.device)
+        A = torch.as_tensor(adjacency, dtype=self.w1.dtype, device=self.w1.device)
+        images = torch.as_tensor(images, dtype=self.w1.dtype, device=self.w1.device)
 
         # Шаг 1: обновляем реальные вершины через A и их веса.
         updated_vertices = (images @ A) * self.w1[:self.vertex_count]
