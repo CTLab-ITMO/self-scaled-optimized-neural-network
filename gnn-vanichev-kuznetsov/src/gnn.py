@@ -13,18 +13,18 @@ class SmallGCN(nn.Module):
         self.num_classes = num_classes
         self.vertex_count = vertex_count
         # Для поэлементного умножения на adj
-        self.w = nn.Parameter(torch.ones(vertex_count))
-        self.linear = nn.Linear(vertex_count, num_classes)
+        self.w1 = nn.Parameter(torch.ones(vertex_count))
+        self.w2 = nn.Parameter(num_classes)
 
     def forward(self, images, adjacency, *, return_logits=False):
         A = torch.as_tensor(adjacency, dtype=self.w.dtype, device=self.w.device)
         images = torch.as_tensor(images, dtype=self.w.dtype, device=self.w.device)
 
         # Шаг 1: обновляем реальные вершины через A и их веса.
-        updated_vertices = (images @ A) * self.w[:self.vertex_count]
+        updated_vertices = (images @ A) * self.w1[:self.vertex_count]
 
         # Шаг 2: фиктивные вершины получают информацию о классах
-        logits = self.linear(updated_vertices)
+        logits = updated_vertices.sum(dim=1, keepdim=True) * self.w2
 
         if return_logits:
             return logits  # CrossEntropyLoss принимает значения до softmax.
