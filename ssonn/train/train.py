@@ -372,12 +372,8 @@ def train_ssonn(
                     base_lr=hyperparams['learning_rate']
                 )
               
-                sched = CosineAnnealingLR(
-                    optimizer, 
-                    T_max=hyperparams["t_max"], 
-                    eta_min=0, 
-                    last_epoch=epoch
-                )
+                # Keep the cosine phase: constructing a scheduler performs an extra step.
+                sched.optimizer = optimizer
                 apply_sparsity_mask(model)                
                 if use_log_tool and experiment:
                     experiment.log_metric("expansion event", num_new, epoch=epoch)
